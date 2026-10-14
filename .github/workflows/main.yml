@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed d2b40c8 Cortex-A9
+name: Build PCSX-ReARMed Single-Core LTO Cortex-A9
 
 on:
   workflow_dispatch:
@@ -13,54 +13,32 @@ jobs:
       - name: Install ARMv7 Cross-Compilers
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf git make
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf git make
 
-      - name: Checkout libretro/pcsx_rearmed at d2b40c8
+      - name: Checkout and Patch for Single-Core Cortex-A9
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
           git checkout d2b40c8
           git submodule update --init
-          # Force Makefile.libretro to use -O3 instead of overriding with -O2
+          # 1. Force -O3 everywhere
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
+          # 2. Remove THREAD_RENDERING overhead for single-core CPU
+          sed -i 's/THREAD_RENDERING = 1/THREAD_RENDERING = 0/g' Makefile.libretro
+          sed -i 's/-DTHREAD_RENDERING//g' Makefile.libretro
+          sed -i 's/plugins\/gpulib\/gpulib_thread_if.o//g' Makefile
 
-      - name: Build 1 - Cortex-A9 + Unai + CHD (softfp ABI)
+      - name: Build Cortex-A9 LTO (hardfp ABI)
         run: |
           cd src
           find . -name "*.o" -delete
           rm -f pcsx_rearmed_libretro.so
-          OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+          OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -flto -funroll-loops -fomit-frame-pointer -ffast-math -fstrict-aliasing -DNDEBUG -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
           
           export CFLAGS="$OPT_FLAGS"
           export CXXFLAGS="$OPT_FLAGS"
-          export ASFLAGS="-mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
-          
-          make -f Makefile.libretro \
-            platform=unix \
-            ARCH=arm \
-            DYNAREC=ari64 \
-            HAVE_NEON=0 \
-            HAVE_VFP=1 \
-            HAVE_CHD=1 \
-            BUILTIN_GPU=unai \
-            CC="arm-linux-gnueabi-gcc $OPT_FLAGS" \
-            CXX="arm-linux-gnueabi-g++ $OPT_FLAGS" \
-            AS="arm-linux-gnueabi-as -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp" \
-            AR=arm-linux-gnueabi-ar \
-            -j2 2>&1 | tee ../build_softfp.log
-          arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
-          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_softfp.so
-
-      - name: Build 2 - Cortex-A9 + Unai + CHD (hardfp ABI)
-        run: |
-          cd src
-          find . -name "*.o" -delete
-          rm -f pcsx_rearmed_libretro.so
-          OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
-          
-          export CFLAGS="$OPT_FLAGS"
-          export CXXFLAGS="$OPT_FLAGS"
+          export LDFLAGS="-flto $OPT_FLAGS"
           export ASFLAGS="-mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"
           
           make -f Makefile.libretro \
@@ -70,35 +48,21 @@ jobs:
             HAVE_NEON=0 \
             HAVE_VFP=1 \
             HAVE_CHD=1 \
+            THREAD_RENDERING=0 \
             BUILTIN_GPU=unai \
             CC="arm-linux-gnueabihf-gcc $OPT_FLAGS" \
             CXX="arm-linux-gnueabihf-g++ $OPT_FLAGS" \
             AS="arm-linux-gnueabihf-as -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard" \
-            AR=arm-linux-gnueabihf-ar \
-            -j2 2>&1 | tee ../build_hardfp.log
+            AR=arm-linux-gnueabihf-gcc-ar \
+            -j2 2>&1 | tee ../build_hardfp_lto.log
           arm-linux-gnueabihf-strip --strip-unneeded pcsx_rearmed_libretro.so
-          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp.so
+          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp_lto.so
 
-      - name: Verify Build & Symbols Report
-        run: |
-          echo "=== COMMIT BUILT ===" > build_report.txt
-          cd src && git log -1 --oneline >> ../build_report.txt && cd ..
-          echo "=== BUILT FILES SIZE ===" >> build_report.txt
-          ls -lh pcsx_rearmed_libretro_*.so >> build_report.txt
-          echo "=== VERIFY UNAI & CHD SYMBOLS ===" >> build_report.txt
-          arm-linux-gnueabi-nm -D pcsx_rearmed_libretro_softfp.so | grep -iE "unai|chd" | head -n 20 >> build_report.txt || true
-          echo "=== GLIBC VERSION REQUIREMENTS ===" >> build_report.txt
-          arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro_softfp.so | grep GLIBC_ | awk '{print $5}' | sort -u >> build_report.txt || true
-          cat build_report.txt
-
-      - name: Package .so Files and Report
+      - name: Package .so File
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-d2b40c8-cortex-a9
+          name: pcsx-rearmed-singlecore-lto
           path: |
-            pcsx_rearmed_libretro_softfp.so
-            pcsx_rearmed_libretro_hardfp.so
-            build_report.txt
-            build_softfp.log
-            build_hardfp.log
+            pcsx_rearmed_libretro_hardfp_lto.so
+            build_hardfp_lto.log
