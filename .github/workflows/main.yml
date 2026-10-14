@@ -27,6 +27,12 @@ jobs:
           cd src
           make -f Makefile.libretro clean
           OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+          
+          # Export CFLAGS/CXXFLAGS into the environment so Makefile.libretro appends its -I include paths to them instead of losing them
+          export CFLAGS="$OPT_FLAGS"
+          export CXXFLAGS="$OPT_FLAGS"
+          export ASFLAGS="-mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
+          
           make -f Makefile.libretro \
             platform=unix \
             ARCH=arm \
@@ -35,13 +41,10 @@ jobs:
             HAVE_VFP=1 \
             HAVE_CHD=1 \
             BUILTIN_GPU=unai \
-            CC=arm-linux-gnueabi-gcc \
-            CXX=arm-linux-gnueabi-g++ \
-            AS=arm-linux-gnueabi-as \
+            CC="arm-linux-gnueabi-gcc $OPT_FLAGS" \
+            CXX="arm-linux-gnueabi-g++ $OPT_FLAGS" \
+            AS="arm-linux-gnueabi-as -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp" \
             AR=arm-linux-gnueabi-ar \
-            CFLAGS="$OPT_FLAGS" \
-            CXXFLAGS="$OPT_FLAGS" \
-            EXTRA_CFLAGS="$OPT_FLAGS" \
             -j2 2>&1 | tee ../build_softfp.log
           arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
           cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_softfp.so
@@ -51,6 +54,11 @@ jobs:
           cd src
           make -f Makefile.libretro clean
           OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+          
+          export CFLAGS="$OPT_FLAGS"
+          export CXXFLAGS="$OPT_FLAGS"
+          export ASFLAGS="-mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"
+          
           make -f Makefile.libretro \
             platform=unix \
             ARCH=arm \
@@ -59,13 +67,10 @@ jobs:
             HAVE_VFP=1 \
             HAVE_CHD=1 \
             BUILTIN_GPU=unai \
-            CC=arm-linux-gnueabihf-gcc \
-            CXX=arm-linux-gnueabihf-g++ \
-            AS=arm-linux-gnueabihf-as \
+            CC="arm-linux-gnueabihf-gcc $OPT_FLAGS" \
+            CXX="arm-linux-gnueabihf-g++ $OPT_FLAGS" \
+            AS="arm-linux-gnueabihf-as -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard" \
             AR=arm-linux-gnueabihf-ar \
-            CFLAGS="$OPT_FLAGS" \
-            CXXFLAGS="$OPT_FLAGS" \
-            EXTRA_CFLAGS="$OPT_FLAGS" \
             -j2 2>&1 | tee ../build_hardfp.log
           arm-linux-gnueabihf-strip --strip-unneeded pcsx_rearmed_libretro.so
           cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp.so
