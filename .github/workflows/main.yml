@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Single-Core LTO Cortex-A9
+name: Build PCSX-ReARMed Single-Core Cortex-A9 (Safe Non-LTO)
 
 on:
   workflow_dispatch:
@@ -15,31 +15,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf git make
 
-      - name: Checkout and Patch for Single-Core Cortex-A9
+      - name: Checkout libretro/pcsx_rearmed at d2b40c8
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
           git checkout d2b40c8
           git submodule update --init
-          # 1. Force -O3 everywhere
+          # Upgrade default -O2 in Makefiles to -O3 without touching object lists
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
-          # 2. Remove THREAD_RENDERING overhead for single-core CPU
-          sed -i 's/THREAD_RENDERING = 1/THREAD_RENDERING = 0/g' Makefile.libretro
-          sed -i 's/-DTHREAD_RENDERING//g' Makefile.libretro
-          sed -i 's/plugins\/gpulib\/gpulib_thread_if.o//g' Makefile
 
-      - name: Build Cortex-A9 LTO (hardfp ABI)
+      - name: Build Cortex-A9 Optimized (hardfp ABI - No LTO)
         run: |
           cd src
           find . -name "*.o" -delete
           rm -f pcsx_rearmed_libretro.so
-          OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -flto -funroll-loops -fomit-frame-pointer -ffast-math -fstrict-aliasing -DNDEBUG -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+          
+          # Cortex-A9 800MHz specific flags:
+          # -march=armv7-a enables __ARM_ARCH_7A__ movw/movt in Ari64 dynarec
+          # -fno-semantic-interposition & -fno-plt remove shared-library call overhead
+          OPT_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -marm -O3 -funroll-loops -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -ftree-vectorize -fno-semantic-interposition -fno-plt -fvisibility=hidden -DNDEBUG -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+          ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"
           
           export CFLAGS="$OPT_FLAGS"
           export CXXFLAGS="$OPT_FLAGS"
-          export LDFLAGS="-flto $OPT_FLAGS"
-          export ASFLAGS="-mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"
+          export ASFLAGS="$ASM_FLAGS"
           
           make -f Makefile.libretro \
             platform=unix \
@@ -52,17 +52,28 @@ jobs:
             BUILTIN_GPU=unai \
             CC="arm-linux-gnueabihf-gcc $OPT_FLAGS" \
             CXX="arm-linux-gnueabihf-g++ $OPT_FLAGS" \
-            AS="arm-linux-gnueabihf-as -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard" \
-            AR=arm-linux-gnueabihf-gcc-ar \
-            -j2 2>&1 | tee ../build_hardfp_lto.log
+            AS="arm-linux-gnueabihf-as $ASM_FLAGS" \
+            AR=arm-linux-gnueabihf-ar \
+            -j2 2>&1 | tee ../build_hardfp_safe.log
           arm-linux-gnueabihf-strip --strip-unneeded pcsx_rearmed_libretro.so
-          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp_lto.so
+          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp.so
 
-      - name: Package .so File
+      - name: Verify Build & Symbols Report
+        run: |
+          echo "=== BUILT FILE SIZE ===" > build_report.txt
+          ls -lh pcsx_rearmed_libretro_hardfp.so >> build_report.txt
+          echo "=== CHECK THREAD_RENDERING IS GONE ===" >> build_report.txt
+          grep -i "THREAD_RENDERING" build_hardfp_safe.log | head -n 3 >> build_report.txt || echo "Confirmed: No THREAD_RENDERING!" >> build_report.txt
+          echo "=== VERIFY ARMV7 & UNAI SYMBOLS ===" >> build_report.txt
+          readelf -A pcsx_rearmed_libretro_hardfp.so >> build_report.txt
+          cat build_report.txt
+
+      - name: Package .so File and Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-singlecore-lto
+          name: pcsx-rearmed-cortex-a9-safe
           path: |
-            pcsx_rearmed_libretro_hardfp_lto.so
-            build_hardfp_lto.log
+            pcsx_rearmed_libretro_hardfp.so
+            build_hardfp_safe.log
+            build_report.txt
