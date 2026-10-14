@@ -1,0 +1,93 @@
+name: Build PCSX-ReARMed d2b40c8 Cortex-A9
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install ARMv7 Cross-Compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf git make
+
+      - name: Checkout libretro/pcsx_rearmed at d2b40c8
+        run: |
+          git clone https://github.com/libretro/pcsx_rearmed.git src
+          cd src
+          git checkout d2b40c8
+          git submodule update --init
+
+      - name: Build 1 - Cortex-A9 + Unai + CHD (softfp ABI)
+        run: |
+          cd src
+          make -f Makefile.libretro clean
+          OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+          make -f Makefile.libretro \
+            platform=unix \
+            ARCH=arm \
+            DYNAREC=ari64 \
+            HAVE_NEON=0 \
+            HAVE_VFP=1 \
+            HAVE_CHD=1 \
+            BUILTIN_GPU=unai \
+            CC=arm-linux-gnueabi-gcc \
+            CXX=arm-linux-gnueabi-g++ \
+            AS=arm-linux-gnueabi-as \
+            AR=arm-linux-gnueabi-ar \
+            CFLAGS="$OPT_FLAGS" \
+            CXXFLAGS="$OPT_FLAGS" \
+            EXTRA_CFLAGS="$OPT_FLAGS" \
+            -j2 2>&1 | tee ../build_softfp.log
+          arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
+          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_softfp.so
+
+      - name: Build 2 - Cortex-A9 + Unai + CHD (hardfp ABI)
+        run: |
+          cd src
+          make -f Makefile.libretro clean
+          OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+          make -f Makefile.libretro \
+            platform=unix \
+            ARCH=arm \
+            DYNAREC=ari64 \
+            HAVE_NEON=0 \
+            HAVE_VFP=1 \
+            HAVE_CHD=1 \
+            BUILTIN_GPU=unai \
+            CC=arm-linux-gnueabihf-gcc \
+            CXX=arm-linux-gnueabihf-g++ \
+            AS=arm-linux-gnueabihf-as \
+            AR=arm-linux-gnueabihf-ar \
+            CFLAGS="$OPT_FLAGS" \
+            CXXFLAGS="$OPT_FLAGS" \
+            EXTRA_CFLAGS="$OPT_FLAGS" \
+            -j2 2>&1 | tee ../build_hardfp.log
+          arm-linux-gnueabihf-strip --strip-unneeded pcsx_rearmed_libretro.so
+          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp.so
+
+      - name: Verify Build & Symbols Report
+        run: |
+          echo "=== COMMIT BUILT ===" > build_report.txt
+          cd src && git log -1 --oneline >> ../build_report.txt && cd ..
+          echo "=== VERIFY UNAI & CHD SYMBOLS ===" >> build_report.txt
+          arm-linux-gnueabi-nm -D pcsx_rearmed_libretro_softfp.so | grep -iE "unai|chd" | head -n 20 >> build_report.txt || true
+          echo "=== GLIBC VERSION REQUIREMENTS ===" >> build_report.txt
+          arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro_softfp.so | grep GLIBC_ | awk '{print $5}' | sort -u >> build_report.txt || true
+          cat build_report.txt
+
+      - name: Package .so Files and Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcsx-rearmed-d2b40c8-cortex-a9
+          path: |
+            pcsx_rearmed_libretro_softfp.so
+            pcsx_rearmed_libretro_hardfp.so
+            build_report.txt
+            build_softfp.log
+            build_hardfp.log
