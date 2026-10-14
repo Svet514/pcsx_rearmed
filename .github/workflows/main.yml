@@ -21,14 +21,17 @@ jobs:
           cd src
           git checkout d2b40c8
           git submodule update --init
+          # Force Makefile.libretro to use -O3 instead of overriding with -O2
+          sed -i 's/-O2/-O3/g' Makefile.libretro
+          sed -i 's/-O2/-O3/g' Makefile
 
       - name: Build 1 - Cortex-A9 + Unai + CHD (softfp ABI)
         run: |
           cd src
-          make -f Makefile.libretro clean
+          find . -name "*.o" -delete
+          rm -f pcsx_rearmed_libretro.so
           OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
           
-          # Export CFLAGS/CXXFLAGS into the environment so Makefile.libretro appends its -I include paths to them instead of losing them
           export CFLAGS="$OPT_FLAGS"
           export CXXFLAGS="$OPT_FLAGS"
           export ASFLAGS="-mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
@@ -52,7 +55,8 @@ jobs:
       - name: Build 2 - Cortex-A9 + Unai + CHD (hardfp ABI)
         run: |
           cd src
-          make -f Makefile.libretro clean
+          find . -name "*.o" -delete
+          rm -f pcsx_rearmed_libretro.so
           OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
           
           export CFLAGS="$OPT_FLAGS"
@@ -79,6 +83,8 @@ jobs:
         run: |
           echo "=== COMMIT BUILT ===" > build_report.txt
           cd src && git log -1 --oneline >> ../build_report.txt && cd ..
+          echo "=== BUILT FILES SIZE ===" >> build_report.txt
+          ls -lh pcsx_rearmed_libretro_*.so >> build_report.txt
           echo "=== VERIFY UNAI & CHD SYMBOLS ===" >> build_report.txt
           arm-linux-gnueabi-nm -D pcsx_rearmed_libretro_softfp.so | grep -iE "unai|chd" | head -n 20 >> build_report.txt || true
           echo "=== GLIBC VERSION REQUIREMENTS ===" >> build_report.txt
