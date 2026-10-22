@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Compatible GLIBC (Ubuntu 18.04 Docker)
+name: Build PCSX-ReARMed Max-Speed SoftFP Cortex-A9
 
 on:
   workflow_dispatch:
@@ -10,76 +10,70 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Inspect Retroleap v2.0.0-alpha10 Exact Config
-        run: |
-          wget -q https://github.com/mac2612/retroleap/archive/refs/tags/v2.0.0-alpha10.zip -O alpha10_src.zip
-          unzip -q alpha10_src.zip
-          echo "=== RETROLEAP ALPHA 10 LF2000 DEFCONFIG ===" > build_report.txt
-          cat retroleap-2.0.0-alpha10/configs/lf2000* >> build_report.txt || true
-          echo "=== RETROLEAP ALPHA 10 PCSX_REARMED RECIPE ===" >> build_report.txt
-          find retroleap-2.0.0-alpha10/package -iname "*pcsx*" -exec cat {} + >> build_report.txt || true
-
       - name: Checkout libretro/pcsx_rearmed at d2b40c8
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
           git checkout d2b40c8
           git submodule update --init
-          # Force -O3 optimization instead of -O2
+          # Force -O3 optimization everywhere instead of -O2
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
-          # Statically link libstdc++ and libgcc so it never fails on missing C++ libraries
+          # Statically link libstdc++ and libgcc (proven to work on Retroleap Alpha 10)
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile
 
-      - name: Compile Inside Ubuntu 18.04 Container (Old GLIBC + Static C++)
+      - name: Compile Max-Optimized SoftFP Builds Inside Ubuntu 18.04
         run: |
           docker run --rm -v "$PWD:/work" -w /work ubuntu:18.04 bash -e -c '
             apt-get update
-            apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf gcc-arm-linux-gnueabi g++-arm-linux-gnueabi make binutils
+            apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi make binutils git
 
             cd /work/src
 
-            # --- BUILD 1: HARDFP ---
+            # All safe maximum-speed Cortex-A9 + VFPv3-D16 + ARMv7 flags (NO -flto, NO -fvisibility=hidden)
+            MAX_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -DHAVE_ARMV7=1 -O3 -funroll-loops -fpeel-loops -ftracer -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -ftree-vectorize -fno-plt -fno-semantic-interposition -fgcse-sm -fgcse-las -fipa-pta -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
+
+            # --- BUILD 1: SINGLE-THREADED (No pthread GPU mutex overhead on 1-core CPU) ---
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
-            OPT_HF="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -funroll-loops -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
-            export CFLAGS="$OPT_HF"
-            export CXXFLAGS="$OPT_HF"
-            export ASFLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"
+            export CFLAGS="$MAX_FLAGS"
+            export CXXFLAGS="$MAX_FLAGS"
+            export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
-              platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabihf-gcc $OPT_HF" \
-              CXX="arm-linux-gnueabihf-g++ $OPT_HF -static-libstdc++ -static-libgcc" \
-              AS="arm-linux-gnueabihf-as -march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard" \
-              AR=arm-linux-gnueabihf-ar -j2 2>&1 | tee ../build_hardfp.log
-            arm-linux-gnueabihf-strip --strip-unneeded pcsx_rearmed_libretro.so
-            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp.so
-
-            # --- BUILD 2: SOFTFP ---
-            find . -name "*.o" -delete
-            rm -f pcsx_rearmed_libretro.so
-            OPT_SF="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -O3 -funroll-loops -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
-            export CFLAGS="$OPT_SF"
-            export CXXFLAGS="$OPT_SF"
-            export ASFLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
-
-            make -f Makefile.libretro \
-              platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $OPT_SF" \
-              CXX="arm-linux-gnueabi-g++ $OPT_SF -static-libstdc++ -static-libgcc" \
-              AS="arm-linux-gnueabi-as -march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_softfp.log
+              platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
+              CC="arm-linux-gnueabi-gcc $MAX_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $MAX_FLAGS -static-libstdc++ -static-libgcc" \
+              AS="arm-linux-gnueabi-as $ASM_FLAGS" \
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_singlethread.log
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
-            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_softfp.so
+            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_singlethread_softfp.so
 
-            # --- VERIFY SYMBOLS ---
+            # --- BUILD 2: THREADED RENDERING (With all new Cortex-A9 + HAVE_ARMV7 flags) ---
+            find . -name "*.o" -delete
+            rm -f pcsx_rearmed_libretro.so
+
+            make -f Makefile.libretro \
+              platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=1 BUILTIN_GPU=unai \
+              CC="arm-linux-gnueabi-gcc $MAX_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $MAX_FLAGS -static-libstdc++ -static-libgcc" \
+              AS="arm-linux-gnueabi-as $ASM_FLAGS" \
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_threaded.log
+            arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
+            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_threaded_softfp.so
+
+            # --- GENERATE REPORT ---
             cd /work
-            echo "=== NEEDED SHARED LIBRARIES (HARDFP) ===" >> build_report.txt
-            arm-linux-gnueabihf-readelf -d pcsx_rearmed_libretro_hardfp.so | grep NEEDED >> build_report.txt || true
-            echo "=== GLIBC SYMBOL VERSIONS REQUIRED (MUST NOT HAVE 2.33/2.34) ===" >> build_report.txt
-            arm-linux-gnueabihf-objdump -T pcsx_rearmed_libretro_hardfp.so | grep GLIBC_ | awk "{print \$5}" | sort -u >> build_report.txt || true
+            echo "=== BUILT FILES ===" > build_report.txt
+            ls -lh *.so >> build_report.txt
+            echo "=== VERIFY SINGLETHREAD HAS NO THREAD_RENDERING ===" >> build_report.txt
+            grep -c "THREAD_RENDERING" build_singlethread.log >> build_report.txt || true
+            echo "=== NEEDED SHARED LIBRARIES ===" >> build_report.txt
+            arm-linux-gnueabi-readelf -d pcsx_rearmed_singlethread_softfp.so | grep NEEDED >> build_report.txt || true
+            echo "=== GLIBC VERSIONS ===" >> build_report.txt
+            arm-linux-gnueabi-objdump -T pcsx_rearmed_singlethread_softfp.so | grep GLIBC_ | awk "{print \$5}" | sort -u >> build_report.txt || true
           '
           cat build_report.txt
 
@@ -87,10 +81,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-ubuntu18-compatible
+          name: pcsx-rearmed-max-softfp-pack
           path: |
-            pcsx_rearmed_libretro_hardfp.so
-            pcsx_rearmed_libretro_softfp.so
+            pcsx_rearmed_singlethread_softfp.so
+            pcsx_rearmed_threaded_softfp.so
             build_report.txt
-            build_hardfp.log
-            build_softfp.log
+            build_singlethread.log
+            build_threaded.log
