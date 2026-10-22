@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Single-Core Cortex-A9 (Safe Non-LTO)
+name: Build PCSX-ReARMed Exact Retroleap Match
 
 on:
   workflow_dispatch:
@@ -9,37 +9,51 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    container:
+      image: debian:stretch
     steps:
-      - name: Install ARMv7 Cross-Compilers
+      - name: Install Old-GLIBC ARM Cross-Compilers (GCC 6 - Max Compatibility)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf git make
+          echo "deb http://archive.debian.org/debian stretch main" > /etc/apt/sources.list
+          apt-get update -o Acquire::Check-Valid-Until=false
+          apt-get install -y --allow-unauthenticated \
+            gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+            git make wget unzip file binutils ca-certificates
+
+      - name: Inspect Retroleap v2.0.0-alpha10 Exact Config
+        run: |
+          wget --no-check-certificate -q https://github.com/mac2612/retroleap/archive/refs/tags/v2.0.0-alpha10.zip -O alpha10_src.zip
+          unzip -q alpha10_src.zip
+          echo "=== RETROLEAP ALPHA 10 LF2000 DEFCONFIG ===" > build_report.txt
+          cat retroleap-2.0.0-alpha10/configs/lf2000* >> build_report.txt || true
+          echo "=== RETROLEAP ALPHA 10 PCSX_REARMED RECIPE ===" >> build_report.txt
+          find retroleap-2.0.0-alpha10/package -iname "*pcsx*" -exec cat {} + >> build_report.txt || true
 
       - name: Checkout libretro/pcsx_rearmed at d2b40c8
         run: |
+          git config --global http.sslVerify false
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
           git checkout d2b40c8
           git submodule update --init
-          # Upgrade default -O2 in Makefiles to -O3 without touching object lists
+          # Force -O3 optimization instead of -O2
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
+          # Statically link libstdc++ and libgcc so it never fails on missing C++ libraries
+          sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile.libretro
+          sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile
 
-      - name: Build Cortex-A9 Optimized (hardfp ABI - No LTO)
+      - name: Build 1 - Cortex-A9 + Unai + CHD (hardfp ABI)
         run: |
           cd src
           find . -name "*.o" -delete
           rm -f pcsx_rearmed_libretro.so
-          
-          # Cortex-A9 800MHz specific flags:
-          # -march=armv7-a enables __ARM_ARCH_7A__ movw/movt in Ari64 dynarec
-          # -fno-semantic-interposition & -fno-plt remove shared-library call overhead
-          OPT_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -marm -O3 -funroll-loops -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -ftree-vectorize -fno-semantic-interposition -fno-plt -fvisibility=hidden -DNDEBUG -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
-          ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"
+          OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
           
           export CFLAGS="$OPT_FLAGS"
           export CXXFLAGS="$OPT_FLAGS"
-          export ASFLAGS="$ASM_FLAGS"
+          export ASFLAGS="-mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"
           
           make -f Makefile.libretro \
             platform=unix \
@@ -48,32 +62,58 @@ jobs:
             HAVE_NEON=0 \
             HAVE_VFP=1 \
             HAVE_CHD=1 \
-            THREAD_RENDERING=0 \
             BUILTIN_GPU=unai \
             CC="arm-linux-gnueabihf-gcc $OPT_FLAGS" \
-            CXX="arm-linux-gnueabihf-g++ $OPT_FLAGS" \
-            AS="arm-linux-gnueabihf-as $ASM_FLAGS" \
+            CXX="arm-linux-gnueabihf-g++ $OPT_FLAGS -static-libstdc++ -static-libgcc" \
+            AS="arm-linux-gnueabihf-as -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard" \
             AR=arm-linux-gnueabihf-ar \
-            -j2 2>&1 | tee ../build_hardfp_safe.log
+            -j2 2>&1 | tee ../build_hardfp.log
           arm-linux-gnueabihf-strip --strip-unneeded pcsx_rearmed_libretro.so
           cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp.so
 
-      - name: Verify Build & Symbols Report
+      - name: Build 2 - Cortex-A9 + Unai + CHD (softfp ABI)
         run: |
-          echo "=== BUILT FILE SIZE ===" > build_report.txt
-          ls -lh pcsx_rearmed_libretro_hardfp.so >> build_report.txt
-          echo "=== CHECK THREAD_RENDERING IS GONE ===" >> build_report.txt
-          grep -i "THREAD_RENDERING" build_hardfp_safe.log | head -n 3 >> build_report.txt || echo "Confirmed: No THREAD_RENDERING!" >> build_report.txt
-          echo "=== VERIFY ARMV7 & UNAI SYMBOLS ===" >> build_report.txt
-          readelf -A pcsx_rearmed_libretro_hardfp.so >> build_report.txt
+          cd src
+          find . -name "*.o" -delete
+          rm -f pcsx_rearmed_libretro.so
+          OPT_FLAGS="-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+          
+          export CFLAGS="$OPT_FLAGS"
+          export CXXFLAGS="$OPT_FLAGS"
+          export ASFLAGS="-mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
+          
+          make -f Makefile.libretro \
+            platform=unix \
+            ARCH=arm \
+            DYNAREC=ari64 \
+            HAVE_NEON=0 \
+            HAVE_VFP=1 \
+            HAVE_CHD=1 \
+            BUILTIN_GPU=unai \
+            CC="arm-linux-gnueabi-gcc $OPT_FLAGS" \
+            CXX="arm-linux-gnueabi-g++ $OPT_FLAGS -static-libstdc++ -static-libgcc" \
+            AS="arm-linux-gnueabi-as -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp" \
+            AR=arm-linux-gnueabi-ar \
+            -j2 2>&1 | tee ../build_softfp.log
+          arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
+          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_softfp.so
+
+      - name: Check Dependencies & GLIBC Symbols
+        run: |
+          echo "=== NEEDED SHARED LIBRARIES (MUST NOT REQUIRE libstdc++.so.6) ===" >> build_report.txt
+          arm-linux-gnueabihf-readelf -d pcsx_rearmed_libretro_hardfp.so | grep NEEDED >> build_report.txt || true
+          echo "=== GLIBC SYMBOL VERSIONS REQUIRED ===" >> build_report.txt
+          arm-linux-gnueabihf-objdump -T pcsx_rearmed_libretro_hardfp.so | grep GLIBC_ | awk '{print $5}' | sort -u >> build_report.txt || true
           cat build_report.txt
 
-      - name: Package .so File and Report
+      - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-cortex-a9-safe
+          name: pcsx-rearmed-leapster-compatible
           path: |
             pcsx_rearmed_libretro_hardfp.so
-            build_hardfp_safe.log
+            pcsx_rearmed_libretro_softfp.so
             build_report.txt
+            build_hardfp.log
+            build_softfp.log
