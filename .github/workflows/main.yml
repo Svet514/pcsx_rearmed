@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Ultimate Cortex-A9 SoftFP
+name: Build PCSX-ReARMed Ultimate + Blues Clues Fix
 
 on:
   workflow_dispatch:
@@ -10,12 +10,47 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout and Patch Source for 800MHz Cortex-A9
+      - name: Checkout d2b40c8 & Backport Channel 255 Audio Fix
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
+
+          echo "=== FINDING UPSTREAM CHANNEL 255 COMMIT ===" > ../blues_clues_patch_report.txt
+          git log --all --grep="255" -p -n 2 >> ../blues_clues_patch_report.txt || true
+
+          # Checkout our fast Retroleap Alpha 10 base commit
           git checkout d2b40c8
           git submodule update --init
+
+          # Cherry-pick the upstream Channel 255 commit if found, AND apply the direct C guard in decode_xa.c & cdrom.c
+          COMMIT_255=$(git log --all --grep="channel number 255" --format="%H" -n 1)
+          if [ -n "$COMMIT_255" ]; then
+            echo "Found exact commit: $COMMIT_255" >> ../blues_clues_patch_report.txt
+            git cherry-pick -n "$COMMIT_255" >> ../blues_clues_patch_report.txt 2>&1 || git checkout -- .
+          fi
+
+          # Ensure decode_xa.c and cdrom.c strictly ignore channel 255 (0xff) sectors
+          python3 -c '
+          with open("libpcsxcore/decode_xa.c", "r") as f:
+              code = f.read()
+          target = "xdp->nbits = 4;"
+          patch = "if (sectorp[1] == 0xff || (sectorp[2] & 0x44) != 0x44 && sectorp[1] == 255) return -1;\n\txdp->nbits = 4;"
+          if "sectorp[1] == 0xff" not in code and target in code:
+              code = code.replace(target, patch, 1)
+              with open("libpcsxcore/decode_xa.c", "w") as f:
+                  f.write(code)
+              print("Patched decode_xa.c for channel 255")
+
+          with open("libpcsxcore/cdrom.c", "r") as f:
+              cdrom = f.read()
+          print("--- cdrom.c XA filter lines ---")
+          for line in cdrom.splitlines():
+              if "Filter" in line or "xa_decode_sector" in line or "0xff" in line:
+                  print(line)
+          ' >> ../blues_clues_patch_report.txt
+
+          echo "=== GIT DIFF APPLIED TO d2b40c8 ===" >> ../blues_clues_patch_report.txt
+          git diff >> ../blues_clues_patch_report.txt
 
           # 1. Force -O3 everywhere
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -24,9 +59,6 @@ jobs:
           # 2. Statically link libstdc++ and libgcc
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile
-
-          # 3. Default PCSX CPU clock to 48 and enable Unai/GTE speed hacks by default in frontend/libretro.c
-          sed -i 's/"pcsx_rearmed_psxclock", "57"/"pcsx_rearmed_psxclock", "48"/g' frontend/libretro.c || true
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -38,9 +70,6 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            # Cortex-A9 800MHz Ultimate Flags:
-            # -munaligned-access speeds up CHD LZMA/Zlib decompression & Unai pixel reads
-            # -fprefetch-loop-arrays + cache params emit ARMv7 PLD (Preload Data) instructions
             ULTIMATE_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -munaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -ftree-vectorize -fprefetch-loop-arrays --param l1-cache-size=32 --param l1-cache-line-size=32 --param l2-cache-size=128 -fno-plt -fno-semantic-interposition -fgcse-sm -fgcse-las -fipa-pta -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
@@ -53,17 +82,19 @@ jobs:
               CC="arm-linux-gnueabi-gcc $ULTIMATE_FLAGS" \
               CXX="arm-linux-gnueabi-g++ $ULTIMATE_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_ultimate.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_blues_clues.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
           '
+          cat blues_clues_patch_report.txt
 
-      - name: Upload Ready-to-Use .so File
+      - name: Upload Ready-to-Use .so File & Patch Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-ultimate-leapster
+          name: pcsx-rearmed-ultimate-blues-clues
           path: |
             pcsx_rearmed_libretro.so
-            build_ultimate.log
+            blues_clues_patch_report.txt
+            build_blues_clues.log
