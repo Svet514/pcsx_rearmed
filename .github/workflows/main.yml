@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Linaro Toolchain Cortex-A9
+name: Build PCSX-ReARMed Compatible GLIBC (Ubuntu 18.04 Docker)
 
 on:
   workflow_dispatch:
@@ -10,19 +10,6 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Download Linaro GCC 7.5 (Old-GLIBC) ARM Toolchains
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y git make wget unzip file binutils xz-utils
-          
-          # Download standalone Linaro GCC 7.5 (targets older glibc 2.25, no GLIBC_2.33/2.34)
-          wget -q https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/arm-linux-gnueabihf/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf.tar.xz -O tc_hf.tar.xz
-          wget -q https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/arm-linux-gnueabi/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabi.tar.xz -O tc_soft.tar.xz
-          
-          mkdir -p $HOME/toolchains
-          tar -xf tc_hf.tar.xz -C $HOME/toolchains
-          tar -xf tc_soft.tar.xz -C $HOME/toolchains
-
       - name: Inspect Retroleap v2.0.0-alpha10 Exact Config
         run: |
           wget -q https://github.com/mac2612/retroleap/archive/refs/tags/v2.0.0-alpha10.zip -O alpha10_src.zip
@@ -38,85 +25,69 @@ jobs:
           cd src
           git checkout d2b40c8
           git submodule update --init
-          # Upgrade -O2 to -O3
+          # Force -O3 optimization instead of -O2
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
-          # Statically link libstdc++ and libgcc into the .so
+          # Statically link libstdc++ and libgcc so it never fails on missing C++ libraries
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile
 
-      - name: Build 1 - Cortex-A9 + Unai + CHD (hardfp ABI)
+      - name: Compile Inside Ubuntu 18.04 Container (Old GLIBC + Static C++)
         run: |
-          export PATH="$HOME/toolchains/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin:$PATH"
-          cd src
-          find . -name "*.o" -delete
-          rm -f pcsx_rearmed_libretro.so
-          
-          OPT_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -funroll-loops -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
-          
-          export CFLAGS="$OPT_FLAGS"
-          export CXXFLAGS="$OPT_FLAGS"
-          export ASFLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"
-          
-          make -f Makefile.libretro \
-            platform=unix \
-            ARCH=arm \
-            DYNAREC=ari64 \
-            HAVE_NEON=0 \
-            HAVE_VFP=1 \
-            HAVE_CHD=1 \
-            BUILTIN_GPU=unai \
-            CC="arm-linux-gnueabihf-gcc $OPT_FLAGS" \
-            CXX="arm-linux-gnueabihf-g++ $OPT_FLAGS -static-libstdc++ -static-libgcc" \
-            AS="arm-linux-gnueabihf-as -march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard" \
-            AR=arm-linux-gnueabihf-ar \
-            -j2 2>&1 | tee ../build_hardfp.log
-          arm-linux-gnueabihf-strip --strip-unneeded pcsx_rearmed_libretro.so
-          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp.so
+          docker run --rm -v "$PWD:/work" -w /work ubuntu:18.04 bash -e -c '
+            apt-get update
+            apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf gcc-arm-linux-gnueabi g++-arm-linux-gnueabi make binutils
 
-      - name: Build 2 - Cortex-A9 + Unai + CHD (softfp ABI)
-        run: |
-          export PATH="$HOME/toolchains/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabi/bin:$PATH"
-          cd src
-          find . -name "*.o" -delete
-          rm -f pcsx_rearmed_libretro.so
-          
-          OPT_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -O3 -funroll-loops -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
-          
-          export CFLAGS="$OPT_FLAGS"
-          export CXXFLAGS="$OPT_FLAGS"
-          export ASFLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
-          
-          make -f Makefile.libretro \
-            platform=unix \
-            ARCH=arm \
-            DYNAREC=ari64 \
-            HAVE_NEON=0 \
-            HAVE_VFP=1 \
-            HAVE_CHD=1 \
-            BUILTIN_GPU=unai \
-            CC="arm-linux-gnueabi-gcc $OPT_FLAGS" \
-            CXX="arm-linux-gnueabi-g++ $OPT_FLAGS -static-libstdc++ -static-libgcc" \
-            AS="arm-linux-gnueabi-as -march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp" \
-            AR=arm-linux-gnueabi-ar \
-            -j2 2>&1 | tee ../build_softfp.log
-          arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
-          cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_softfp.so
+            cd /work/src
 
-      - name: Verify Dependencies & GLIBC Symbols
-        run: |
-          export PATH="$HOME/toolchains/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin:$PATH"
-          echo "=== NEEDED SHARED LIBRARIES (HARDFP) ===" >> build_report.txt
-          arm-linux-gnueabihf-readelf -d pcsx_rearmed_libretro_hardfp.so | grep NEEDED >> build_report.txt || true
-          echo "=== GLIBC SYMBOL VERSIONS REQUIRED (MUST NOT HAVE 2.33/2.34) ===" >> build_report.txt
-          arm-linux-gnueabihf-objdump -T pcsx_rearmed_libretro_hardfp.so | grep GLIBC_ | awk '{print $5}' | sort -u >> build_report.txt || true
+            # --- BUILD 1: HARDFP ---
+            find . -name "*.o" -delete
+            rm -f pcsx_rearmed_libretro.so
+            OPT_HF="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -O3 -funroll-loops -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+            export CFLAGS="$OPT_HF"
+            export CXXFLAGS="$OPT_HF"
+            export ASFLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"
+
+            make -f Makefile.libretro \
+              platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 BUILTIN_GPU=unai \
+              CC="arm-linux-gnueabihf-gcc $OPT_HF" \
+              CXX="arm-linux-gnueabihf-g++ $OPT_HF -static-libstdc++ -static-libgcc" \
+              AS="arm-linux-gnueabihf-as -march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard" \
+              AR=arm-linux-gnueabihf-ar -j2 2>&1 | tee ../build_hardfp.log
+            arm-linux-gnueabihf-strip --strip-unneeded pcsx_rearmed_libretro.so
+            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_hardfp.so
+
+            # --- BUILD 2: SOFTFP ---
+            find . -name "*.o" -delete
+            rm -f pcsx_rearmed_libretro.so
+            OPT_SF="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -O3 -funroll-loops -fomit-frame-pointer -ffast-math -fstrict-aliasing -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector"
+            export CFLAGS="$OPT_SF"
+            export CXXFLAGS="$OPT_SF"
+            export ASFLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
+
+            make -f Makefile.libretro \
+              platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 BUILTIN_GPU=unai \
+              CC="arm-linux-gnueabi-gcc $OPT_SF" \
+              CXX="arm-linux-gnueabi-g++ $OPT_SF -static-libstdc++ -static-libgcc" \
+              AS="arm-linux-gnueabi-as -march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp" \
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_softfp.log
+            arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
+            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro_softfp.so
+
+            # --- VERIFY SYMBOLS ---
+            cd /work
+            echo "=== NEEDED SHARED LIBRARIES (HARDFP) ===" >> build_report.txt
+            arm-linux-gnueabihf-readelf -d pcsx_rearmed_libretro_hardfp.so | grep NEEDED >> build_report.txt || true
+            echo "=== GLIBC SYMBOL VERSIONS REQUIRED (MUST NOT HAVE 2.33/2.34) ===" >> build_report.txt
+            arm-linux-gnueabihf-objdump -T pcsx_rearmed_libretro_hardfp.so | grep GLIBC_ | awk "{print \$5}" | sort -u >> build_report.txt || true
+          '
           cat build_report.txt
 
       - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-linaro-compatible
+          name: pcsx-rearmed-ubuntu18-compatible
           path: |
             pcsx_rearmed_libretro_hardfp.so
             pcsx_rearmed_libretro_softfp.so
