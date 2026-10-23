@@ -19,15 +19,6 @@ jobs:
           # 1. Backport the official August 2021 cdrom.c & cdrom.h (e73e384c) which has the Blue's Clues & CD timing fixes
           git checkout e73e384cfacbb9b03d14f809e1283dc715068e3c -- libpcsxcore/cdrom.c libpcsxcore/cdrom.h libpcsxcore/decode_xa.c
 
-          # 2. Fix the exact Cat/Dog cutscene bug in cdrom.c:
-          # Do NOT let dummy/non-audio sectors lock cdr.Channel on FirstSector==1, and NEVER set cdr.FirstSector = -1 to kill the stream!
-          sed -i 's/if( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 )/if( (cdr.Transfer[4 + 2] \& 0x4) \&\& cdr.Transfer[4 + 1] != 255 \&\& (cdr.FirstSector == 1 || cdr.Channel == 255) )/g' libpcsxcore/cdrom.c
-          sed -i 's/if( cdr.FirstSector == 1 )/if( (cdr.Transfer[4 + 2] \& 0x4) \&\& cdr.Transfer[4 + 1] != 255 \&\& (cdr.FirstSector == 1 || cdr.Channel == 255) )/g' libpcsxcore/cdrom.c
-          sed -i 's/else cdr.FirstSector = -1;//g' libpcsxcore/cdrom.c
-
-          # 3. Also guard decode_xa.c against channel 255
-          sed -i 's/xdp->nbits = 4;/if (sectorp[1] == 0xff) return -1; xdp->nbits = 4;/g' libpcsxcore/decode_xa.c
-
           # 4. Force -O3 everywhere in Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
