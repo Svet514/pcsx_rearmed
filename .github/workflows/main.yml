@@ -17,49 +17,41 @@ jobs:
           git checkout d2b40c8
           git submodule update --init
 
-          # Patch libpcsxcore/cdrom.c so Channel 255 (0xff) sectors NEVER lock cdr.Channel/cdr.FirstSector and are completely ignored
-          python3 -c '
+          cat << 'EOF' > patch_cdrom.py
+          import re
+
           with open("libpcsxcore/cdrom.c", "r") as f:
               code = f.read()
 
-          # Print the original lines around cdr.Transfer[4 + 1] so we can see them in the report
           lines = code.splitlines()
           for i, line in enumerate(lines):
               if "cdr.Transfer[4 + 1]" in line or "xa_decode_sector" in line:
                   start = max(0, i - 10)
-                  end = min(len(lines), i + 20)
+                  end = min(len(lines), i + 25)
                   print("=== ORIGINAL CDROM.C LINES ===")
                   print("\n".join(lines[start:end]))
                   break
 
-          # 1. Prevent Channel 255 dummy sectors from locking cdr.Channel & consuming cdr.FirstSector
-          old_lock = """if (cdr.FirstSector == 1) {
-\t\t\tcdr.File = cdr.Transfer[4 + 0];
-\t\t\tcdr.Channel = cdr.Transfer[4 + 1];
-\t\t}"""
-          new_lock = """if (cdr.Transfer[4 + 1] == 0xff) {
-\t\t\t/* Ignore dummy channel 255 sector completely so it does not lock cdr.Channel */
-\t\t} else if (cdr.FirstSector == 1 || cdr.Channel == 0xff) {
-\t\t\tcdr.File = cdr.Transfer[4 + 0];
-\t\t\tcdr.Channel = cdr.Transfer[4 + 1];
-\t\t\tcdr.FirstSector = 1;
-\t\t}"""
+          # 1. Prevent Channel 255 (0xff) dummy sectors from locking cdr.Channel or consuming cdr.FirstSector
+          new_lock = (
+              "if (cdr.Transfer[4 + 1] == 0xff) {\n"
+              "\t\t\t/* Ignore dummy channel 255 sector */\n"
+              "\t\t} else if (cdr.FirstSector == 1 || cdr.Channel == 0xff) {\n"
+              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t\tcdr.FirstSector = 1;\n"
+              "\t\t}"
+          )
 
-          if old_lock in code:
-              code = code.replace(old_lock, new_lock, 1)
-              print("Successfully patched cdr.FirstSector channel lock in cdrom.c!")
-          else:
-              # Fallback flexible replacement if indentation differs
-              import re
-              code, count = re.subn(
-                  r"if\s*\(\s*cdr\.FirstSector\s*==\s*1\s*\)\s*\{\s*cdr\.File\s*=\s*cdr\.Transfer\[4\s*\+\s*0\];\s*cdr\.Channel\s*=\s*cdr\.Transfer\[4\s*\+\s*1\];\s*\}",
-                  new_lock,
-                  code,
-                  count=1
-              )
-              print(f"Regex patched cdr.FirstSector lock: {count} match(es)")
+          code, count = re.subn(
+              r"if\s*\(\s*cdr\.FirstSector\s*==\s*1\s*\)\s*\{\s*cdr\.File\s*=\s*cdr\.Transfer\[4\s*\+\s*0\];\s*cdr\.Channel\s*=\s*cdr\.Transfer\[4\s*\+\s*1\];\s*\}",
+              new_lock,
+              code,
+              count=1
+          )
+          print(f"Patched cdr.FirstSector lock: {count} match(es)")
 
-          # 2. Also ensure the xa_decode_sector condition checks cdr.Channel != 255 and cdr.Transfer[4 + 1] != 0xff
+          # 2. Ensure xa_decode_sector check also ignores channel 255 (0xff)
           old_xa = "(cdr.Transfer[4 + 0] == cdr.File))"
           new_xa = "(cdr.Transfer[4 + 0] == cdr.File) && (cdr.Channel != 0xff) && (cdr.Transfer[4 + 1] != 0xff))"
           if old_xa in code:
@@ -68,10 +60,24 @@ jobs:
 
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(code)
-          ' > ../blues_clues_cdrom_report.txt
 
-          echo "=== VERIFY GIT DIFF ON LIBPCSXCORE/CDROM.C ===" >> ../blues_clues_cdrom_report.txt
-          git diff libpcsxcore/cdrom.c >> ../blues_clues_cdrom_report.txt
+          # 3. Also keep the guard inside decode_xa.c as a second layer of protection
+          with open("libpcsxcore/decode_xa.c", "r") as f:
+              xa_code = f.read()
+          target = "xdp->nbits = 4;"
+          patch = "if (sectorp[1] == 0xff) return -1;\n\txdp->nbits = 4;"
+          if "sectorp[1] == 0xff" not in xa_code and target in xa_code:
+              xa_code = xa_code.replace(target, patch, 1)
+              with open("libpcsxcore/decode_xa.c", "w") as f:
+                  f.write(xa_code)
+              print("Successfully patched decode_xa.c!")
+          EOF
+
+          python3 patch_cdrom.py > ../blues_clues_cdrom_report.txt
+          rm -f patch_cdrom.py
+
+          echo "=== VERIFY GIT DIFF ON CDROM.C & DECODE_XA.C ===" >> ../blues_clues_cdrom_report.txt
+          git diff >> ../blues_clues_cdrom_report.txt
 
           # 1. Force -O3 everywhere
           sed -i 's/-O2/-O3/g' Makefile.libretro
