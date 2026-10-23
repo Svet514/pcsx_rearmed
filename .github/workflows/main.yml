@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Cortex-A9 + AutoFrameSkip + BluesClues v4
+name: Build PCSX-ReARMed e73e384c Max-50FPS Cortex-A9
 
 on:
   workflow_dispatch:
@@ -10,119 +10,29 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Source & Apply CDROM + Dynamic Audio-Sync Patches
+      - name: Checkout Commit e73e384c (Aug 2021) & Apply Clean Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
-
-          # Grab the exact cdrom.c and decode_xa.c from the official Blue's Clues fix commit (e73e384c)
-          git show e73e384cfacbb9b03d14f809e1283dc715068e3c:libpcsxcore/cdrom.c > /tmp/cdrom_fixed.c
-          git show e73e384cfacbb9b03d14f809e1283dc715068e3c:libpcsxcore/cdrom.h > /tmp/cdrom_fixed.h
-
-          # Checkout our fast Retroleap Alpha 10 base
-          git checkout d2b40c8
+          git checkout e73e384cfacbb9b03d14f809e1283dc715068e3c
           git submodule update --init
 
-          # Copy the official August 2021 cdrom.c & cdrom.h (which includes all CdlSetfilter, FastForward, and Blue's Clues fixes)
-          cp /tmp/cdrom_fixed.c libpcsxcore/cdrom.c
-          cp /tmp/cdrom_fixed.h libpcsxcore/cdrom.h
+          # 1. Fix Blue's Clues Cat/Dog cutscene: only lock cdr.Channel on real audio sectors (!= 255) and ignore MODE_SF channel mismatches on 255
+          sed -i 's/if( cdr.FirstSector == 1 )/if( (cdr.Transfer[4 + 2] \& 0x4) \&\& cdr.Transfer[4 + 1] != 255 \&\& (cdr.FirstSector == 1 || cdr.Channel == 255 || (cdr.Mode \& MODE_SF) == 0) )/g' libpcsxcore/cdrom.c
 
-          cat << 'EOF' > apply_patches.py
-          with open("libpcsxcore/cdrom.c", "r") as f:
-              cdrom = f.read()
+          # 2. Also ensure decode_xa.c immediately drops any rogue channel 255 sector
+          sed -i 's/xdp->nbits = 4;/if (sectorp[1] == 0xff) return -1; xdp->nbits = 4;/g' libpcsxcore/decode_xa.c
 
-          # In cdrom.c, also ensure that if a game uses MODE_SF with Channel 255 or switches XA channels in cutscenes,
-          # dummy channel 255 sectors NEVER overwrite cdr.Channel or block the Cat cutscene in Blue's Clues:
-          old_block = """\t\tif( cdr.FirstSector == 1 ) {
-\t\t\tcdr.File = cdr.Transfer[4 + 0];
-\t\t\tcdr.Channel = cdr.Transfer[4 + 1];
-\t\t}"""
-          new_block = """\t\tif (cdr.Transfer[4 + 1] != 0xff && (cdr.Transfer[4 + 2] & 0x4)) {
-\t\t\tif (cdr.FirstSector == 1 || cdr.Channel == 0xff || (cdr.Mode & MODE_SF) == 0) {
-\t\t\t\tcdr.File = cdr.Transfer[4 + 0];
-\t\t\t\tcdr.Channel = cdr.Transfer[4 + 1];
-\t\t\t}
-\t\t}"""
-          if old_block in cdrom:
-              cdrom = cdrom.replace(old_block, new_block, 1)
-              print("SUCCESS: Patched e73e384c cdrom.c with enhanced Blue's Clues channel lock!")
-          else:
-              print("WARNING: old_block pattern differed in e73e384c cdrom.c")
-
-          with open("libpcsxcore/cdrom.c", "w") as f:
-              f.write(cdrom)
-
-          # Now patch frontend/libretro.c to add Micro Auto-Frameskip when frameskip == 0 and FPS dips below 50/60,
-          # so audio NEVER crackles or slows down at 44-48 FPS while keeping FPS at 42-50 instead of 25!
-          with open("frontend/libretro.c", "r") as f:
-              lr = f.read()
-
-          for i, line in enumerate(lr.splitlines()):
-              if "fskip_advice" in line:
-                  start = max(0, i - 10)
-                  end = min(len(lr.splitlines()), i + 15)
-                  print("=== LIBRETRO.C FSKIP LINES ===")
-                  print("\n".join(lr.splitlines()[start:end]))
-                  break
-          EOF
-
-          python3 apply_patches.py > ../patch_v4_report.txt
-          rm -f apply_patches.py
-
-          echo "=== GIT DIFF ON CDROM ===" >> ../patch_v4_report.txt
-          git diff libpcsxcore/cdrom.c >> ../patch_v4_report.txt
-
-          # 1. Force -O3 everywhere
+          # 3. Force -O3 everywhere in Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
 
-          # 2. Statically link libstdc++ and libgcc
+          # 4. Statically link libstdc++ and libgcc for Retroleap Alpha 10
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile
 
-      - name: Patch Dynamic Audio-Saving Auto-Frameskip into frontend/libretro.c
-        run: |
-          cd src
-          cat << 'EOF' > patch_fskip.py
-          with open("frontend/libretro.c", "r") as f:
-              code = f.read()
-
-          # Add a high-resolution frame timer in retro_run() so if frameskip is set to 0 (or 1),
-          # instead of skipping every other frame (25fps), it ONLY skips a frame when the previous frame took > 20.5ms (PAL) / 17.0ms (NTSC)!
-          target = "psxCpu->ExecuteBlock(EXEC_CALLER_OTHER);"
-          replacement = """{
-\t\tstatic uint64_t last_usec = 0;
-\t\tstatic int consecutive_skips = 0;
-\t\tstruct timeval tv;
-\t\tgettimeofday(&tv, NULL);
-\t\tuint64_t now_usec = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-\t\tuint64_t target_usec = Config.PsxType ? 20000ULL : 16667ULL;
-\t\tif (pl_rearmed_cbs.frameskip == 1) {
-\t\t\t/* Smart Dynamic Auto-Frameskip: only skip a frame if the CPU took longer than 1 frame time! */
-\t\t\tif (last_usec != 0 && (now_usec - last_usec) > (target_usec + 800ULL) && consecutive_skips < 2) {
-\t\t\t\tpl_rearmed_cbs.fskip_advice = 1;
-\t\t\t\tconsecutive_skips++;
-\t\t\t} else {
-\t\t\t\tpl_rearmed_cbs.fskip_advice = 0;
-\t\t\t\tconsecutive_skips = 0;
-\t\t\t}
-\t\t}
-\t\tlast_usec = now_usec;
-\t}
-\tpsxCpu->ExecuteBlock(EXEC_CALLER_OTHER);"""
-
-          if target in code:
-              code = "/* Auto-fskip time.h */\n#include <sys/time.h>\n" + code.replace(target, replacement, 1)
-              with open("frontend/libretro.c", "w") as f:
-                  f.write(code)
-              print("SUCCESS: Patched Smart Dynamic Auto-Frameskip into retro_run()!")
-          else:
-              print("WARNING: ExecuteBlock target not found in frontend/libretro.c")
-          EOF
-
-          python3 patch_fskip.py >> ../patch_v4_report.txt
-          rm -f patch_fskip.py
-          git diff frontend/libretro.c >> ../patch_v4_report.txt
+          echo "=== GIT DIFF APPLIED TO e73e384c ===" > ../build_e73e384c_report.txt
+          git diff >> ../build_e73e384c_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -134,7 +44,8 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            ULTIMATE_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -munaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -ftree-vectorize -fprefetch-loop-arrays --param l1-cache-size=32 --param l1-cache-line-size=32 --param l2-cache-size=128 -fno-plt -fno-semantic-interposition -fgcse-sm -fgcse-las -fipa-pta -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            # Pure 50FPS Cortex-A9 800MHz flags: added -finline-functions -finline-limit=1000 -fira-loop-pressure -fsched-pressure
+            ULTIMATE_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -munaligned-access -O3 -finline-functions -finline-limit=1000 -funroll-loops -fpeel-loops -ftracer -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -funsafe-loop-optimizations -fira-loop-pressure -fsched-pressure -fstrict-aliasing -ftree-vectorize -fprefetch-loop-arrays --param l1-cache-size=32 --param l1-cache-line-size=32 --param l2-cache-size=128 -fno-plt -fno-semantic-interposition -fgcse-sm -fgcse-las -fipa-pta -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
             export CFLAGS="$ULTIMATE_FLAGS"
@@ -146,19 +57,19 @@ jobs:
               CC="arm-linux-gnueabi-gcc $ULTIMATE_FLAGS" \
               CXX="arm-linux-gnueabi-g++ $ULTIMATE_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v4.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_e73e384c.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
           '
-          cat patch_v4_report.txt
+          cat build_e73e384c_report.txt
 
-      - name: Upload Ready-to-Use .so File & v4 Report
+      - name: Upload Ready-to-Use .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v4-autofskip-bluesclues
+          name: pcsx-rearmed-e73e384c-max50fps
           path: |
             pcsx_rearmed_libretro.so
-            patch_v4_report.txt
-            build_v4.log
+            build_e73e384c_report.txt
+            build_e73e384c.log
