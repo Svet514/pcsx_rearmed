@@ -21,49 +21,48 @@ jobs:
           with open("libpcsxcore/cdrom.c", "r") as f:
               code = f.read()
 
-          # Exact block from d2b40c8 (verified from blues_clues_cdrom_report.txt)
-          exact_old_block = """\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA
-\t\t// Firemen 2: Multi-XA files - briefings, cutscenes
-\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {
-\t\t\tcdr.File = cdr.Transfer[4 + 0];
-\t\t\tcdr.Channel = cdr.Transfer[4 + 1];
-\t\t}
+          exact_old_block = (
+              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
+              "\t\t// Firemen 2: Multi-XA files - briefings, cutscenes\n"
+              "\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {\n"
+              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t}\n"
+              "\n"
+              "\t\tif((cdr.Transfer[4 + 2] & 0x4) &&\n"
+              "\t\t\t (cdr.Transfer[4 + 1] == cdr.Channel) &&\n"
+              "\t\t\t (cdr.Transfer[4 + 0] == cdr.File)) {\n"
+              "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);\n"
+              "\t\t\tif (!ret) {\n"
+              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);\n"
+              "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);\n"
+              "\t\t\t\tcdr.FirstSector = 0;\n"
+              "\t\t\t}\n"
+              "\t\t\telse cdr.FirstSector = -1;\n"
+              "\t\t}\n"
+              "\t}"
+          )
 
-\t\tif((cdr.Transfer[4 + 2] & 0x4) &&
-\t\t\t (cdr.Transfer[4 + 1] == cdr.Channel) &&
-\t\t\t (cdr.Transfer[4 + 0] == cdr.File)) {
-\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);
-\t\t\tif (!ret) {
-\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);
-\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);
-\t\t\t\tcdr.FirstSector = 0;
-\t\t\t}
-\t\t\telse cdr.FirstSector = -1;
-\t\t}
-\t}"""
-
-          # Patched block:
-          # 1. Ignores channel 255 (0xff) sectors completely so they never lock cdr.Channel or set FirstSector = -1
-          # 2. If cdr.Channel was set to 0xff (255) by the game or FirstSector==1, locks onto the first valid audio sector (cdr.Transfer[4+2] & 0x4)
-          # 3. Does not kill the stream with cdr.FirstSector = -1 on a rejected sector
-          exact_new_block = """\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA
-\t\t// Firemen 2 & Blue's Clues: Multi-XA files & Channel 255 fix
-\t\tif ((cdr.Transfer[4 + 2] & 0x4) && (cdr.Transfer[4 + 1] != 0xff)) {
-\t\t\tif ((cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0) || cdr.Channel == 0xff) {
-\t\t\t\tcdr.File = cdr.Transfer[4 + 0];
-\t\t\t\tcdr.Channel = cdr.Transfer[4 + 1];
-\t\t\t}
-\t\t\tif ((cdr.Transfer[4 + 1] == cdr.Channel) &&
-\t\t\t    (cdr.Transfer[4 + 0] == cdr.File)) {
-\t\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);
-\t\t\t\tif (!ret) {
-\t\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);
-\t\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);
-\t\t\t\t\tcdr.FirstSector = 0;
-\t\t\t\t}
-\t\t\t}
-\t\t}
-\t}"""
+          exact_new_block = (
+              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
+              "\t\t// Firemen 2 & Blue's Clues: Multi-XA files & Channel 255 fix\n"
+              "\t\tif ((cdr.Transfer[4 + 2] & 0x4) && (cdr.Transfer[4 + 1] != 0xff)) {\n"
+              "\t\t\tif ((cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0) || cdr.Channel == 0xff) {\n"
+              "\t\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t\t}\n"
+              "\t\t\tif ((cdr.Transfer[4 + 1] == cdr.Channel) &&\n"
+              "\t\t\t    (cdr.Transfer[4 + 0] == cdr.File)) {\n"
+              "\t\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);\n"
+              "\t\t\t\tif (!ret) {\n"
+              "\t\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);\n"
+              "\t\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);\n"
+              "\t\t\t\t\tcdr.FirstSector = 0;\n"
+              "\t\t\t\t}\n"
+              "\t\t\t}\n"
+              "\t\t}\n"
+              "\t}"
+          )
 
           if exact_old_block in code:
               code = code.replace(exact_old_block, exact_new_block, 1)
