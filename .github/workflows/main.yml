@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Ultimate + Complete Blues Clues CDROM Fix
+name: Build PCSX-ReARMed Ultimate + Exact Blues Clues Fix v3
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout d2b40c8 & Patch libpcsxcore/cdrom.c for Channel 255
+      - name: Checkout d2b40c8 & Patch Exact cdrom.c Lines
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -18,66 +18,69 @@ jobs:
           git submodule update --init
 
           cat << 'EOF' > patch_cdrom.py
-          import re
-
           with open("libpcsxcore/cdrom.c", "r") as f:
               code = f.read()
 
-          lines = code.splitlines()
-          for i, line in enumerate(lines):
-              if "cdr.Transfer[4 + 1]" in line or "xa_decode_sector" in line:
-                  start = max(0, i - 10)
-                  end = min(len(lines), i + 25)
-                  print("=== ORIGINAL CDROM.C LINES ===")
-                  print("\n".join(lines[start:end]))
-                  break
+          # Exact block from d2b40c8 (verified from blues_clues_cdrom_report.txt)
+          exact_old_block = """\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA
+\t\t// Firemen 2: Multi-XA files - briefings, cutscenes
+\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {
+\t\t\tcdr.File = cdr.Transfer[4 + 0];
+\t\t\tcdr.Channel = cdr.Transfer[4 + 1];
+\t\t}
 
-          # 1. Prevent Channel 255 (0xff) dummy sectors from locking cdr.Channel or consuming cdr.FirstSector
-          new_lock = (
-              "if (cdr.Transfer[4 + 1] == 0xff) {\n"
-              "\t\t\t/* Ignore dummy channel 255 sector */\n"
-              "\t\t} else if (cdr.FirstSector == 1 || cdr.Channel == 0xff) {\n"
-              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
-              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
-              "\t\t\tcdr.FirstSector = 1;\n"
-              "\t\t}"
-          )
+\t\tif((cdr.Transfer[4 + 2] & 0x4) &&
+\t\t\t (cdr.Transfer[4 + 1] == cdr.Channel) &&
+\t\t\t (cdr.Transfer[4 + 0] == cdr.File)) {
+\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);
+\t\t\tif (!ret) {
+\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);
+\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);
+\t\t\t\tcdr.FirstSector = 0;
+\t\t\t}
+\t\t\telse cdr.FirstSector = -1;
+\t\t}
+\t}"""
 
-          code, count = re.subn(
-              r"if\s*\(\s*cdr\.FirstSector\s*==\s*1\s*\)\s*\{\s*cdr\.File\s*=\s*cdr\.Transfer\[4\s*\+\s*0\];\s*cdr\.Channel\s*=\s*cdr\.Transfer\[4\s*\+\s*1\];\s*\}",
-              new_lock,
-              code,
-              count=1
-          )
-          print(f"Patched cdr.FirstSector lock: {count} match(es)")
+          # Patched block:
+          # 1. Ignores channel 255 (0xff) sectors completely so they never lock cdr.Channel or set FirstSector = -1
+          # 2. If cdr.Channel was set to 0xff (255) by the game or FirstSector==1, locks onto the first valid audio sector (cdr.Transfer[4+2] & 0x4)
+          # 3. Does not kill the stream with cdr.FirstSector = -1 on a rejected sector
+          exact_new_block = """\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA
+\t\t// Firemen 2 & Blue's Clues: Multi-XA files & Channel 255 fix
+\t\tif ((cdr.Transfer[4 + 2] & 0x4) && (cdr.Transfer[4 + 1] != 0xff)) {
+\t\t\tif ((cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0) || cdr.Channel == 0xff) {
+\t\t\t\tcdr.File = cdr.Transfer[4 + 0];
+\t\t\t\tcdr.Channel = cdr.Transfer[4 + 1];
+\t\t\t}
+\t\t\tif ((cdr.Transfer[4 + 1] == cdr.Channel) &&
+\t\t\t    (cdr.Transfer[4 + 0] == cdr.File)) {
+\t\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);
+\t\t\t\tif (!ret) {
+\t\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);
+\t\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);
+\t\t\t\t\tcdr.FirstSector = 0;
+\t\t\t\t}
+\t\t\t}
+\t\t}
+\t}"""
 
-          # 2. Ensure xa_decode_sector check also ignores channel 255 (0xff)
-          old_xa = "(cdr.Transfer[4 + 0] == cdr.File))"
-          new_xa = "(cdr.Transfer[4 + 0] == cdr.File) && (cdr.Channel != 0xff) && (cdr.Transfer[4 + 1] != 0xff))"
-          if old_xa in code:
-              code = code.replace(old_xa, new_xa, 1)
-              print("Successfully patched xa_decode_sector check in cdrom.c!")
+          if exact_old_block in code:
+              code = code.replace(exact_old_block, exact_new_block, 1)
+              print("SUCCESS: Replaced exact CD-XA block in libpcsxcore/cdrom.c!")
+          else:
+              print("ERROR: Exact block not found!")
+              exit(1)
 
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(code)
-
-          # 3. Also keep the guard inside decode_xa.c as a second layer of protection
-          with open("libpcsxcore/decode_xa.c", "r") as f:
-              xa_code = f.read()
-          target = "xdp->nbits = 4;"
-          patch = "if (sectorp[1] == 0xff) return -1;\n\txdp->nbits = 4;"
-          if "sectorp[1] == 0xff" not in xa_code and target in xa_code:
-              xa_code = xa_code.replace(target, patch, 1)
-              with open("libpcsxcore/decode_xa.c", "w") as f:
-                  f.write(xa_code)
-              print("Successfully patched decode_xa.c!")
           EOF
 
-          python3 patch_cdrom.py > ../blues_clues_cdrom_report.txt
+          python3 patch_cdrom.py > ../blues_clues_v3_report.txt
           rm -f patch_cdrom.py
 
-          echo "=== VERIFY GIT DIFF ON CDROM.C & DECODE_XA.C ===" >> ../blues_clues_cdrom_report.txt
-          git diff >> ../blues_clues_cdrom_report.txt
+          echo "=== VERIFY GIT DIFF ON CDROM.C ===" >> ../blues_clues_v3_report.txt
+          git diff >> ../blues_clues_v3_report.txt
 
           # 1. Force -O3 everywhere
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -109,19 +112,19 @@ jobs:
               CC="arm-linux-gnueabi-gcc $ULTIMATE_FLAGS" \
               CXX="arm-linux-gnueabi-g++ $ULTIMATE_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_blues_clues_v2.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_blues_clues_v3.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
           '
-          cat blues_clues_cdrom_report.txt
+          cat blues_clues_v3_report.txt
 
-      - name: Upload Ready-to-Use .so File & CDROM Report
+      - name: Upload Ready-to-Use .so File & v3 Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-blues-clues-v2
+          name: pcsx-rearmed-blues-clues-v3
           path: |
             pcsx_rearmed_libretro.so
-            blues_clues_cdrom_report.txt
-            build_blues_clues_v2.log
+            blues_clues_v3_report.txt
+            build_blues_clues_v3.log
