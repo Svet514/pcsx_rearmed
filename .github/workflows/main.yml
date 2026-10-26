@@ -20,40 +20,20 @@ jobs:
           git checkout e73e384cfacbb9b03d14f809e1283dc715068e3c -- libpcsxcore/cdrom.c libpcsxcore/cdrom.h
 
           cat << 'EOF' > patch_v9.py
+          import re
           import sys
 
           # --- 1. HARDWARE-ACCURATE CD-XA MODE_SF & CHANNEL 255 FIX IN libpcsxcore/cdrom.c ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
-          old_cdxa = (
-              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
-              "\t\t// Firemen 2: Multi-XA files - briefings, cutscenes\n"
-              "\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {\n"
-              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
-              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
-              "\t\t}\n"
-              "\n"
-              "\t\tif((cdr.Transfer[4 + 2] & 0x4) &&\n"
-              "\t\t\t (cdr.Transfer[4 + 1] == cdr.Channel) &&\n"
-              "\t\t\t (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {\n"
-              "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);\n"
-              "\t\t\tif (!ret) {\n"
-              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);\n"
-              "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);\n"
-              "\t\t\t\tcdr.FirstSector = 0;\n"
-              "\t\t\t}\n"
-              "\t\t\telse cdr.FirstSector = -1;\n"
-              "\t\t}\n"
-              "\t}"
+          # Match from "if ((!cdr.Muted) && (cdr.Mode & MODE_STRSND)" down to "else cdr.FirstSector = -1;\n\t\t}\n\t}"
+          # regardless of comments in between!
+          pattern_cdxa = re.compile(
+              r"\tif\s*\(\(!cdr\.Muted\)\s*&&\s*\(cdr\.Mode\s*&\s*MODE_STRSND\).*?else\s+cdr\.FirstSector\s*=\s*-1;\s*\}\s*\}",
+              re.DOTALL
           )
 
-          # How this works:
-          # - Ignores any sector with channel == 255 (0xff) so dummy sectors never lock cdr.Channel or kill FirstSector.
-          # - When MODE_SF is ON ((cdr.Mode & MODE_SF) != 0, e.g. Sesame Street Sports): strictly requires File == cdr.File and Channel == cdr.Channel!
-          #   (unless the game set cdr.Channel == 255, in which case it locks onto the first valid audio channel).
-          # - When MODE_SF is OFF ((cdr.Mode & MODE_SF) == 0, e.g. un-filtered cutscenes): if the stream switches channels mid-cutscene
-          #   (like Blue's Clues switching from the house intro at 00:29 to Periwinkle the Cat at 00:31), it updates cdr.Channel and re-inits ADPCM (FirstSector=1)!
           new_cdxa = (
               "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
               "\t\tif ((cdr.Transfer[4 + 2] & 0x4) && (cdr.Transfer[4 + 1] != 255)) {\n"
@@ -81,11 +61,17 @@ jobs:
               "\t}"
           )
 
-          if old_cdxa not in cdrom:
-              print("ERROR: old_cdxa block not matched in libpcsxcore/cdrom.c!")
+          cdrom, count1 = pattern_cdxa.subn(new_cdxa, cdrom, count=1)
+          if count1 == 0:
+              print("ERROR: pattern_cdxa not matched in libpcsxcore/cdrom.c!")
               sys.exit(1)
 
-          cdrom = cdrom.replace(old_cdxa, new_cdxa, 1)
+          # Also ensure CdlSetfilter resets FirstSector = 1 when switching channels
+          cdrom = cdrom.replace(
+              "cdr.Channel = cdr.Param[1];",
+              "cdr.Channel = cdr.Param[1]; cdr.FirstSector = 1;"
+          )
+
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
           print("SUCCESS 1: Patched libpcsxcore/cdrom.c with hardware-accurate MODE_SF + Channel 255 logic!")
@@ -94,20 +80,9 @@ jobs:
           with open("libpcsxcore/cdriso.c", "r") as f:
               cdriso = f.read()
 
-          old_chd_read = (
-              "\thunk = sector / chd_img->sectors_per_hunk;\n"
-              "\tchd_img->sector_in_hunk = sector % chd_img->sectors_per_hunk;\n"
-              "\n"
-              "\tif (hunk != chd_img->current_hunk)\n"
-              "\t{\n"
-              "\t\tchd_read(chd_img->chd, hunk, chd_img->buffer);\n"
-              "\t\tchd_img->current_hunk = hunk;\n"
-              "\t}\n"
-              "\n"
-              "\tif (dest != cdbuffer) // copy avoid HACK\n"
-              "\t\tmemcpy(dest, chd_img->buffer[chd_img->sector_in_hunk],\n"
-              "\t\t\tCD_FRAMESIZE_RAW);\n"
-              "\treturn CD_FRAMESIZE_RAW;"
+          pattern_chd = re.compile(
+              r"\thunk\s*=\s*sector\s*/\s*chd_img->sectors_per_hunk;.*?return\s+CD_FRAMESIZE_RAW;",
+              re.DOTALL
           )
 
           new_chd_read = (
@@ -150,7 +125,10 @@ jobs:
               "\t}\n"
               "\tif (cache_bufs[slot] != NULL) {\n"
               "\t\tcache_age[slot] = ++age_counter;\n"
-              "\t\tmemcpy(dest, cache_bufs[slot] + (chd_img->sector_in_hunk * CD_FRAMESIZE_RAW), CD_FRAMESIZE_RAW);\n"
+              "\t\tif (dest != cdbuffer)\n"
+              "\t\t\tmemcpy(dest, cache_bufs[slot] + (chd_img->sector_in_hunk * CD_FRAMESIZE_RAW), CD_FRAMESIZE_RAW);\n"
+              "\t\telse\n"
+              "\t\t\tmemcpy(cdbuffer, cache_bufs[slot] + (chd_img->sector_in_hunk * CD_FRAMESIZE_RAW), CD_FRAMESIZE_RAW);\n"
               "\t\treturn CD_FRAMESIZE_RAW;\n"
               "\t}\n"
               "\tif (hunk != chd_img->current_hunk) {\n"
@@ -162,17 +140,18 @@ jobs:
               "\treturn CD_FRAMESIZE_RAW;"
           )
 
-          if old_chd_read not in cdriso:
-              print("ERROR: old_chd_read not matched in libpcsxcore/cdriso.c!")
+          cdriso, count2 = pattern_chd.subn(new_chd_read, cdriso, count=1)
+          if count2 == 0:
+              print("ERROR: pattern_chd not matched in libpcsxcore/cdriso.c!")
               sys.exit(1)
 
-          cdriso = cdriso.replace(old_chd_read, new_chd_read, 1)
           with open("libpcsxcore/cdriso.c", "w") as f:
               f.write(cdriso)
           print("SUCCESS 2: Patched 8-Hunk LRU RAM Cache into libpcsxcore/cdriso.c!")
           EOF
 
           python3 patch_v9.py > ../build_v9_report.txt
+          cat ../build_v9_report.txt
           rm -f patch_v9.py
 
           # 3. Use -O3 for C files, -Wl,-Bsymbolic, and static libstdc++
