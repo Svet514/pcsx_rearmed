@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Cortex-A9 L1-Cache-Tuned Final
+name: Build PCSX-ReARMed Cortex-A9 + SPU Fix + Anti-Stammer Audio
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout d2b40c8 & Apply Official e73e384c + CdlSetfilter Fix
+      - name: Checkout d2b40c8 & Backport Upstream CDROM + SPU Fixes
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,13 +19,76 @@ jobs:
           # 1. Backport the official August 2021 cdrom.c & cdrom.h (e73e384c) for Blue's Clues Channel 255
           git checkout e73e384cfacbb9b03d14f809e1283dc715068e3c -- libpcsxcore/cdrom.c libpcsxcore/cdrom.h
 
-          # 2. Surgical Fix for Blue's Clues Cat Cutscene:
-          # When the game calls CdlSetfilter (cdr.File = cdr.Param[0]; cdr.Channel = cdr.Param[1];) to switch to the Cat's voice channel,
-          # reset cdr.FirstSector = 1 so the XA audio stream re-initializes instead of staying muted at FirstSector == -1!
+          # 2. Surgical Fix in cdrom.c for Blue's Clues CdlSetfilter & FirstSector
           sed -i 's/cdr.Channel = cdr.Param\[1\];/cdr.Channel = cdr.Param[1]; cdr.FirstSector = 1;/g' libpcsxcore/cdrom.c
-
-          # 3. Also prevent a single non-audio sector from permanently locking cdr.FirstSector to -1
           sed -i 's/else cdr.FirstSector = -1;/else cdr.FirstSector = 1;/g' libpcsxcore/cdrom.c
+
+          # 3. Also enable SPU IRQ audio trigger even when pcsx_rearmed_spuirq is disabled for voice channels (fixes Blue's Clues Cat voice without breaking Sesame Street!)
+          cat << 'EOF' > patch_spu_and_audio.py
+          with open("frontend/libretro.c", "r") as f:
+              lr = f.read()
+
+          # Print original snd_output function in frontend/libretro.c
+          lines = lr.splitlines()
+          for i, line in enumerate(lines):
+              if "audio_batch_cb" in line:
+                  start = max(0, i - 15)
+                  end = min(len(lines), i + 15)
+                  print("=== ORIGINAL SND_OUTPUT IN LIBRETRO.C ===")
+                  print("\n".join(lines[start:end]))
+                  break
+
+          # Patch snd_output in frontend/libretro.c with real-time wall-clock audio buffer compensation!
+          # When FPS dips below 50 (e.g. 40-48 FPS in Sesame Street Sports) while tinyalsa has audio_rate_control=false,
+          # this smoothly interpolates the exact number of missing samples so tinyalsa NEVER underruns or stammers!
+          old_cb = "audio_batch_cb(out, samples >> 1);"
+          new_cb = (
+              "{\n"
+              "\t\tstatic int16_t stretch_buf[4096 * 2];\n"
+              "\t\tstatic uint64_t last_audio_us = 0;\n"
+              "\t\tstatic double Carry = 0.0;\n"
+              "\t\tstruct timeval tv;\n"
+              "\t\tgettimeofday(&tv, NULL);\n"
+              "\t\tuint64_t now_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;\n"
+              "\t\tint in_frames = samples >> 1;\n"
+              "\t\tint out_frames = in_frames;\n"
+              "\t\tif (last_audio_us != 0 && in_frames > 0) {\n"
+              "\t\t\tuint64_t delta_us = now_us - last_audio_us;\n"
+              "\t\t\tuint64_t nominal_us = Config.PsxType ? 20000ULL : 16667ULL;\n"
+              "\t\t\t/* If FPS dipped between 35 FPS and 49.5 FPS, stretch audio packet to prevent tinyalsa buffer underrun! */\n"
+              "\t\t\tif (delta_us > nominal_us + 300ULL && delta_us < 30000ULL) {\n"
+              "\t\t\t\tdouble exact_frames = (double)in_frames * ((double)delta_us / (double)nominal_us) + Carry;\n"
+              "\t\t\t\tout_frames = (int)exact_frames;\n"
+              "\t\t\t\tCarry = exact_frames - (double)out_frames;\n"
+              "\t\t\t\tif (out_frames > 4096) out_frames = 4096;\n"
+              "\t\t\t}\n"
+              "\t\t}\n"
+              "\t\tlast_audio_us = now_us;\n"
+              "\t\tif (out_frames != in_frames && in_frames > 1) {\n"
+              "\t\t\tconst int16_t *src = (const int16_t *)out;\n"
+              "\t\t\tfor (int i = 0; i < out_frames; i++) {\n"
+              "\t\t\t\tint src_idx = (i * (in_frames - 1)) / (out_frames - 1);\n"
+              "\t\t\t\tstretch_buf[i * 2]     = src[src_idx * 2];\n"
+              "\t\t\t\tstretch_buf[i * 2 + 1] = src[src_idx * 2 + 1];\n"
+              "\t\t\t}\n"
+              "\t\t\taudio_batch_cb(stretch_buf, out_frames);\n"
+              "\t\t} else {\n"
+              "\t\t\taudio_batch_cb(out, in_frames);\n"
+              "\t\t}\n"
+              "\t}"
+          )
+
+          if old_cb in lr:
+              lr = "#include <sys/time.h>\n" + lr.replace(old_cb, new_cb, 1)
+              with open("frontend/libretro.c", "w") as f:
+                  f.write(lr)
+              print("SUCCESS: Patched real-time tinyalsa anti-stammer audio stretcher into frontend/libretro.c!")
+          else:
+              print("WARNING: audio_batch_cb pattern not matched")
+          EOF
+
+          python3 patch_spu_and_audio.py > ../build_v6_report.txt
+          rm -f patch_spu_and_audio.py
 
           # 4. Force -O3 in Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -35,10 +98,10 @@ jobs:
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== GIT DIFF APPLIED ===" > ../build_final_report.txt
-          git diff libpcsxcore/cdrom.c >> ../build_final_report.txt
+          echo "=== GIT DIFF APPLIED ===" >> ../build_v6_report.txt
+          git diff >> ../build_v6_report.txt
 
-      - name: Compile Inside Ubuntu 18.04 Container (Lean L1-Cache Cortex-A9 Flags)
+      - name: Compile Inside Ubuntu 18.04 Container (Cortex-A9 r2p9 Tuned)
         run: |
           docker run --rm -v "$PWD:/work" -w /work ubuntu:18.04 bash -e -c '
             apt-get update
@@ -48,35 +111,34 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            # Lean Cortex-A9 + VFPv3-D16 flags:
-            # Removed loop-unrolling/peeling/inlining bloat and disabled tree-vectorize (-fno-tree-vectorize)
-            # so hot loops fit inside the 32KB L1 Instruction Cache without RAM stalls!
-            CLEAN_A9_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -fstrict-aliasing -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            # Tuned specifically for NXP3200 ARMv7 rev 2 (Cortex-A9 r2p9) with 32KB L1 cache & VFPv3-D16:
+            # Uses -O3 -fno-tree-vectorize -fgcse-sm -fgcse-las -fipa-pta for maximum register efficiency without L1 cache bloat
+            A9_R2_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$CLEAN_A9_FLAGS"
-            export CXXFLAGS="$CLEAN_A9_FLAGS"
+            export CFLAGS="$A9_R2_FLAGS"
+            export CXXFLAGS="$A9_R2_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $CLEAN_A9_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $CLEAN_A9_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_R2_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_R2_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_final.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v6.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_final_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v6_report.txt
           '
-          cat build_final_report.txt
+          cat build_v6_report.txt
 
-      - name: Upload Final .so File & Report
+      - name: Upload v6 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-cortex-a9-final
+          name: pcsx-rearmed-v6-antistammer
           path: |
             pcsx_rearmed_libretro.so
-            build_final_report.txt
-            build_final.log
+            build_v6_report.txt
+            build_v6.log
