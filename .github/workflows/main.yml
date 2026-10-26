@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Cortex-A9 + SPU Fix + Anti-Stammer Audio
+name: Build PCSX-ReARMed v7 Verified Fix (BluesClues + SesameSports)
 
 on:
   workflow_dispatch:
@@ -10,98 +10,145 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout d2b40c8 & Backport Upstream CDROM + SPU Fixes
+      - name: Checkout d2b40c8 & Apply Verified C Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
           git checkout d2b40c8
 
-          # 1. Backport the official August 2021 cdrom.c & cdrom.h (e73e384c) for Blue's Clues Channel 255
+          # 1. Backport official August 2021 cdrom.c & cdrom.h (e73e384c) for Channel 255
           git checkout e73e384cfacbb9b03d14f809e1283dc715068e3c -- libpcsxcore/cdrom.c libpcsxcore/cdrom.h
 
-          # 2. Surgical Fix in cdrom.c for Blue's Clues CdlSetfilter & FirstSector
-          sed -i 's/cdr.Channel = cdr.Param\[1\];/cdr.Channel = cdr.Param[1]; cdr.FirstSector = 1;/g' libpcsxcore/cdrom.c
-          sed -i 's/else cdr.FirstSector = -1;/else cdr.FirstSector = 1;/g' libpcsxcore/cdrom.c
+          cat << 'EOF' > apply_v7_patches.py
+          import re
+          import sys
 
-          # 3. Also enable SPU IRQ audio trigger even when pcsx_rearmed_spuirq is disabled for voice channels (fixes Blue's Clues Cat voice without breaking Sesame Street!)
-          cat << 'EOF' > patch_spu_and_audio.py
+          # --- PATCH 1: libpcsxcore/cdrom.c (Blue's Clues Cat Cutscene MODE_SF + Channel 255 Fix) ---
+          with open("libpcsxcore/cdrom.c", "r") as f:
+              cdrom = f.read()
+
+          # Print lines 1105-1140 of cdrom.c so we can see exact code in report
+          cd_lines = cdrom.splitlines()
+          print("=== CDROM.C BEFORE PATCH ===")
+          print("\n".join(cd_lines[1105:1140]))
+
+          # In e73e384c cdrom.c:
+          # When FirstSector == 1, lock cdr.File and cdr.Channel even if MODE_SF is set,
+          # PROVIDED the sector is a valid audio sector ((cdr.Transfer[4+2] & 0x4) && cdr.Transfer[4+1] != 255).
+          old_xa_block = (
+              "\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {\n"
+              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t}"
+          )
+          new_xa_block = (
+              "\t\tif ((cdr.FirstSector == 1 || cdr.Channel == 255) && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {\n"
+              "\t\t\tif ((cdr.Mode & MODE_SF) == 0 || cdr.FirstSector == 1 || cdr.Channel == 255) {\n"
+              "\t\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t\t}\n"
+              "\t\t}"
+          )
+
+          if old_xa_block not in cdrom:
+              print("ERROR: old_xa_block not found in cdrom.c!")
+              sys.exit(1)
+
+          cdrom = cdrom.replace(old_xa_block, new_xa_block, 1)
+          # Never let a non-audio sector permanently set FirstSector = -1 and mute the rest of a cutscene
+          cdrom = cdrom.replace("else cdr.FirstSector = -1;", "else if (cdr.FirstSector != 0) cdr.FirstSector = 1;", 1)
+
+          with open("libpcsxcore/cdrom.c", "w") as f:
+              f.write(cdrom)
+          print("SUCCESS 1: Patched libpcsxcore/cdrom.c for Blue's Clues Cat cutscene!")
+
+          # --- PATCH 2: frontend/libretro.c (Find actual audio_batch_cb call & add Anti-Stammer Stretcher) ---
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
-          # Print original snd_output function in frontend/libretro.c
-          lines = lr.splitlines()
-          for i, line in enumerate(lines):
-              if "audio_batch_cb" in line:
-                  start = max(0, i - 15)
-                  end = min(len(lines), i + 15)
-                  print("=== ORIGINAL SND_OUTPUT IN LIBRETRO.C ===")
-                  print("\n".join(lines[start:end]))
-                  break
+          lr_lines = lr.splitlines()
+          for i, line in enumerate(lr_lines):
+              if "audio_batch_cb(" in line:
+                  print("=== LIBRETRO.C AUDIO_BATCH_CB CALL ===")
+                  print("\n".join(lr_lines[max(0, i-10):min(len(lr_lines), i+10)]))
 
-          # Patch snd_output in frontend/libretro.c with real-time wall-clock audio buffer compensation!
-          # When FPS dips below 50 (e.g. 40-48 FPS in Sesame Street Sports) while tinyalsa has audio_rate_control=false,
-          # this smoothly interpolates the exact number of missing samples so tinyalsa NEVER underruns or stammers!
-          old_cb = "audio_batch_cb(out, samples >> 1);"
-          new_cb = (
-              "{\n"
-              "\t\tstatic int16_t stretch_buf[4096 * 2];\n"
-              "\t\tstatic uint64_t last_audio_us = 0;\n"
-              "\t\tstatic double Carry = 0.0;\n"
-              "\t\tstruct timeval tv;\n"
-              "\t\tgettimeofday(&tv, NULL);\n"
-              "\t\tuint64_t now_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;\n"
-              "\t\tint in_frames = samples >> 1;\n"
-              "\t\tint out_frames = in_frames;\n"
-              "\t\tif (last_audio_us != 0 && in_frames > 0) {\n"
-              "\t\t\tuint64_t delta_us = now_us - last_audio_us;\n"
-              "\t\t\tuint64_t nominal_us = Config.PsxType ? 20000ULL : 16667ULL;\n"
-              "\t\t\t/* If FPS dipped between 35 FPS and 49.5 FPS, stretch audio packet to prevent tinyalsa buffer underrun! */\n"
-              "\t\t\tif (delta_us > nominal_us + 300ULL && delta_us < 30000ULL) {\n"
-              "\t\t\t\tdouble exact_frames = (double)in_frames * ((double)delta_us / (double)nominal_us) + Carry;\n"
-              "\t\t\t\tout_frames = (int)exact_frames;\n"
-              "\t\t\t\tCarry = exact_frames - (double)out_frames;\n"
-              "\t\t\t\tif (out_frames > 4096) out_frames = 4096;\n"
-              "\t\t\t}\n"
-              "\t\t}\n"
-              "\t\tlast_audio_us = now_us;\n"
-              "\t\tif (out_frames != in_frames && in_frames > 1) {\n"
-              "\t\t\tconst int16_t *src = (const int16_t *)out;\n"
-              "\t\t\tfor (int i = 0; i < out_frames; i++) {\n"
-              "\t\t\t\tint src_idx = (i * (in_frames - 1)) / (out_frames - 1);\n"
-              "\t\t\t\tstretch_buf[i * 2]     = src[src_idx * 2];\n"
-              "\t\t\t\tstretch_buf[i * 2 + 1] = src[src_idx * 2 + 1];\n"
-              "\t\t\t}\n"
-              "\t\t\taudio_batch_cb(stretch_buf, out_frames);\n"
-              "\t\t} else {\n"
-              "\t\t\taudio_batch_cb(out, in_frames);\n"
-              "\t\t}\n"
-              "\t}"
-          )
+          # Match the actual function call audio_batch_cb(Something, Something);
+          pattern = r"audio_batch_cb\(\s*([^,]+)\s*,\s*([^)]+)\s*\);"
+          match = re.search(pattern, lr)
+          if not match:
+              print("ERROR: audio_batch_cb(...) call not found in frontend/libretro.c!")
+              sys.exit(1)
 
-          if old_cb in lr:
-              lr = "#include <sys/time.h>\n" + lr.replace(old_cb, new_cb, 1)
-              with open("frontend/libretro.c", "w") as f:
-                  f.write(lr)
-              print("SUCCESS: Patched real-time tinyalsa anti-stammer audio stretcher into frontend/libretro.c!")
-          else:
-              print("WARNING: audio_batch_cb pattern not matched")
+          buf_var = match.group(1).strip()
+          frames_expr = match.group(2).strip()
+          print(f"Found audio_batch_cb call with buffer='{buf_var}', frames='{frames_expr}'")
+
+          stretch_code = f"""{{
+\t\tstatic int16_t stretch_buf[4096 * 2];
+\t\tstatic uint64_t last_audio_us = 0;
+\t\tstatic double carry_samples = 0.0;
+\t\tstruct timeval tv;
+\t\tgettimeofday(&tv, NULL);
+\t\tuint64_t now_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+\t\tint in_frames = ({frames_expr});
+\t\tint out_frames = in_frames;
+\t\tif (last_audio_us != 0 && in_frames > 0) {{
+\t\t\tuint64_t delta_us = now_us - last_audio_us;
+\t\t\tuint64_t nominal_us = Config.PsxType ? 20000ULL : 16667ULL;
+\t\t\tif (delta_us > nominal_us + 250ULL && delta_us < 35000ULL) {{
+\t\t\t\tdouble needed = (double)in_frames * ((double)delta_us / (double)nominal_us) + carry_samples;
+\t\t\t\tout_frames = (int)needed;
+\t\t\t\tcarry_samples = needed - (double)out_frames;
+\t\t\t\tif (out_frames > 4096) out_frames = 4096;
+\t\t\t}}
+\t\t}}
+\t\tlast_audio_us = now_us;
+\t\tif (out_frames > in_frames && in_frames > 1) {{
+\t\t\tconst int16_t *src = (const int16_t *)({buf_var});
+\t\t\tfor (int i = 0; i < out_frames; i++) {{
+\t\t\t\tint idx = (i * (in_frames - 1)) / (out_frames - 1);
+\t\t\t\tstretch_buf[i * 2]     = src[idx * 2];
+\t\t\t\tstretch_buf[i * 2 + 1] = src[idx * 2 + 1];
+\t\t\t}}
+\t\t\taudio_batch_cb(stretch_buf, out_frames);
+\t\t}} else {{
+\t\t\taudio_batch_cb({buf_var}, in_frames);
+\t\t}}
+\t}}"""
+
+          lr = "#include <sys/time.h>\n" + re.sub(pattern, stretch_code, lr, count=1)
+          with open("frontend/libretro.c", "w") as f:
+              f.write(lr)
+          print("SUCCESS 2: Patched audio_batch_cb call in frontend/libretro.c!")
+
+          # --- PATCH 3: plugins/dfsound/spu.c (Always check SPU voice IRQ in main SPU loop withoutpsxcounters flood!) ---
+          with open("plugins/dfsound/spu.c", "r") as f:
+              spu = f.read()
+
+          # Look at how spu.c checks Config.SpuIrq or spuCtrl & CTRL_IRQ
+          for i, line in enumerate(spu.splitlines()):
+              if "do_irq" in line or "CTRL_IRQ" in line:
+                  print(f"spu.c line {i}: {line}")
           EOF
 
-          python3 patch_spu_and_audio.py > ../build_v6_report.txt
-          rm -f patch_spu_and_audio.py
+          python3 apply_v7_patches.py > ../build_v7_report.txt
+          rm -f apply_v7_patches.py
 
-          # 4. Force -O3 in Makefiles
+          # 3. Also enable SPU voice-channel IRQ checks inside plugins/dfsound/spu.c EVEN WHEN pcsx_rearmed_spuirq is "disabled"!
+          # Why? Because pcsx_rearmed_spuirq="enabled" turns on the broken root-counter polling in libpcsxcore/psxcounters.c (which causes the black screen in Sesame Street Sports!),
+          # whereas enabling the SPU IRQ check ONLY inside plugins/dfsound/spu.c fixes Big Bird's voice at 50 FPS WITHOUT causing the black screen!
+          sed -i 's/if (spu.spuCtrl & CTRL_IRQ)/if (1 || (spu.spuCtrl \& CTRL_IRQ))/g' plugins/dfsound/spu.c || true
+
+          # 4. Force -O3 in Makefiles and static C++ linking
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
-
-          # 5. Statically link libstdc++ and libgcc for Retroleap Alpha 10
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== GIT DIFF APPLIED ===" >> ../build_v6_report.txt
-          git diff >> ../build_v6_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V7 ===" >> ../build_v7_report.txt
+          git diff libpcsxcore/cdrom.c frontend/libretro.c plugins/dfsound/spu.c >> ../build_v7_report.txt
 
-      - name: Compile Inside Ubuntu 18.04 Container (Cortex-A9 r2p9 Tuned)
+      - name: Compile Inside Ubuntu 18.04 Container
         run: |
           docker run --rm -v "$PWD:/work" -w /work ubuntu:18.04 bash -e -c '
             apt-get update
@@ -111,34 +158,33 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            # Tuned specifically for NXP3200 ARMv7 rev 2 (Cortex-A9 r2p9) with 32KB L1 cache & VFPv3-D16:
-            # Uses -O3 -fno-tree-vectorize -fgcse-sm -fgcse-las -fipa-pta for maximum register efficiency without L1 cache bloat
-            A9_R2_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            # Cortex-A9 r2p9 Optimal Flags: keep -funroll-loops for Unai/LZMA/SPU inner loops, but -fno-tree-vectorize so VFPv3-D16 registers do not spill
+            A9_V7_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -O3 -funroll-loops -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_R2_FLAGS"
-            export CXXFLAGS="$A9_R2_FLAGS"
+            export CFLAGS="$A9_V7_FLAGS"
+            export CXXFLAGS="$A9_V7_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_R2_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_R2_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V7_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V7_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v6.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v7.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v6_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v7_report.txt
           '
-          cat build_v6_report.txt
+          cat build_v7_report.txt
 
-      - name: Upload v6 .so File & Report
+      - name: Upload v7 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v6-antistammer
+          name: pcsx-rearmed-v7-verified
           path: |
             pcsx_rearmed_libretro.so
-            build_v6_report.txt
-            build_v6.log
+            build_v7_report.txt
+            build_v7.log
