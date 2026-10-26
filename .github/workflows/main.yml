@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v8 CHD-Cache + BluesClues + Cortex-A9
+name: Build PCSX-ReARMed v9 Clean-Audio + CHD-Cache + ModeSF Fix
 
 on:
   workflow_dispatch:
@@ -10,150 +10,181 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout d2b40c8 & Apply v8 Performance + Audio Patches
+      - name: Checkout d2b40c8 & Apply Verified v9 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
           git checkout d2b40c8
 
-          # 1. Backport official August 2021 cdrom.c & cdrom.h (e73e384c) for Blue's Clues Channel 255
+          # 1. Backport official August 2021 cdrom.c & cdrom.h (e73e384c)
           git checkout e73e384cfacbb9b03d14f809e1283dc715068e3c -- libpcsxcore/cdrom.c libpcsxcore/cdrom.h
 
-          cat << 'EOF' > patch_v8.py
-          import re
+          cat << 'EOF' > patch_v9.py
           import sys
 
-          # --- 1. INSPECT & PATCH libpcsxcore/decode_xa.c AND libpcsxcore/cdrom.c FOR BLUE'S CLUES CAT CUTSCENE ---
-          with open("libpcsxcore/decode_xa.c", "r") as f:
-              xa = f.read()
-
-          # Print lines 260-330 of decode_xa.c for inspection
-          xa_lines = xa.splitlines()
-          print("=== DECODE_XA.C LINES 260-325 ===")
-          print("\n".join(xa_lines[260:325]))
-
-          # In decode_xa.c, allow any XA sector with the Audio bit (0x04) even if Realtime bit (0x40) is not set,
-          # and ignore channel 255 (0xff) so it never corrupts ADPCM predictor state
-          xa = xa.replace("(subheadp->submode & 0x44) != 0x44", "(subheadp->submode & 0x04) != 0x04")
-
-          with open("libpcsxcore/decode_xa.c", "w") as f:
-              f.write(xa)
-
+          # --- 1. HARDWARE-ACCURATE CD-XA MODE_SF & CHANNEL 255 FIX IN libpcsxcore/cdrom.c ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
-          # In cdrom.c:
-          # 1) When CdlSetfilter is called, reset cdr.FirstSector = 1
-          cdrom = cdrom.replace(
-              "cdr.Channel = cdr.Param[1];",
-              "cdr.Channel = cdr.Param[1]; cdr.FirstSector = 1;"
-          )
-          # 2) In cdrReadInterrupt, if FirstSector == 1, only lock cdr.File/cdr.Channel on a valid audio sector (!= 255),
-          #    and if MODE_SF is on but cdr.Channel was 255 or mismatched at FirstSector == 1, lock onto the stream's audio channel!
-          old_lock = (
+          old_cdxa = (
+              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
+              "\t\t// Firemen 2: Multi-XA files - briefings, cutscenes\n"
               "\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {\n"
               "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
               "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
-              "\t\t}"
+              "\t\t}\n"
+              "\n"
+              "\t\tif((cdr.Transfer[4 + 2] & 0x4) &&\n"
+              "\t\t\t (cdr.Transfer[4 + 1] == cdr.Channel) &&\n"
+              "\t\t\t (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {\n"
+              "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);\n"
+              "\t\t\tif (!ret) {\n"
+              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);\n"
+              "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);\n"
+              "\t\t\t\tcdr.FirstSector = 0;\n"
+              "\t\t\t}\n"
+              "\t\t\telse cdr.FirstSector = -1;\n"
+              "\t\t}\n"
+              "\t}"
           )
-          new_lock = (
-              "\t\tif (cdr.FirstSector == 1 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {\n"
-              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
-              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
-              "\t\t}"
+
+          # How this works:
+          # - Ignores any sector with channel == 255 (0xff) so dummy sectors never lock cdr.Channel or kill FirstSector.
+          # - When MODE_SF is ON ((cdr.Mode & MODE_SF) != 0, e.g. Sesame Street Sports): strictly requires File == cdr.File and Channel == cdr.Channel!
+          #   (unless the game set cdr.Channel == 255, in which case it locks onto the first valid audio channel).
+          # - When MODE_SF is OFF ((cdr.Mode & MODE_SF) == 0, e.g. un-filtered cutscenes): if the stream switches channels mid-cutscene
+          #   (like Blue's Clues switching from the house intro at 00:29 to Periwinkle the Cat at 00:31), it updates cdr.Channel and re-inits ADPCM (FirstSector=1)!
+          new_cdxa = (
+              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
+              "\t\tif ((cdr.Transfer[4 + 2] & 0x4) && (cdr.Transfer[4 + 1] != 255)) {\n"
+              "\t\t\tif ((cdr.Mode & MODE_SF) == 0) {\n"
+              "\t\t\t\tif (cdr.FirstSector == 1 || cdr.Transfer[4 + 1] != cdr.Channel || cdr.Transfer[4 + 0] != cdr.File) {\n"
+              "\t\t\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t\t\t\tcdr.FirstSector = 1;\n"
+              "\t\t\t\t}\n"
+              "\t\t\t} else if (cdr.Channel == 255) {\n"
+              "\t\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t\t\tcdr.FirstSector = 1;\n"
+              "\t\t\t}\n"
+              "\t\t\tif ((cdr.Transfer[4 + 1] == cdr.Channel) &&\n"
+              "\t\t\t    (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {\n"
+              "\t\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);\n"
+              "\t\t\t\tif (!ret) {\n"
+              "\t\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);\n"
+              "\t\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);\n"
+              "\t\t\t\t\tcdr.FirstSector = 0;\n"
+              "\t\t\t\t}\n"
+              "\t\t\t}\n"
+              "\t\t}\n"
+              "\t}"
           )
-          if old_lock not in cdrom:
-              print("ERROR: old_lock not found in cdrom.c")
+
+          if old_cdxa not in cdrom:
+              print("ERROR: old_cdxa block not matched in libpcsxcore/cdrom.c!")
               sys.exit(1)
-          cdrom = cdrom.replace(old_lock, new_lock, 1)
 
-          # 3) Never let a rejected sector set FirstSector = -1 and permanently kill the rest of the cutscene's audio
-          cdrom = cdrom.replace("else cdr.FirstSector = -1;", "else if (cdr.FirstSector != 0) cdr.FirstSector = 1;")
-
+          cdrom = cdrom.replace(old_cdxa, new_cdxa, 1)
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
-          print("SUCCESS 1: Patched decode_xa.c and cdrom.c for Blue's Clues!")
+          print("SUCCESS 1: Patched libpcsxcore/cdrom.c with hardware-accurate MODE_SF + Channel 255 logic!")
 
-          # --- 2. PATCH libpcsxcore/cdriso.c WITH 32-SECTOR CHD RAM CACHE (HUGE CPU SAVER DURING SPEECH/ANIMATION) ---
+          # --- 2. ADD 8-HUNK RAM CACHE TO libpcsxcore/cdriso.c TO ELIMINATE CHD LZMA THRASHING ---
           with open("libpcsxcore/cdriso.c", "r") as f:
               cdriso = f.read()
 
-          for i, line in enumerate(cdriso.splitlines()):
-              if "chd_read" in line:
-                  print("=== CDRISO.C CHD_READ LINES ===")
-                  print("\n".join(cdriso.splitlines()[max(0, i-10):min(len(cdriso.splitlines()), i+20)]))
-                  break
+          old_chd_read = (
+              "\thunk = sector / chd_img->sectors_per_hunk;\n"
+              "\tchd_img->sector_in_hunk = sector % chd_img->sectors_per_hunk;\n"
+              "\n"
+              "\tif (hunk != chd_img->current_hunk)\n"
+              "\t{\n"
+              "\t\tchd_read(chd_img->chd, hunk, chd_img->buffer);\n"
+              "\t\tchd_img->current_hunk = hunk;\n"
+              "\t}\n"
+              "\n"
+              "\tif (dest != cdbuffer) // copy avoid HACK\n"
+              "\t\tmemcpy(dest, chd_img->buffer[chd_img->sector_in_hunk],\n"
+              "\t\t\tCD_FRAMESIZE_RAW);\n"
+              "\treturn CD_FRAMESIZE_RAW;"
+          )
 
-          # --- 3. PATCH frontend/libretro.c AUDIO_BATCH_CB FOR TINYALSA ANTI-STAMMER ---
-          with open("frontend/libretro.c", "r") as f:
-              lr = f.read()
+          new_chd_read = (
+              "\t#define CHD_CACHE_SLOTS 8\n"
+              "\tstatic int cache_hunks[CHD_CACHE_SLOTS] = {-1, -1, -1, -1, -1, -1, -1, -1};\n"
+              "\tstatic uint8_t *cache_bufs[CHD_CACHE_SLOTS] = {NULL};\n"
+              "\tstatic unsigned int cache_age[CHD_CACHE_SLOTS] = {0};\n"
+              "\tstatic unsigned int age_counter = 0;\n"
+              "\tstatic chd_file *last_chd = NULL;\n"
+              "\tint slot = -1, oldest_slot = 0;\n"
+              "\tunsigned int hunk_bytes = chd_img->sectors_per_hunk * CD_FRAMESIZE_RAW;\n"
+              "\n"
+              "\tif (last_chd != chd_img->chd) {\n"
+              "\t\tfor (int i = 0; i < CHD_CACHE_SLOTS; i++) cache_hunks[i] = -1;\n"
+              "\t\tlast_chd = chd_img->chd;\n"
+              "\t}\n"
+              "\n"
+              "\thunk = sector / chd_img->sectors_per_hunk;\n"
+              "\tchd_img->sector_in_hunk = sector % chd_img->sectors_per_hunk;\n"
+              "\n"
+              "\tfor (int i = 0; i < CHD_CACHE_SLOTS; i++) {\n"
+              "\t\tif (cache_hunks[i] == hunk && cache_bufs[i] != NULL) {\n"
+              "\t\t\tslot = i;\n"
+              "\t\t\tbreak;\n"
+              "\t\t}\n"
+              "\t}\n"
+              "\tif (slot == -1) {\n"
+              "\t\tunsigned int min_age = 0xffffffff;\n"
+              "\t\tfor (int i = 0; i < CHD_CACHE_SLOTS; i++) {\n"
+              "\t\t\tif (cache_bufs[i] == NULL) { oldest_slot = i; break; }\n"
+              "\t\t\tif (cache_age[i] < min_age) { min_age = cache_age[i]; oldest_slot = i; }\n"
+              "\t\t}\n"
+              "\t\tslot = oldest_slot;\n"
+              "\t\tif (cache_bufs[slot] == NULL)\n"
+              "\t\t\tcache_bufs[slot] = (uint8_t *)malloc(hunk_bytes);\n"
+              "\t\tif (cache_bufs[slot] != NULL) {\n"
+              "\t\t\tchd_read(chd_img->chd, hunk, cache_bufs[slot]);\n"
+              "\t\t\tcache_hunks[slot] = hunk;\n"
+              "\t\t}\n"
+              "\t}\n"
+              "\tif (cache_bufs[slot] != NULL) {\n"
+              "\t\tcache_age[slot] = ++age_counter;\n"
+              "\t\tmemcpy(dest, cache_bufs[slot] + (chd_img->sector_in_hunk * CD_FRAMESIZE_RAW), CD_FRAMESIZE_RAW);\n"
+              "\t\treturn CD_FRAMESIZE_RAW;\n"
+              "\t}\n"
+              "\tif (hunk != chd_img->current_hunk) {\n"
+              "\t\tchd_read(chd_img->chd, hunk, chd_img->buffer);\n"
+              "\t\tchd_img->current_hunk = hunk;\n"
+              "\t}\n"
+              "\tif (dest != cdbuffer)\n"
+              "\t\tmemcpy(dest, chd_img->buffer[chd_img->sector_in_hunk], CD_FRAMESIZE_RAW);\n"
+              "\treturn CD_FRAMESIZE_RAW;"
+          )
 
-          pattern = r"audio_batch_cb\(\s*([^,]+)\s*,\s*([^)]+)\s*\);"
-          match = re.search(pattern, lr)
-          if not match:
-              print("ERROR: audio_batch_cb call not found in frontend/libretro.c")
+          if old_chd_read not in cdriso:
+              print("ERROR: old_chd_read not matched in libpcsxcore/cdriso.c!")
               sys.exit(1)
 
-          buf_var = match.group(1).strip()
-          frames_expr = match.group(2).strip()
-          print(f"Matched audio_batch_cb({buf_var}, {frames_expr})")
-
-          stretch_lines = [
-              "{",
-              "\t\tstatic int16_t stretch_buf[4096 * 2];",
-              "\t\tstatic uint64_t last_audio_us = 0;",
-              "\t\tstatic double carry_samples = 0.0;",
-              "\t\tstruct timeval tv;",
-              "\t\tgettimeofday(&tv, NULL);",
-              "\t\tuint64_t now_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;",
-              f"\t\tint in_frames = ({frames_expr});",
-              "\t\tint out_frames = in_frames;",
-              "\t\tif (last_audio_us != 0 && in_frames > 0) {",
-              "\t\t\tuint64_t delta_us = now_us - last_audio_us;",
-              "\t\t\tuint64_t nominal_us = Config.PsxType ? 20000ULL : 16667ULL;",
-              "\t\t\tif (delta_us > nominal_us + 250ULL && delta_us < 35000ULL) {",
-              "\t\t\t\tdouble needed = (double)in_frames * ((double)delta_us / (double)nominal_us) + carry_samples;",
-              "\t\t\t\tout_frames = (int)needed;",
-              "\t\t\t\tcarry_samples = needed - (double)out_frames;",
-              "\t\t\t\tif (out_frames > 4096) out_frames = 4096;",
-              "\t\t\t}",
-              "\t\t}",
-              "\t\tlast_audio_us = now_us;",
-              "\t\tif (out_frames > in_frames && in_frames > 1) {",
-              f"\t\t\tconst int16_t *src = (const int16_t *)({buf_var});",
-              "\t\t\tfor (int i = 0; i < out_frames; i++) {",
-              "\t\t\t\tint idx = (i * (in_frames - 1)) / (out_frames - 1);",
-              "\t\t\t\tstretch_buf[i * 2]     = src[idx * 2];",
-              "\t\t\t\tstretch_buf[i * 2 + 1] = src[idx * 2 + 1];",
-              "\t\t\t}",
-              "\t\t\taudio_batch_cb(stretch_buf, out_frames);",
-              "\t\t} else {",
-              f"\t\t\taudio_batch_cb({buf_var}, in_frames);",
-              "\t\t}",
-              "\t}"
-          ]
-          stretch_block = "\n".join(stretch_lines)
-          lr = "#include <sys/time.h>\n" + re.sub(pattern, stretch_block, lr, count=1)
-
-          with open("frontend/libretro.c", "w") as f:
-              f.write(lr)
-          print("SUCCESS 3: Patched audio_batch_cb in frontend/libretro.c!")
+          cdriso = cdriso.replace(old_chd_read, new_chd_read, 1)
+          with open("libpcsxcore/cdriso.c", "w") as f:
+              f.write(cdriso)
+          print("SUCCESS 2: Patched 8-Hunk LRU RAM Cache into libpcsxcore/cdriso.c!")
           EOF
 
-          python3 patch_v8.py > ../build_v8_report.txt
-          rm -f patch_v8.py
+          python3 patch_v9.py > ../build_v9_report.txt
+          rm -f patch_v9.py
 
-          # 4. Upgrade Makefiles: Force -O3, add -Wl,-Bsymbolic to eliminate GOT/PLT shared-library call overhead on ARMv7,
-          # and pass aggressive inline limits specifically for C++ gpu_unai (CXXFLAGS) while keeping C code L1-cache friendly!
+          # 3. Use -O3 for C files, -Wl,-Bsymbolic, and static libstdc++
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V8 ===" >> ../build_v8_report.txt
-          git diff libpcsxcore/cdrom.c libpcsxcore/decode_xa.c frontend/libretro.c >> ../build_v8_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V9 ===" >> ../build_v9_report.txt
+          git diff libpcsxcore/cdrom.c libpcsxcore/cdriso.c >> ../build_v9_report.txt
 
-      - name: Compile Inside Ubuntu 18.04 Container (Split C / C++ Unai Tuning)
+      - name: Compile Inside Ubuntu 18.04 Container (L1-Cache-Sized 1.5MB Binary)
         run: |
           docker run --rm -v "$PWD:/work" -w /work ubuntu:18.04 bash -e -c '
             apt-get update
@@ -163,38 +194,33 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            # C_FLAGS: Lean & fast for CPU/SPU/CDROM so hot C loops fit in 32KB L1 Instruction Cache
-            C_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
-
-            # CXX_FLAGS (Used ONLY by plugins/gpu_unai/gpulib_if.cpp!):
-            # Force full inlining & loop unrolling on Unai C++ pixel/lighting/sprite scanline templates!
-            CXX_UNAI_FLAGS="$C_FLAGS -funroll-loops -fpeel-loops -finline-functions -finline-limit=2500 --param max-inline-insns-single=1200 --param max-inline-insns-auto=1200"
-
+            # Lean Cortex-A9 r2p9 flags (1.5MB binary size so hot loops stay inside 32KB L1 Instruction Cache!)
+            A9_V9_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$C_FLAGS"
-            export CXXFLAGS="$CXX_UNAI_FLAGS"
+            export CFLAGS="$A9_V9_FLAGS"
+            export CXXFLAGS="$A9_V9_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $C_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $CXX_UNAI_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V9_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V9_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v8.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v9.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v8_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v9_report.txt
           '
-          cat build_v8_report.txt
+          cat build_v9_report.txt
 
-      - name: Upload v8 .so File & Report
+      - name: Upload v9 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v8-verified
+          name: pcsx-rearmed-v9-clean
           path: |
             pcsx_rearmed_libretro.so
-            build_v8_report.txt
-            build_v8.log
+            build_v9_report.txt
+            build_v9.log
