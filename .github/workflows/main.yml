@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed Cortex-A9 Max-50FPS + BluesClues v5
+name: Build PCSX-ReARMed Cortex-A9 L1-Cache-Tuned Final
 
 on:
   workflow_dispatch:
@@ -10,16 +10,24 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout d2b40c8 (No Submodules Needed) & Backport Fixes
+      - name: Checkout d2b40c8 & Apply Official e73e384c + CdlSetfilter Fix
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
           git checkout d2b40c8
 
-          # 1. Backport the official August 2021 cdrom.c & cdrom.h (e73e384c) which has the Blue's Clues & CD timing fixes
-          git checkout e73e384cfacbb9b03d14f809e1283dc715068e3c -- libpcsxcore/cdrom.c libpcsxcore/cdrom.h libpcsxcore/decode_xa.c
+          # 1. Backport the official August 2021 cdrom.c & cdrom.h (e73e384c) for Blue's Clues Channel 255
+          git checkout e73e384cfacbb9b03d14f809e1283dc715068e3c -- libpcsxcore/cdrom.c libpcsxcore/cdrom.h
 
-          # 4. Force -O3 everywhere in Makefiles
+          # 2. Surgical Fix for Blue's Clues Cat Cutscene:
+          # When the game calls CdlSetfilter (cdr.File = cdr.Param[0]; cdr.Channel = cdr.Param[1];) to switch to the Cat's voice channel,
+          # reset cdr.FirstSector = 1 so the XA audio stream re-initializes instead of staying muted at FirstSector == -1!
+          sed -i 's/cdr.Channel = cdr.Param\[1\];/cdr.Channel = cdr.Param[1]; cdr.FirstSector = 1;/g' libpcsxcore/cdrom.c
+
+          # 3. Also prevent a single non-audio sector from permanently locking cdr.FirstSector to -1
+          sed -i 's/else cdr.FirstSector = -1;/else cdr.FirstSector = 1;/g' libpcsxcore/cdrom.c
+
+          # 4. Force -O3 in Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
 
@@ -27,10 +35,10 @@ jobs:
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== GIT DIFF APPLIED ===" > ../build_v5_report.txt
-          git diff libpcsxcore/cdrom.c libpcsxcore/decode_xa.c >> ../build_v5_report.txt
+          echo "=== GIT DIFF APPLIED ===" > ../build_final_report.txt
+          git diff libpcsxcore/cdrom.c >> ../build_final_report.txt
 
-      - name: Compile Inside Ubuntu 18.04 Container
+      - name: Compile Inside Ubuntu 18.04 Container (Lean L1-Cache Cortex-A9 Flags)
         run: |
           docker run --rm -v "$PWD:/work" -w /work ubuntu:18.04 bash -e -c '
             apt-get update
@@ -40,32 +48,35 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            # Pure 50FPS Cortex-A9 800MHz flags (No frameskip hacks)
-            ULTIMATE_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -munaligned-access -O3 -finline-functions -finline-limit=1000 -funroll-loops -fpeel-loops -ftracer -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -funsafe-loop-optimizations -fira-loop-pressure -fsched-pressure -fstrict-aliasing -ftree-vectorize -fprefetch-loop-arrays --param l1-cache-size=32 --param l1-cache-line-size=32 --param l2-cache-size=128 -fno-plt -fno-semantic-interposition -fgcse-sm -fgcse-las -fipa-pta -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            # Lean Cortex-A9 + VFPv3-D16 flags:
+            # Removed loop-unrolling/peeling/inlining bloat and disabled tree-vectorize (-fno-tree-vectorize)
+            # so hot loops fit inside the 32KB L1 Instruction Cache without RAM stalls!
+            CLEAN_A9_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -fstrict-aliasing -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$ULTIMATE_FLAGS"
-            export CXXFLAGS="$ULTIMATE_FLAGS"
+            export CFLAGS="$CLEAN_A9_FLAGS"
+            export CXXFLAGS="$CLEAN_A9_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $ULTIMATE_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $ULTIMATE_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $CLEAN_A9_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $CLEAN_A9_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v5.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_final.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_final_report.txt
           '
-          cat build_v5_report.txt
+          cat build_final_report.txt
 
-      - name: Upload Ready-to-Use .so File & Report
+      - name: Upload Final .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v5-max50fps
+          name: pcsx-rearmed-cortex-a9-final
           path: |
             pcsx_rearmed_libretro.so
-            build_v5_report.txt
-            build_v5.log
+            build_final_report.txt
+            build_final.log
