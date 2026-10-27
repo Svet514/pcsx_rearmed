@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v11 Fast-Lighting + BluesClues Fix
+name: Build PCSX-ReARMed v12 Fast-Lighting + Smart-XA + Logger
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Patch Unai Lighting + CD-XA
+      - name: Checkout Official b1226a3a & Patch Fast Unai Lighting + Smart CD-XA
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,18 +19,75 @@ jobs:
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v11.py
+          cat << 'EOF' > patch_v12.py
           import re
           import sys
 
-          # --- 1. INSPECT & OPTIMIZE plugins/gpu_unai/gpu_inner_light.h ---
+          # --- 1. PATCH plugins/gpu_unai/gpu_inner_light.h FOR FAST REGISTER LIGHTING (NO LUT CACHE MISSES!) ---
           with open("plugins/gpu_unai/gpu_inner_light.h", "r") as f:
               light_h = f.read()
 
-          print("=== GPU_INNER_LIGHT.H LINES 85-260 ===")
-          print("\n".join(light_h.splitlines()[85:260]))
+          # Print the rest of gpu_inner_light.h (lines 250 to end) so we see all functions
+          print("=== GPU_INNER_LIGHT.H LINES 250-END ===")
+          print("\n".join(light_h.splitlines()[250:]))
 
-          # --- 2. PATCH libpcsxcore/cdrom.c FOR BLUE'S CLUES CAT CUTSCENE ---
+          # Replace gpuLightingTXTGeneric and gpuLightingTXTGouraudGeneric with fast neutral-light skip + register math
+          old_txt_gen = (
+              "GPU_INLINE uint_fast16_t gpuLightingTXTGeneric(uint_fast16_t uSrc, u8 r5, u8 g5, u8 b5)\n"
+              "{\n"
+              "\treturn (gpu_unai.LightLUT[((uSrc&0x7C00)>>5) | b5] << 10) |\n"
+              "\t       (gpu_unai.LightLUT[ (uSrc&0x03E0)     | g5] <<  5) |\n"
+              "\t       (gpu_unai.LightLUT[((uSrc&0x001F)<<5) | r5]      );\n"
+              "}"
+          )
+
+          new_txt_gen = (
+              "GPU_INLINE uint_fast16_t gpuLightingTXTGeneric(uint_fast16_t uSrc, u8 r5, u8 g5, u8 b5)\n"
+              "{\n"
+              "\tif (((r5 ^ 15) | (g5 ^ 15) | (b5 ^ 15)) == 0) return uSrc & 0x7FFF;\n"
+              "\tu32 b = (((uSrc & 0x7C00) >> 10) * b5) >> 4; if (b > 31) b = 31;\n"
+              "\tu32 g = (((uSrc & 0x03E0) >>  5) * g5) >> 4; if (g > 31) g = 31;\n"
+              "\tu32 r = (( uSrc & 0x001F       ) * r5) >> 4; if (r > 31) r = 31;\n"
+              "\treturn (b << 10) | (g << 5) | r;\n"
+              "}"
+          )
+
+          old_gouraud_gen = (
+              "GPU_INLINE uint_fast16_t gpuLightingTXTGouraudGeneric(uint_fast16_t uSrc, u32 gCol)\n"
+              "{\n"
+              "\treturn (gpu_unai.LightLUT[((uSrc&0x7C00)>>5) | ((gCol>> 5)&0x1F)]<<10) |\n"
+              "\t       (gpu_unai.LightLUT[ (uSrc&0x03E0)     | ((gCol>>16)&0x1F)]<< 5) |\n"
+              "\t       (gpu_unai.LightLUT[((uSrc&0x001F)<<5) |  (gCol>>27)      ]    );\n"
+              "}"
+          )
+
+          new_gouraud_gen = (
+              "GPU_INLINE uint_fast16_t gpuLightingTXTGouraudGeneric(uint_fast16_t uSrc, u32 gCol)\n"
+              "{\n"
+              "\tu32 b5 = (gCol >>  5) & 0x1F;\n"
+              "\tu32 g5 = (gCol >> 16) & 0x1F;\n"
+              "\tu32 r5 = (gCol >> 27);\n"
+              "\tif (((r5 ^ 15) | (g5 ^ 15) | (b5 ^ 15)) == 0) return uSrc & 0x7FFF;\n"
+              "\tu32 b = (((uSrc & 0x7C00) >> 10) * b5) >> 4; if (b > 31) b = 31;\n"
+              "\tu32 g = (((uSrc & 0x03E0) >>  5) * g5) >> 4; if (g > 31) g = 31;\n"
+              "\tu32 r = (( uSrc & 0x001F       ) * r5) >> 4; if (r > 31) r = 31;\n"
+              "\treturn (b << 10) | (g << 5) | r;\n"
+              "}"
+          )
+
+          if old_txt_gen in light_h and old_gouraud_gen in light_h:
+              light_h = light_h.replace(old_txt_gen, new_txt_gen, 1).replace(old_gouraud_gen, new_gouraud_gen, 1)
+              # Also force gpu_inner_light.h to use our fast register functions instead of LightLUT inline asm
+              light_h = light_h.replace("#define gpuLightingTXT gpuLightingTXTAsm", "#define gpuLightingTXT gpuLightingTXTGeneric")
+              light_h = light_h.replace("#define gpuLightingTXTGouraud gpuLightingTXTGouraudAsm", "#define gpuLightingTXTGouraud gpuLightingTXTGouraudGeneric")
+              with open("plugins/gpu_unai/gpu_inner_light.h", "w") as f:
+                  f.write(light_h)
+              print("SUCCESS 1: Patched gpu_inner_light.h with Register-Only Fast Lighting + Neutral-Light Skip!")
+          else:
+              print("ERROR: gpu_inner_light.h patterns not matched!")
+              sys.exit(1)
+
+          # --- 2. PATCH libpcsxcore/cdrom.c WITH SMART 16-SECTOR DEAD-FILTER AUTO-LOCK + CLEAN LOGGER ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
@@ -44,22 +101,27 @@ jobs:
               print("ERROR: pattern_cdxa not matched in libpcsxcore/cdrom.c!")
               sys.exit(1)
 
-          # Complete, C-compile-verified CD-XA handler:
-          # 1. Never sets cdr.FirstSector = -1 on a transition sector (sets cdr.FirstSector = 1 instead so the Cat cutscene never dies after the 00:29 house chime!).
-          # 2. When (cdr.Mode & MODE_SF) == 0, automatically updates cdr.File & cdr.Channel and sets FirstSector = 1 if the channel changes mid-stream.
-          # 3. When (cdr.Mode & MODE_SF) != 0 (like Sesame Street Sports), strictly obeys CdlSetfilter unless cdr.Channel == 255.
+          # How this Smart Auto-Lock works:
+          # - In Sesame Street Sports, 8 channels are interleaved, so the matching channel arrives every 4-8 sectors (missed_xa < 8).
+          # - In Blue's Clues Cat Cutscene, if cdr.File/cdr.Channel is stuck on the wrong channel (even with MODE_SF on!),
+          #   after 16 consecutive audio sectors (~0.2 sec) with 0 matches, it automatically locks onto the Cat's audio channel!
+          # - Also logs the first 100 events to /tmp/cdxa.log using a clean C file write so we can inspect via SSH!
           new_cdxa = "\n".join([
-              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA",
+              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa)) { // CD-XA",
+              "\t\tstatic int missed_xa = 0;",
+              "\t\tstatic int dbg_cnt = 0;",
               "\t\tif ((cdr.Transfer[4 + 2] & 0x4) && (cdr.Transfer[4 + 1] != 255)) {",
-              "\t\t\tif ((cdr.Mode & MODE_SF) == 0 || cdr.Channel == 255) {",
-              "\t\t\t\tif (cdr.FirstSector == 1 || cdr.Transfer[4 + 1] != cdr.Channel || cdr.Transfer[4 + 0] != cdr.File) {",
+              "\t\t\tif ((cdr.Mode & MODE_SF) == 0 || cdr.Channel == 255 || cdr.FirstSector == -1 || missed_xa >= 16) {",
+              "\t\t\t\tif (cdr.FirstSector != 0 || cdr.Transfer[4 + 1] != cdr.Channel || cdr.Transfer[4 + 0] != cdr.File) {",
               "\t\t\t\t\tcdr.File = cdr.Transfer[4 + 0];",
               "\t\t\t\t\tcdr.Channel = cdr.Transfer[4 + 1];",
               "\t\t\t\t\tcdr.FirstSector = 1;",
+              "\t\t\t\t\tmissed_xa = 0;",
               "\t\t\t\t}",
               "\t\t\t}",
               "\t\t\tif ((cdr.Transfer[4 + 1] == cdr.Channel) &&",
               "\t\t\t    (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {",
+              "\t\t\t\tmissed_xa = 0;",
               "\t\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);",
               "\t\t\t\tif (!ret) {",
               "\t\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);",
@@ -68,14 +130,19 @@ jobs:
               "\t\t\t\t} else {",
               "\t\t\t\t\tcdr.FirstSector = 1;",
               "\t\t\t\t}",
+              "\t\t\t} else {",
+              "\t\t\t\tmissed_xa++;",
+              "\t\t\t\tif (dbg_cnt < 80) {",
+              "\t\t\t\t\tFILE *fp = fopen(\"/tmp/cdxa.log\", \"a\");",
+              "\t\t\t\t\tif (fp) { fprintf(fp, \"MISS %d: Mode=%02x Flt=%d:%d Sec=%d:%d Sub=%02x%c\", missed_xa, cdr.Mode, cdr.File, cdr.Channel, cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], 10); fclose(fp); }",
+              "\t\t\t\t\tdbg_cnt++;",
+              "\t\t\t\t}",
               "\t\t\t}",
               "\t\t}",
               "\t}"
           ])
 
           cdrom = cdrom.replace(match.group(0), new_cdxa, 1)
-
-          # Also ensure CdlSetfilter resets cdr.FirstSector = 1
           cdrom = cdrom.replace(
               "cdr.Channel = cdr.Param[1];",
               "cdr.Channel = cdr.Param[1]; cdr.FirstSector = 1;"
@@ -83,11 +150,11 @@ jobs:
 
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
-          print("SUCCESS: Patched libpcsxcore/cdrom.c cleanly!")
+          print("SUCCESS 2: Patched libpcsxcore/cdrom.c with Smart 16-Sector Auto-Lock & Logger!")
           EOF
 
-          python3 patch_v11.py > ../build_v11_report.txt
-          rm -f patch_v11.py
+          python3 patch_v12.py > ../build_v12_report.txt
+          rm -f patch_v12.py
 
           # 3. Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -95,8 +162,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V11 ===" >> ../build_v11_report.txt
-          git diff frontend/libretro.c libpcsxcore/cdrom.c >> ../build_v11_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V12 ===" >> ../build_v12_report.txt
+          git diff frontend/libretro.c libpcsxcore/cdrom.c plugins/gpu_unai/gpu_inner_light.h >> ../build_v12_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -108,32 +175,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V11_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V12_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V11_FLAGS"
-            export CXXFLAGS="$A9_V11_FLAGS"
+            export CFLAGS="$A9_V12_FLAGS"
+            export CXXFLAGS="$A9_V12_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V11_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V11_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V12_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V12_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v11.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v12.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v11_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v12_report.txt
           '
-          cat build_v11_report.txt
+          cat build_v12_report.txt
 
-      - name: Upload v11 .so File & Report
+      - name: Upload v12 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v11-clean
+          name: pcsx-rearmed-v12-fastlight-smartxa
           path: |
             pcsx_rearmed_libretro.so
-            build_v11_report.txt
-            build_v11.log
+            build_v12_report.txt
+            build_v12.log
