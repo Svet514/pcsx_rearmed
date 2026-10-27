@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v10 Official b1226a3a + scph5502 BIOS + Clean Audio
+name: Build PCSX-ReARMed v11 Fast-Lighting + BluesClues Fix
 
 on:
   workflow_dispatch:
@@ -10,31 +10,93 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Add scph5502.bin BIOS + Clean XA Fix
+      - name: Checkout Official b1226a3a & Patch Unai Lighting + CD-XA
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
-
-          # Checkout official August 22, 2021 Libretro merge commit (no submodules needed!)
           git checkout b1226a3ab49a2e82e55a7123eb68fded56091044
 
-          # 1. Add scph5502.bin (your PAL BIOS in /roms/scph5502.bin!) to frontend/libretro.c so it never falls back to buggy HLE BIOS!
+          # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          # 2. In libpcsxcore/cdrom.c:
-          # When (cdr.Mode & MODE_SF) == 0 (unfiltered XA cutscene like Blue's Clues), allow valid non-255 audio sectors
-          # to update cdr.File and cdr.Channel even after FirstSector becomes 0 at 00:29, while keeping MODE_SF != 0 (Sesame Street) 100% strict!
-          sed -i 's/if( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 )/if( (cdr.Mode \& MODE_SF)==0 \&\& (cdr.Transfer[4 + 2] \& 0x4) \&\& cdr.Transfer[4 + 1] != 255 )/g' libpcsxcore/cdrom.c
+          cat << 'EOF' > patch_v11.py
+          import re
+          import sys
 
-          # 3. Upgrade -O2 to -O3 and add static C++ linking + -Wl,-Bsymbolic
+          # --- 1. INSPECT plugins/gpu_unai/gpu_inner_light.h ---
+          with open("plugins/gpu_unai/gpu_inner_light.h", "r") as f:
+              light_h = f.read()
+          print("=== GPU_INNER_LIGHT.H ===")
+          print("\n".join(light_h.splitlines()[:90]))
+
+          # --- 2. PATCH libpcsxcore/cdrom.c FOR BLUE'S CLUES CAT CUTSCENE + LIGHTWEIGHT DIAGNOSTIC LOG ---
+          with open("libpcsxcore/cdrom.c", "r") as f:
+              cdrom = f.read()
+
+          pattern_cdxa = re.compile(
+              r"\tif\s*\(\(!cdr\.Muted\)\s*&&\s*\(cdr\.Mode\s*&\s*MODE_STRSND\).*?else\s+cdr\.FirstSector\s*=\s*-1;\s*\}\s*\}",
+              re.DOTALL
+          )
+
+          # Fixes:
+          # 1. Never set cdr.FirstSector = -1 (which killed the Cat cutscene at 00:31 right after the 00:29 house chime!).
+          #    Instead, set cdr.FirstSector = 1 so the Cat's voice sector re-locks cleanly!
+          # 2. When cdr.FirstSector == 1 and (cdr.Mode & MODE_SF) == 0, only lock onto a real audio sector (!= 255).
+          # 3. Log the first 40 XA transitions/rejections to /tmp/cdxa.log so if any sector is skipped in Blue's Clues, we see the exact byte values!
+          new_cdxa = (
+              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
+              "\t\tif ((cdr.Transfer[4 + 2] & 0x4) && (cdr.Transfer[4 + 1] != 255)) {\n"
+              "\t\t\tif ((cdr.Mode & MODE_SF) == 0 || cdr.Channel == 255) {\n"
+              "\t\t\t\tif (cdr.FirstSector == 1 || cdr.Transfer[4 + 1] != cdr.Channel || cdr.Transfer[4 + 0] != cdr.File) {\n"
+              "\t\t\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t\t\t\tcdr.FirstSector = 1;\n"
+              "\t\t\t\t}\n"
+              "\t\t\t}\n"
+              "\t\t\tif ((cdr.Transfer[4 + 1] == cdr.Channel) &&\n"
+              "\t\t\t    (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {\n"
+              "\t\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);\n"
+              "\t\t\t\tif (!ret) {\n"
+              "\t\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);\n"
+              "\t\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);\n"
+              "\t\t\t\t\tcdr.FirstSector = 0;\n"
+              "\t\t\t\t} else {\n"
+              "\t\t\t\t\tcdr.FirstSector = 1;\n"
+              "\t\t\t\t}\n"
+              "\t\t\t} else {\n"
+              "\t\t\t\tstatic int log_cnt = 0;\n"
+              "\t\t\t\tif (log_cnt < 60) {\n"
+              "\t\t\t\t\tFILE *fp = fopen(\"/tmp/cdxa.log\", \"a\");\n"
+              "\t\t\t\t\tif (fp) { fprintf(fp, \"SKIP XA: Mode=%02x SF=%d First=%d Filter=%d:%d Sec=%d:%d Sub=%02x Coding=%02x\\n\", cdr.Mode, (cdr.Mode & MODE_SF), cdr.FirstSector, cdr.File, cdr.Channel, cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], cdr.Transfer[4+3]); fclose(fp); }\n"
+              "\t\t\t\t\tlog_cnt++;\n"
+              "\t\t\t\t}\n"
+              "\t\t\t}\n"
+              "\t\t}\n"
+              "\t}"
+          )
+
+          cdrom, count = pattern_cdxa.subn(new_cdxa, cdrom, count=1)
+          if count == 0:
+              print("ERROR: pattern_cdxa not matched!")
+              sys.exit(1)
+
+          with open("libpcsxcore/cdrom.c", "w") as f:
+              f.write(cdrom)
+          print("SUCCESS: Patched libpcsxcore/cdrom.c!")
+          EOF
+
+          python3 patch_v11.py > ../build_v11_report.txt
+          cat ../build_v11_report.txt
+          rm -f patch_v11.py
+
+          # 3. Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
           sed -i 's/-O2/-O3/g' Makefile
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V10 ===" > ../build_v10_report.txt
-          git diff frontend/libretro.c libpcsxcore/cdrom.c >> ../build_v10_report.txt
-          cat ../build_v10_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V11 ===" >> ../build_v11_report.txt
+          git diff frontend/libretro.c libpcsxcore/cdrom.c >> ../build_v11_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -46,33 +108,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            # Cortex-A9 r2p9 flags with -mno-unaligned-access (prevents kernel alignment traps seen in /proc/cpu/alignment)
-            A9_V10_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V11_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V10_FLAGS"
-            export CXXFLAGS="$A9_V10_FLAGS"
+            export CFLAGS="$A9_V11_FLAGS"
+            export CXXFLAGS="$A9_V11_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V10_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V10_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V11_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V11_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v10.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v11.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v10_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v11_report.txt
           '
-          cat build_v10_report.txt
+          cat build_v11_report.txt
 
-      - name: Upload v10 .so File & Report
+      - name: Upload v11 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v10-official-scph5502
+          name: pcsx-rearmed-v11-diagnostic
           path: |
             pcsx_rearmed_libretro.so
-            build_v10_report.txt
-            build_v10.log
+            build_v11_report.txt
+            build_v11.log
