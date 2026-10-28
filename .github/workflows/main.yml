@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v17 44100Hz-Uncapped + v13-GPU + SPU-Fix
+name: Build PCSX-ReARMed v18 Real-768-Divider-Fix + Cat-Tracer
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Apply v17 Patches
+      - name: Checkout Official b1226a3a & Apply v18 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,40 +19,33 @@ jobs:
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v17.py
-          import re
+          cat << 'EOF' > patch_v18.py
           import sys
 
-          # --- 1. KEEP gpu_inner_light_arm.h 100% STOCK (LIKE V13) SO NO BRANCH PENALTY IN SESAME STREET! ---
-          print("SUCCESS 1: Kept gpu_inner_light_arm.h 100% stock (restores v13 polygon speed)!")
-
-          # --- 2. REMOVE THE 46.88 FPS CAP AT 44100Hz BY GENERATING 820 SAMPLES/FRAME (41000Hz) IN SPU & XA ---
-          # RetroArch still sees 44100Hz -> 44100Hz (so 0 resampling and 0 crackling!),
-          # while tinyalsa drains 820 samples in 19.9ms instead of 882 samples in 21.4ms -> unlocks 50.00 FPS!
+          # --- 1. INSPECT & PATCH THE 768 CYCLE DIVIDER IN plugins/dfsound/spu.c ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
 
-          print("=== SPU.C LINES AROUND flags & 1 AND SPU_async ===")
-          for i, line in enumerate(spu_c.splitlines()):
-              if "flags & 1" in line or "44100" in line or "SPU_async" in line or "do_samples" in line:
-                  start = max(0, i - 10)
-                  end = min(len(spu_c.splitlines()), i + 15)
-                  print(f"--- Line {i+1} ---")
-                  print("\n".join(spu_c.splitlines()[start:end]))
+          print("=== SPU.C LINES 1095-1175 (do_samples) ===")
+          print("\n".join(spu_c.splitlines()[1095:1175]))
 
-          # Change 44100 sample generation rate in plugins/dfsound/spu.c and libpcsxcore/decode_xa.c to 41000
-          spu_c_patched = spu_c.replace("44100", "41000")
+          # Change the SPU sample-generation divider from 768 (44100Hz = 882 samples/frame)
+          # to 824 (41100Hz = 822 samples/frame) so tinyalsa at 44100Hz never caps FPS at 46.88!
+          spu_c = spu_c.replace("cycle_diff / 768", "cycle_diff / 824")
+          spu_c = spu_c.replace("ns_to * 768", "ns_to * 824")
+          spu_c = spu_c.replace("44100", "41100")
+
           with open("plugins/dfsound/spu.c", "w") as f:
-              f.write(spu_c_patched)
+              f.write(spu_c)
 
           with open("libpcsxcore/decode_xa.c", "r") as f:
               dec_xa = f.read()
-          dec_xa_patched = dec_xa.replace("44100", "41000")
+          dec_xa = dec_xa.replace("44100", "41100")
           with open("libpcsxcore/decode_xa.c", "w") as f:
-              f.write(dec_xa_patched)
-          print("SUCCESS 2: Uncapped 44100Hz framerate from 46.6 FPS to 50.0 FPS in spu.c & decode_xa.c!")
+              f.write(dec_xa)
+          print("SUCCESS 1: Patched 768 -> 824 cycle divider in spu.c & 41100Hz in decode_xa.c!")
 
-          # --- 3. KEEP CLEAN CHANNEL 255 FIRSTSECTOR FIX IN libpcsxcore/cdrom.c ---
+          # --- 2. KEEP CLEAN CHANNEL 255 FIRSTSECTOR FIX + TRACE CD COMMANDS IN libpcsxcore/cdrom.c ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
@@ -68,15 +61,45 @@ jobs:
               "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
               "\t\t}"
           )
-          if old_lock in cdrom:
-              cdrom = cdrom.replace(old_lock, new_lock, 1)
-              with open("libpcsxcore/cdrom.c", "w") as f:
-                  f.write(cdrom)
-              print("SUCCESS 3: Applied Channel 255 FirstSector fix to cdrom.c!")
+          cdrom = cdrom.replace(old_lock, new_lock, 1)
+
+          # Log CdlSetfilter and CdlSetmode to /tmp/cat_trace.log
+          cdrom = cdrom.replace(
+              "case CdlSetfilter:\n\t\t\tcdr.File = cdr.Param[0];\n\t\t\tcdr.Channel = cdr.Param[1];",
+              "case CdlSetfilter:\n\t\t\tcdr.File = cdr.Param[0];\n\t\t\tcdr.Channel = cdr.Param[1];\n\t\t\t{ FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\"); if (fp) { fprintf(fp, \"CD_FLT: File=%d Chan=%d Mode=%02x%c\", cdr.File, cdr.Channel, cdr.Mode, 10); fclose(fp); } }",
+              1
+          )
+          with open("libpcsxcore/cdrom.c", "w") as f:
+              f.write(cdrom)
+          print("SUCCESS 2: Patched libpcsxcore/cdrom.c!")
+
+          # --- 3. TRACE SPU VOICE KEY-ON & DMA IN plugins/dfsound/registers.c & dma.c ---
+          with open("plugins/dfsound/registers.c", "r") as f:
+              reg_c = f.read()
+
+          old_reg_fn = "void CALLBACK SPUwriteRegister(unsigned long reg, unsigned short val)\n{"
+          new_reg_fn = "\n".join([
+              "void CALLBACK SPUwriteRegister(unsigned long reg, unsigned short val)",
+              "{",
+              "\tconst unsigned long r_dbg = reg & 0xfff;",
+              "\tif (r_dbg == 0xd88 || r_dbg == 0xd8a || r_dbg == 0xda4 || r_dbg == 0xdaa) {",
+              "\t\tstatic int spu_dbg_cnt = 0;",
+              "\t\tif (spu_dbg_cnt < 300) {",
+              "\t\t\tFILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
+              "\t\t\tif (fp) { fprintf(fp, \"SPU_REG: reg=%03lx val=%04x%c\", r_dbg, val, 10); fclose(fp); }",
+              "\t\t\tspu_dbg_cnt++;",
+              "\t\t}",
+              "\t}"
+          ])
+          if old_reg_fn in reg_c:
+              reg_c = reg_c.replace(old_reg_fn, new_reg_fn, 1)
+              with open("plugins/dfsound/registers.c", "w") as f:
+                  f.write(reg_c)
+              print("SUCCESS 3: Added SPU voice Key-On tracer to registers.c!")
           EOF
 
-          python3 patch_v17.py > ../build_v17_report.txt
-          rm -f patch_v17.py
+          python3 patch_v18.py > ../build_v18_report.txt
+          rm -f patch_v18.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -84,8 +107,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V17 ===" >> ../build_v17_report.txt
-          git diff libpcsxcore/cdrom.c libpcsxcore/decode_xa.c plugins/dfsound/spu.c >> ../build_v17_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V18 ===" >> ../build_v18_report.txt
+          git diff libpcsxcore/cdrom.c libpcsxcore/decode_xa.c plugins/dfsound/spu.c plugins/dfsound/registers.c >> ../build_v18_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -97,32 +120,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V17_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V18_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V17_FLAGS"
-            export CXXFLAGS="$A9_V17_FLAGS"
+            export CFLAGS="$A9_V18_FLAGS"
+            export CXXFLAGS="$A9_V18_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V17_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V17_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V18_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V18_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v17.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v18.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v17_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v18_report.txt
           '
-          cat build_v17_report.txt
+          cat build_v18_report.txt
 
-      - name: Upload v17 .so File & Report
+      - name: Upload v18 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v17-uncapped-44100
+          name: pcsx-rearmed-v18-divider824
           path: |
             pcsx_rearmed_libretro.so
-            build_v17_report.txt
-            build_v17.log
+            build_v18_report.txt
+            build_v18.log
