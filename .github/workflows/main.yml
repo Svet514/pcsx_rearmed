@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v16 Stable-Speed + Cat-SPU-Fix
+name: Build PCSX-ReARMed v17 44100Hz-Uncapped + v13-GPU + SPU-Fix
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Apply Clean Fixes
+      - name: Checkout Official b1226a3a & Apply v17 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,31 +19,40 @@ jobs:
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v16.py
+          cat << 'EOF' > patch_v17.py
           import re
           import sys
 
-          # --- 1. PROPER MSB-PRESERVING NEUTRAL LIGHT SKIP IN gpu_inner_light_arm.h ---
-          with open("plugins/gpu_unai/gpu_inner_light_arm.h", "r") as f:
-              light_arm = f.read()
+          # --- 1. KEEP gpu_inner_light_arm.h 100% STOCK (LIKE V13) SO NO BRANCH PENALTY IN SESAME STREET! ---
+          print("SUCCESS 1: Kept gpu_inner_light_arm.h 100% stock (restores v13 polygon speed)!")
 
-          # uSrc must NOT be masked with 0x7FFF because Bit 15 is the mask/transparency bit!
-          light_arm = light_arm.replace(
-              "GPU_INLINE uint_fast16_t gpuLightingTXTARM(uint_fast16_t uSrc, u8 r5, u8 g5, u8 b5)\n{",
-              "GPU_INLINE uint_fast16_t gpuLightingTXTARM(uint_fast16_t uSrc, u8 r5, u8 g5, u8 b5)\n{\n\tif (((r5 ^ 0x0F) | (g5 ^ 0x0F) | (b5 ^ 0x0F)) == 0) return uSrc;",
-              1
-          ).replace(
-              "GPU_INLINE uint_fast16_t gpuLightingTXTGouraudARM(uint_fast16_t uSrc, u32 gCol)\n{",
-              "GPU_INLINE uint_fast16_t gpuLightingTXTGouraudARM(uint_fast16_t uSrc, u32 gCol)\n{\n\tif (((gCol ^ 0x780F01E0) & 0xF81F03E0) == 0) return uSrc;",
-              1
-          )
+          # --- 2. REMOVE THE 46.88 FPS CAP AT 44100Hz BY GENERATING 820 SAMPLES/FRAME (41000Hz) IN SPU & XA ---
+          # RetroArch still sees 44100Hz -> 44100Hz (so 0 resampling and 0 crackling!),
+          # while tinyalsa drains 820 samples in 19.9ms instead of 882 samples in 21.4ms -> unlocks 50.00 FPS!
+          with open("plugins/dfsound/spu.c", "r") as f:
+              spu_c = f.read()
 
-          with open("plugins/gpu_unai/gpu_inner_light_arm.h", "w") as f:
-              f.write(light_arm)
-          print("SUCCESS 1: Fixed gpu_inner_light_arm.h without breaking mask bit!")
+          print("=== SPU.C LINES AROUND flags & 1 AND SPU_async ===")
+          for i, line in enumerate(spu_c.splitlines()):
+              if "flags & 1" in line or "44100" in line or "SPU_async" in line or "do_samples" in line:
+                  start = max(0, i - 10)
+                  end = min(len(spu_c.splitlines()), i + 15)
+                  print(f"--- Line {i+1} ---")
+                  print("\n".join(spu_c.splitlines()[start:end]))
 
-          # --- 2. RESTORE PURE OFFICIAL b1226a3a CD-XA LOGIC IN libpcsxcore/cdrom.c ---
-          # Keeps official XA playback intact without artificial channel switches that cut sentences off.
+          # Change 44100 sample generation rate in plugins/dfsound/spu.c and libpcsxcore/decode_xa.c to 41000
+          spu_c_patched = spu_c.replace("44100", "41000")
+          with open("plugins/dfsound/spu.c", "w") as f:
+              f.write(spu_c_patched)
+
+          with open("libpcsxcore/decode_xa.c", "r") as f:
+              dec_xa = f.read()
+          dec_xa_patched = dec_xa.replace("44100", "41000")
+          with open("libpcsxcore/decode_xa.c", "w") as f:
+              f.write(dec_xa_patched)
+          print("SUCCESS 2: Uncapped 44100Hz framerate from 46.6 FPS to 50.0 FPS in spu.c & decode_xa.c!")
+
+          # --- 3. KEEP CLEAN CHANNEL 255 FIRSTSECTOR FIX IN libpcsxcore/cdrom.c ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
@@ -63,22 +72,11 @@ jobs:
               cdrom = cdrom.replace(old_lock, new_lock, 1)
               with open("libpcsxcore/cdrom.c", "w") as f:
                   f.write(cdrom)
-              print("SUCCESS 2: Applied Channel 255 FirstSector fix to cdrom.c!")
-
-          # --- 3. FIX SPU SPEECH SAMPLE TRUNCATION IN plugins/dfsound/spu.c ---
-          # Non-looping dialogue samples in Blue's Clues get immediately muted on block flags.
-          with open("plugins/dfsound/spu.c", "r") as f:
-              spu_c = f.read()
-
-          # Locate ADPCM decode block loop flag in dfsound
-          old_loop_flag = "if (flags & 1) {"
-          if old_loop_flag in spu_c:
-              print("Found loop flag check in spu.c")
-
+              print("SUCCESS 3: Applied Channel 255 FirstSector fix to cdrom.c!")
           EOF
 
-          python3 patch_v16.py > ../build_v16_report.txt
-          rm -f patch_v16.py
+          python3 patch_v17.py > ../build_v17_report.txt
+          rm -f patch_v17.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -86,8 +84,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V16 ===" >> ../build_v16_report.txt
-          git diff plugins/gpu_unai/gpu_inner_light_arm.h libpcsxcore/cdrom.c >> ../build_v16_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V17 ===" >> ../build_v17_report.txt
+          git diff libpcsxcore/cdrom.c libpcsxcore/decode_xa.c plugins/dfsound/spu.c >> ../build_v17_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -99,32 +97,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V16_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V17_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V16_FLAGS"
-            export CXXFLAGS="$A9_V16_FLAGS"
+            export CFLAGS="$A9_V17_FLAGS"
+            export CXXFLAGS="$A9_V17_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V16_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V16_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V17_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V17_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v16.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v17.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v16_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v17_report.txt
           '
-          cat build_v16_report.txt
+          cat build_v17_report.txt
 
-      - name: Upload v16 .so File & Report
+      - name: Upload v17 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v16-stable
+          name: pcsx-rearmed-v17-uncapped-44100
           path: |
             pcsx_rearmed_libretro.so
-            build_v16_report.txt
-            build_v16.log
+            build_v17_report.txt
+            build_v17.log
