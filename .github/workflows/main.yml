@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v13 Clean-Speech + Full-FastLight + CD-Logger
+name: Build PCSX-ReARMed v15 Real-ARM-FastLight + Clean-XA + CatLogger
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a (Clean Speech) & Patch Fast Lighting
+      - name: Checkout Official b1226a3a & Patch Real ARM Lighting + Clean XA
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,81 +19,85 @@ jobs:
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v13.py
-          import re
+          cat << 'EOF' > patch_v15.py
           import sys
 
-          # --- 1. INSPECT gpu_inner.h TO SEE HOW LIGHTING & BLENDING ARE CALLED ---
-          with open("plugins/gpu_unai/gpu_inner.h", "r") as f:
-              inner_h = f.read()
-          print("=== GPU_INNER.H LINES 1-140 ===")
-          print("\n".join(inner_h.splitlines()[:140]))
+          # --- 1. INSPECT & PATCH plugins/gpu_unai/gpu_inner_light_arm.h (THE ACTUAL ARM LIGHTING CODE!) ---
+          with open("plugins/gpu_unai/gpu_inner_light_arm.h", "r") as f:
+              light_arm = f.read()
+          print("=== GPU_INNER_LIGHT_ARM.H ===")
+          print(light_arm)
 
-          # --- 2. PATCH ALL 4 LIGHTING FUNCTIONS IN gpu_inner_light.h WITH 1-CYCLE NEUTRAL-LIGHT SKIP ---
-          with open("plugins/gpu_unai/gpu_inner_light.h", "r") as f:
-              light_h = f.read()
+          with open("plugins/gpu_unai/gpu_inner_blend_arm.h", "r") as f:
+              blend_arm = f.read()
+          print("=== GPU_INNER_BLEND_ARM.H ===")
+          print(blend_arm)
 
-          # Fast skip when r5==15, g5==15, b5==15 (neutral light = unmodified texture color)
-          light_h = light_h.replace(
-              "GPU_INLINE uint_fast16_t gpuLightingTXTGeneric(uint_fast16_t uSrc, u8 r5, u8 g5, u8 b5)\n{",
-              "GPU_INLINE uint_fast16_t gpuLightingTXTGeneric(uint_fast16_t uSrc, u8 r5, u8 g5, u8 b5)\n{\n\tif (((r5 ^ 0x0F) | (g5 ^ 0x0F) | (b5 ^ 0x0F)) == 0) return uSrc & 0x7FFF;",
+          # Add 1-cycle neutral-light skip to gpuLightingTXTARM and gpuLightingTXTGouraudARM
+          light_arm_patched = light_arm.replace(
+              "GPU_INLINE uint_fast16_t gpuLightingTXTARM(uint_fast16_t uSrc, u8 r5, u8 g5, u8 b5)\n{",
+              "GPU_INLINE uint_fast16_t gpuLightingTXTARM(uint_fast16_t uSrc, u8 r5, u8 g5, u8 b5)\n{\n\tif (((r5 ^ 0x0F) | (g5 ^ 0x0F) | (b5 ^ 0x0F)) == 0) return uSrc & 0x7FFF;",
               1
-          )
-          light_h = light_h.replace(
-              "GPU_INLINE uint_fast16_t gpuLightingTXTGouraudGeneric(uint_fast16_t uSrc, u32 gCol)\n{",
-              "GPU_INLINE uint_fast16_t gpuLightingTXTGouraudGeneric(uint_fast16_t uSrc, u32 gCol)\n{\n\tif (((gCol ^ 0x780F01E0) & 0xF81F03E0) == 0) return uSrc & 0x7FFF;",
-              1
-          )
-          light_h = light_h.replace(
-              "GPU_INLINE u32 gpuLightingTXT24(uint_fast16_t uSrc, u8 r8, u8 g8, u8 b8)\n{",
-              "GPU_INLINE u32 gpuLightingTXT24(uint_fast16_t uSrc, u8 r8, u8 g8, u8 b8)\n{\n\tif (((r8 ^ 0x7F) | (g8 ^ 0x7F) | (b8 ^ 0x7F)) < 4) return ((uSrc & 0x7C00) << 14) | ((uSrc & 0x03E0) << 9) | ((uSrc & 0x001F) << 4);",
-              1
-          )
-          light_h = light_h.replace(
-              "GPU_INLINE u32 gpuLightingTXT24Gouraud(uint_fast16_t uSrc, u32 gCol)\n{",
-              "GPU_INLINE u32 gpuLightingTXT24Gouraud(uint_fast16_t uSrc, u32 gCol)\n{\n\tif (((gCol ^ 0x7F0FC1FC) & 0xF81F03E0) == 0) return ((uSrc & 0x7C00) << 14) | ((uSrc & 0x03E0) << 9) | ((uSrc & 0x001F) << 4);",
+          ).replace(
+              "GPU_INLINE uint_fast16_t gpuLightingTXTGouraudARM(uint_fast16_t uSrc, u32 gCol)\n{",
+              "GPU_INLINE uint_fast16_t gpuLightingTXTGouraudARM(uint_fast16_t uSrc, u32 gCol)\n{\n\tif (((gCol ^ 0x780F01E0) & 0xF81F03E0) == 0) return uSrc & 0x7FFF;",
               1
           )
 
-          with open("plugins/gpu_unai/gpu_inner_light.h", "w") as f:
-              f.write(light_h)
-          print("SUCCESS 1: Patched all 4 lighting functions in gpu_inner_light.h!")
+          with open("plugins/gpu_unai/gpu_inner_light_arm.h", "w") as f:
+              f.write(light_arm_patched)
+          print("SUCCESS 1: Patched plugins/gpu_unai/gpu_inner_light_arm.h!")
 
-          # --- 3. KEEP OFFICIAL b1226a3a CD-XA LOGIC 100% INTACT (NO SPEECH CUTOFFS!) + ADD READ-ONLY /tmp/cdxa.log TRACER ---
+          # --- 2. PATCH libpcsxcore/cdrom.c (PREVENT CHANNEL 255 LOCK ON FIRSTSECTOR + LOG NON-255 CAT SECTORS) ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
-          # Add a read-only logger when XA sectors are evaluated so we can see why the Cat cutscene is silent without altering playback!
           old_xa_check = "if ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA"
           new_xa_check = "\n".join([
-              "if (cdr.Transfer[4 + 2] & 0x4) {",
+              "if ((cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {",
               "\t\tstatic int xa_log_lines = 0;",
-              "\t\tstatic int last_logged_chan = -2;",
-              "\t\tif (xa_log_lines < 150 && (cdr.Transfer[4 + 1] != last_logged_chan || cdr.FirstSector != 0)) {",
+              "\t\tstatic int last_chan = -2;",
+              "\t\tstatic int last_file = -2;",
+              "\t\tif (xa_log_lines < 200 && (cdr.Transfer[4 + 1] != last_chan || cdr.Transfer[4 + 0] != last_file || cdr.FirstSector != 0)) {",
               "\t\t\tFILE *fp = fopen(\"/tmp/cdxa.log\", \"a\");",
               "\t\t\tif (fp) {",
-              "\t\t\t\tfprintf(fp, \"XA_SEC: Muted=%d Mode=%02x First=%d Flt=%d:%d Sec=%d:%d Sub=%02x Cod=%02x%c\", cdr.Muted, cdr.Mode, cdr.FirstSector, cdr.File, cdr.Channel, cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], cdr.Transfer[4+3], 10);",
+              "\t\t\t\tfprintf(fp, \"XA_REAL: Muted=%d Mode=%02x First=%d Flt=%d:%d Sec=%d:%d Sub=%02x Cod=%02x%c\", cdr.Muted, cdr.Mode, cdr.FirstSector, cdr.File, cdr.Channel, cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], cdr.Transfer[4+3], 10);",
               "\t\t\t\tfclose(fp);",
               "\t\t\t}",
-              "\t\t\tlast_logged_chan = cdr.Transfer[4 + 1];",
+              "\t\t\tlast_chan = cdr.Transfer[4 + 1];",
+              "\t\t\tlast_file = cdr.Transfer[4 + 0];",
               "\t\t\txa_log_lines++;",
               "\t\t}",
               "\t}",
               "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA"
           ])
 
-          if old_xa_check not in cdrom:
-              print("ERROR: old_xa_check not found in cdrom.c!")
+          # Prevent FirstSector==1 from locking cdr.Channel onto 255 (which attempt 1 cdxa.log proved is the 1st sector of every stream!)
+          old_lock = (
+              "\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {\n"
+              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t}"
+          )
+          new_lock = (
+              "\t\tif (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {\n"
+              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t}"
+          )
+
+          if old_xa_check not in cdrom or old_lock not in cdrom:
+              print("ERROR: cdrom.c target blocks not found!")
               sys.exit(1)
 
-          cdrom = cdrom.replace(old_xa_check, new_xa_check, 1)
+          cdrom = cdrom.replace(old_xa_check, new_xa_check, 1).replace(old_lock, new_lock, 1)
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
-          print("SUCCESS 2: Kept official b1226a3a CD-XA speech logic + added read-only /tmp/cdxa.log tracer!")
+          print("SUCCESS 2: Patched libpcsxcore/cdrom.c cleanly!")
           EOF
 
-          python3 patch_v13.py > ../build_v13_report.txt
-          rm -f patch_v13.py
+          python3 patch_v15.py > ../build_v15_report.txt
+          rm -f patch_v15.py
 
           # 3. Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -101,8 +105,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V13 ===" >> ../build_v13_report.txt
-          git diff frontend/libretro.c libpcsxcore/cdrom.c plugins/gpu_unai/gpu_inner_light.h >> ../build_v13_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V15 ===" >> ../build_v15_report.txt
+          git diff frontend/libretro.c libpcsxcore/cdrom.c plugins/gpu_unai/gpu_inner_light_arm.h >> ../build_v15_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -114,32 +118,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V13_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V15_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V13_FLAGS"
-            export CXXFLAGS="$A9_V13_FLAGS"
+            export CFLAGS="$A9_V15_FLAGS"
+            export CXXFLAGS="$A9_V15_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V13_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V13_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V15_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V15_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v13.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v15.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v13_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v15_report.txt
           '
-          cat build_v13_report.txt
+          cat build_v15_report.txt
 
-      - name: Upload v13 .so File & Report
+      - name: Upload v15 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v13-cleanspeech
+          name: pcsx-rearmed-v15-real-armlight
           path: |
             pcsx_rearmed_libretro.so
-            build_v13_report.txt
-            build_v13.log
+            build_v15_report.txt
+            build_v15.log
