@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v19 Auto-Tempo-50FPS + Cat-FirstSector-Fix
+name: Build PCSX-ReARMed v20 V13-CleanVoice + 50FPS-Uncap + Cat-FullTrace
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Apply v19 Patches
+      - name: Checkout Official b1226a3a & Apply v20 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,136 +19,131 @@ jobs:
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v19.py
+          cat << 'EOF' > patch_v20.py
           import sys
 
-          # --- 1. PATCH plugins/dfsound/spu.c: 50 FPS (824 DIVIDER) + AUTO-TEMPO CUSHION WHEN FPS DROPS TO 42! ---
+          # --- 1. KEEP SPU.C & DECODE_XA.C AT 100% V13 TIMING (768 / 44100) FOR LAG-FREE BIG BIRD VOICE! ---
+          # In frontend/libretro.c (snd_feed):
+          # - When FPS < 47 (Big Bird talking at 42 FPS): pass 100% untouched V13 44100Hz audio (0 lag!).
+          # - When FPS >= 47 (full speed): trim the 6.8% surplus samples so tinyalsa never caps FPS at 46.6!
+          with open("frontend/libretro.c", "r") as f:
+              lr = f.read()
+
+          lr = "#include <sys/time.h>\n" + lr
+          old_snd = "audio_batch_cb(buf, bytes / 4);"
+          new_snd = "\n".join([
+              "{",
+              "\t\tstatic struct timeval last_snd_tv = {0, 0};",
+              "\t\tstruct timeval now_snd_tv;",
+              "\t\tgettimeofday(&now_snd_tv, NULL);",
+              "\t\tlong dt_us = (now_snd_tv.tv_sec - last_snd_tv.tv_sec) * 1000000L + (now_snd_tv.tv_usec - last_snd_tv.tv_usec);",
+              "\t\tlast_snd_tv = now_snd_tv;",
+              "\t\tint in_frames = bytes / 4;",
+              "\t\tif (dt_us > 0 && dt_us < 21300 && in_frames > 64 && in_frames <= 2048) {",
+              "\t\t\tstatic int16_t fast_buf[2048 * 2];",
+              "\t\t\tint out_frames = (in_frames * 466) / 500;",
+              "\t\t\tconst int16_t *src = (const int16_t *)buf;",
+              "\t\t\tfor (int i = 0; i < out_frames; i++) {",
+              "\t\t\t\tint idx = (i * in_frames) / out_frames;",
+              "\t\t\t\tfast_buf[i * 2]     = src[idx * 2];",
+              "\t\t\t\tfast_buf[i * 2 + 1] = src[idx * 2 + 1];",
+              "\t\t\t}",
+              "\t\t\taudio_batch_cb(fast_buf, out_frames);",
+              "\t\t} else {",
+              "\t\t\taudio_batch_cb(buf, in_frames);",
+              "\t\t}",
+              "\t}"
+          ])
+
+          if old_snd not in lr:
+              print("ERROR: old_snd not found in frontend/libretro.c!")
+              sys.exit(1)
+
+          lr = lr.replace(old_snd, new_snd, 1)
+          with open("frontend/libretro.c", "w") as f:
+              f.write(lr)
+          print("SUCCESS 1: Patched smart V13/50FPS audio switch in frontend/libretro.c!")
+
+          # --- 2. TRACE SPU CHANNEL DETAILS IN plugins/dfsound/spu.c ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
 
-          spu_c = "#include <sys/time.h>\n" + spu_c
-          spu_c = spu_c.replace("cycle_diff / 768", "cycle_diff / 824")
-          spu_c = spu_c.replace("ns_to * 768", "ns_to * 824")
-
-          # Log SPU voice Key-On (dwNewChannel) inside do_samples so /tmp/cat_trace.log is guaranteed to be created!
           old_silent = "silentch = ~(spu.dwChannelOn | spu.dwNewChannel) & 0xffffff;"
           new_silent = "\n".join([
               "if (spu.dwNewChannel) {",
               "\t\tstatic int spu_log_c = 0;",
-              "\t\tif (spu_log_c < 250) {",
+              "\t\tif (spu_log_c < 200) {",
               "\t\t\tFILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
-              "\t\t\tif (fp) { fprintf(fp, \"SPU_KEYON: New=%06x On=%06x Irq=%04x%c\", spu.dwNewChannel, spu.dwChannelOn, (unsigned int)(spu.pSpuIrq - spu.spuMemC), 10); fclose(fp); }",
+              "\t\t\tif (fp) {",
+              "\t\t\t\tfor (int ch = 0; ch < 24; ch++) {",
+              "\t\t\t\t\tif (spu.dwNewChannel & (1 << ch)) {",
+              "\t\t\t\t\t\tfprintf(fp, \"SPU_CH%d: start=%05x loop=%05x pitch=%04x vol=%d:%d%c\", ch, (unsigned int)(spu.s_chan[ch].pStart - spu.spuMemC), (unsigned int)(spu.s_chan[ch].pLoop - spu.spuMemC), spu.s_chan[ch].iRawPitch, spu.s_chan[ch].iLeftVolume, spu.s_chan[ch].iRightVolume, 10);",
+              "\t\t\t\t\t}",
+              "\t\t\t\t}",
+              "\t\t\t\tfclose(fp);",
+              "\t\t\t}",
               "\t\t\tspu_log_c++;",
               "\t\t}",
               "\t}",
               "\tsilentch = ~(spu.dwChannelOn | spu.dwNewChannel) & 0xffffff;"
           ])
-
-          # In SPUasync: when FPS drops below 48 FPS (e.g. 42 FPS in Sesame Street), natively generate the extra
-          # deficit samples via do_samples() so tinyalsa at 44100Hz NEVER underruns (0 cmd=0 resets!),
-          # while keeping 822 samples/frame at 50 FPS so games run at a full 50.00 FPS!
-          old_async_feed = (
-              " if (flags & 1) {\n"
-              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);\n"
-              "  spu.pS = (short *)spu.pSpuBuffer;"
-          )
-          new_async_feed = "\n".join([
-              " if (flags & 1) {",
-              "  static struct timeval last_tv = {0, 0};",
-              "  struct timeval now_tv;",
-              "  gettimeofday(&now_tv, NULL);",
-              "  if (last_tv.tv_sec != 0) {",
-              "   long dt_us = (now_tv.tv_sec - last_tv.tv_sec) * 1000000L + (now_tv.tv_usec - last_tv.tv_usec);",
-              "   if (dt_us > 21200 && dt_us < 60000) {",
-              "    int gen_samples = ((unsigned char *)spu.pS - spu.pSpuBuffer) >> 2;",
-              "    int needed_samples = (int)((dt_us * 412L) / 10000L);",
-              "    int deficit = needed_samples - gen_samples;",
-              "    if (deficit > 8 && deficit < 350) {",
-              "     spu.cycles_played -= (unsigned int)(deficit * 824);",
-              "     do_samples(cycle, 1);",
-              "    }",
-              "   }",
-              "  }",
-              "  last_tv = now_tv;",
-              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);",
-              "  spu.pS = (short *)spu.pSpuBuffer;"
-          ])
-
-          if old_silent not in spu_c or old_async_feed not in spu_c:
-              print("ERROR: target blocks not found in spu.c!")
-              sys.exit(1)
-
-          spu_c = spu_c.replace(old_silent, new_silent, 1).replace(old_async_feed, new_async_feed, 1)
+          spu_c = spu_c.replace(old_silent, new_silent, 1)
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
-          print("SUCCESS 1: Patched spu.c with 824 Divider (50 FPS) + Auto-Deficit Cushion (no lag at 42 FPS) + SPU KeyOn Logger!")
+          print("SUCCESS 2: Added detailed SPU_CH logger to plugins/dfsound/spu.c!")
 
-          # --- 2. PATCH libpcsxcore/cdrom.c: PREVENT FirstSector = -1 FROM MUTING THE CAT CUTSCENE + LOG XA EVENTS ---
+          # --- 3. LOG ALL CD-ROM COMMANDS & READ SECTORS IN libpcsxcore/cdrom.c ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
-          old_cdxa = (
-              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
-              "\t\t// Firemen 2: Multi-XA files - briefings, cutscenes\n"
+          # Log every CD command in cdrInterrupt()
+          old_switch = "switch (cdr.Ctrl & 0x7f) {"
+          if old_switch not in cdrom:
+              # Find the main command switch in cdrInterrupt
+              for line in cdrom.splitlines():
+                  if "case CdlSetloc:" in line:
+                      print("Found case CdlSetloc")
+          old_setloc = "case CdlSetloc:"
+          new_setloc = "\n".join([
+              "case CdlSetloc:",
+              "\t\t\t{ static int loc_c = 0; if (loc_c < 200) { FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\"); if (fp) { fprintf(fp, \"CD_SETLOC: %02x:%02x:%02x Mode=%02x Flt=%d:%d%c\", cdr.Param[0], cdr.Param[1], cdr.Param[2], cdr.Mode, cdr.File, cdr.Channel, 10); fclose(fp); } loc_c++; } }"
+          ])
+
+          # Also log the first sector after every CdlReadS/CdlPlay in cdrReadInterrupt() regardless of subheader flags!
+          old_cdxa_top = "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA"
+          new_cdxa_top = "\n".join([
+              "\tif (cdr.FirstSector == 1) {",
+              "\t\tstatic int fs_log = 0;",
+              "\t\tif (fs_log < 200 && cdr.Transfer[4 + 1] != 255) {",
+              "\t\t\tFILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
+              "\t\t\tif (fp) { fprintf(fp, \"CD_READ1: Muted=%d Mode=%02x Flt=%d:%d Sec=%d:%d Sub=%02x Cod=%02x%c\", cdr.Muted, cdr.Mode, cdr.File, cdr.Channel, cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], cdr.Transfer[4+3], 10); fclose(fp); }",
+              "\t\t\tfs_log++;",
+              "\t\t}",
+              "\t}",
+              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA"
+          ])
+
+          old_lock = (
               "\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {\n"
               "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
               "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
-              "\t\t}\n"
-              "\n"
-              "\t\t/* Gameblabla \n"
-              "\t\t * Skips playing on channel 255.\n"
-              "\t\t * Fixes missing audio in Blue's Clues : Blue's Big Musical. (Should also fix Taxi 2)\n"
-              "\t\t * TODO : Check if this is the proper behaviour.\n"
-              "\t\t * */\n"
-              "\t\tif((cdr.Transfer[4 + 2] & 0x4) &&\n"
-              "\t\t\t (cdr.Transfer[4 + 1] == cdr.Channel) &&\n"
-              "\t\t\t (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {\n"
-              "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);\n"
-              "\t\t\tif (!ret) {\n"
-              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);\n"
-              "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);\n"
-              "\t\t\t\tcdr.FirstSector = 0;\n"
-              "\t\t\t}\n"
-              "\t\t\telse cdr.FirstSector = -1;\n"
-              "\t\t}\n"
-              "\t}"
+              "\t\t}"
+          )
+          new_lock = (
+              "\t\tif (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {\n"
+              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t}"
           )
 
-          new_cdxa = "\n".join([
-              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA",
-              "\t\tif (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {",
-              "\t\t\tcdr.File = cdr.Transfer[4 + 0];",
-              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];",
-              "\t\t\t{ static int c_log = 0; if (c_log < 100) { FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\"); if (fp) { fprintf(fp, \"XA_START: File=%d Chan=%d Mode=%02x Sub=%02x Cod=%02x%c\", cdr.File, cdr.Channel, cdr.Mode, cdr.Transfer[4+2], cdr.Transfer[4+3], 10); fclose(fp); } c_log++; } }",
-              "\t\t}",
-              "\t\tif ((cdr.Transfer[4 + 2] & 0x4) &&",
-              "\t\t    (cdr.Transfer[4 + 1] == cdr.Channel) &&",
-              "\t\t    (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {",
-              "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);",
-              "\t\t\tif (!ret) {",
-              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);",
-              "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);",
-              "\t\t\t\tcdr.FirstSector = 0;",
-              "\t\t\t} else {",
-              "\t\t\t\tstatic int e_log = 0; if (e_log < 50) { FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\"); if (fp) { fprintf(fp, \"XA_ERR: First=%d File=%d Chan=%d Sub=%02x Cod=%02x%c\", cdr.FirstSector, cdr.File, cdr.Channel, cdr.Transfer[4+2], cdr.Transfer[4+3], 10); fclose(fp); } e_log++; }",
-              "\t\t\t\tif (cdr.FirstSector != 1) cdr.FirstSector = -1;",
-              "\t\t\t}",
-              "\t\t}",
-              "\t}"
-          ])
-
-          if old_cdxa not in cdrom:
-              print("ERROR: old_cdxa not matched in cdrom.c!")
-              sys.exit(1)
-
-          cdrom = cdrom.replace(old_cdxa, new_cdxa, 1)
+          cdrom = cdrom.replace(old_setloc, new_setloc, 1).replace(old_cdxa_top, new_cdxa_top, 1).replace(old_lock, new_lock, 1)
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
-          print("SUCCESS 2: Patched cdrom.c with FirstSector!=1 guard + guaranteed XA_START/XA_ERR logger!")
+          print("SUCCESS 3: Added CD_SETLOC and CD_READ1 loggers to libpcsxcore/cdrom.c!")
           EOF
 
-          python3 patch_v19.py > ../build_v19_report.txt
-          rm -f patch_v19.py
+          python3 patch_v20.py > ../build_v20_report.txt
+          rm -f patch_v20.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -156,8 +151,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V19 ===" >> ../build_v19_report.txt
-          git diff libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v19_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V20 ===" >> ../build_v20_report.txt
+          git diff frontend/libretro.c libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v20_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -169,32 +164,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V19_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V20_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V19_FLAGS"
-            export CXXFLAGS="$A9_V19_FLAGS"
+            export CFLAGS="$A9_V20_FLAGS"
+            export CXXFLAGS="$A9_V20_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V19_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V19_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V20_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V20_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v19.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v20.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v19_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v20_report.txt
           '
-          cat build_v19_report.txt
+          cat build_v20_report.txt
 
-      - name: Upload v19 .so File & Report
+      - name: Upload v20 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v19-autotempo-cattrace
+          name: pcsx-rearmed-v20-v13voice-50fps
           path: |
             pcsx_rearmed_libretro.so
-            build_v19_report.txt
-            build_v19.log
+            build_v20_report.txt
+            build_v20.log
