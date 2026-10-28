@@ -64,7 +64,7 @@ jobs:
               f.write(lr)
           print("SUCCESS 1: Patched smart V13/50FPS audio switch in frontend/libretro.c!")
 
-          # --- 2. TRACE SPU CHANNEL DETAILS IN plugins/dfsound/spu.c ---
+          # --- 2. TRACE SPU CHANNEL DETAILS IN plugins/dfsound/spu.c (USING pCurr!) ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
 
@@ -77,7 +77,7 @@ jobs:
               "\t\t\tif (fp) {",
               "\t\t\t\tfor (int ch = 0; ch < 24; ch++) {",
               "\t\t\t\t\tif (spu.dwNewChannel & (1 << ch)) {",
-              "\t\t\t\t\t\tfprintf(fp, \"SPU_CH%d: start=%05x loop=%05x pitch=%04x vol=%d:%d%c\", ch, (unsigned int)(spu.s_chan[ch].pStart - spu.spuMemC), (unsigned int)(spu.s_chan[ch].pLoop - spu.spuMemC), spu.s_chan[ch].iRawPitch, spu.s_chan[ch].iLeftVolume, spu.s_chan[ch].iRightVolume, 10);",
+              "\t\t\t\t\t\tfprintf(fp, \"SPU_CH%d: curr=%05x loop=%05x pitch=%04x vol=%d:%d%c\", ch, (unsigned int)(spu.s_chan[ch].pCurr - spu.spuMemC), (unsigned int)(spu.s_chan[ch].pLoop - spu.spuMemC), spu.s_chan[ch].iRawPitch, spu.s_chan[ch].iLeftVolume, spu.s_chan[ch].iRightVolume, 10);",
               "\t\t\t\t\t}",
               "\t\t\t\t}",
               "\t\t\t\tfclose(fp);",
@@ -96,13 +96,6 @@ jobs:
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
-          # Log every CD command in cdrInterrupt()
-          old_switch = "switch (cdr.Ctrl & 0x7f) {"
-          if old_switch not in cdrom:
-              # Find the main command switch in cdrInterrupt
-              for line in cdrom.splitlines():
-                  if "case CdlSetloc:" in line:
-                      print("Found case CdlSetloc")
           old_setloc = "case CdlSetloc:"
           new_setloc = "\n".join([
               "case CdlSetloc:",
