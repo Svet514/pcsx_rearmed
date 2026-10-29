@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v26 CatCutsceneUnmute + XAMixerTrace
+name: Build PCSX-ReARMed v27 Clean Production Release
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Apply v26 Patches
+      - name: Checkout Official b1226a3a & Apply Clean v27 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,21 +19,14 @@ jobs:
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v26.py
+          cat << 'EOF' > patch_v27.py
           import sys
 
-          with open("plugins/dfsound/xa.c", "r") as f:
-              xa_c = f.read()
-          print("=== PLUGINS/DFSOUND/XA.C FULL SOURCE ===")
-          print(xa_c)
-
+          # --- 1. PATCH plugins/dfsound/spu.c: 768 DURING MOVIES + 824/748 IN GAMEPLAY + XA UNMUTE ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
-          print("=== PLUGINS/DFSOUND/SPU.C LINES 1100-1315 ===")
-          print("\n".join(spu_c.splitlines()[1100:1315]))
 
-          # --- 1. PATCH plugins/dfsound/spu.c: 768 DURING MOVIES + 824/748 IN GAMEPLAY + FORCE UNMUTE XA ---
-          spu_c = "#include <sys/time.h>\nstatic int g_spu_div = 768;\nint g_cat_scene = 0;\n" + spu_c
+          spu_c = "#include <sys/time.h>\nstatic int g_spu_div = 768;\n" + spu_c
 
           old_ns_calc = (
               " if (cycle_diff < 2 * 768)\n"
@@ -69,19 +62,6 @@ jobs:
               "   else if (emu_us > 19600) g_spu_div = 784;",
               "   else g_spu_div = 824;",
               "  }",
-              "  if (g_cat_scene) {",
-              "   static int out_log = 0;",
-              "   if (out_log < 120) {",
-              "    int bytes = (unsigned char *)spu.pS - spu.pSpuBuffer;",
-              "    short *ps = (short *)spu.pSpuBuffer;",
-              "    int nsh = bytes >> 1;",
-              "    int max_o = 0, min_o = 0;",
-              "    for (int i = 0; i < nsh; i++) { if (ps[i] > max_o) max_o = ps[i]; if (ps[i] < min_o) min_o = ps[i]; }",
-              "    FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
-              "    if (fp) { fprintf(fp, \"SPU_CAT_OUT: bytes=%d min=%d max=%d ChOn=%06x Play=%d Feed=%d Ctrl=%04x%c\", bytes, min_o, max_o, spu.dwChannelOn, (int)(spu.XAPlay - spu.XAStart), (int)(spu.XAFeed - spu.XAStart), spu.spuCtrl, 10); fclose(fp); }",
-              "    out_log++;",
-              "   }",
-              "  }",
               "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);",
               "  spu.pS = (short *)spu.pSpuBuffer;",
               "  gettimeofday(&after_feed_tv, NULL);"
@@ -91,17 +71,6 @@ jobs:
           new_feed_xa = "\n".join([
               " if (spu.iLeftXAVol < 0x2000 && spu.iRightXAVol < 0x2000) { spu.iLeftXAVol = 0x7fff; spu.iRightXAVol = 0x7fff; }",
               " spu.spuCtrl |= 0xc001;",
-              " if (g_cat_scene) {",
-              "  static int cat_xa_log = 0;",
-              "  if (cat_xa_log < 80) {",
-              "   int max_v = 0;",
-              "   int tot = xap->nsamples * (xap->stereo ? 2 : 1);",
-              "   for (int i = 0; i < tot; i++) { int v = xap->pcm[i]; if (v < 0) v = -v; if (v > max_v) max_v = v; }",
-              "   FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
-              "   if (fp) { fprintf(fp, \"SPU_CAT_XA: max_pcm=%d nsamples=%d freq=%d Vol=%04x:%04x Ctrl=%04x Play=%d Feed=%d%c\", max_v, xap->nsamples, xap->freq, spu.iLeftXAVol, spu.iRightXAVol, spu.spuCtrl, (int)(spu.XAPlay - spu.XAStart), (int)(spu.XAFeed - spu.XAStart), 10); fclose(fp); }",
-              "   cat_xa_log++;",
-              "  }",
-              " }",
               " FeedXA(xap);"
           ])
 
@@ -117,75 +86,37 @@ jobs:
           )
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
-          print("SUCCESS 1: Patched spu.c with SPU_CAT_XA / SPU_CAT_OUT loggers & spuCtrl unmute!")
+          print("SUCCESS 1: Cleanly patched plugins/dfsound/spu.c!")
 
-          # --- 2. PATCH libpcsxcore/cdrom.c: CLEAN CHANNEL 255 FIX + SET g_cat_scene AT 05:28:72 ---
+          # --- 2. PATCH libpcsxcore/cdrom.c: CLEAN CHANNEL 255 FIRST-SECTOR LOCK FIX ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
-          cdrom = "extern int g_cat_scene;\n" + cdrom
-
-          old_cdxa_block = (
-              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
-              "\t\t// Firemen 2: Multi-XA files - briefings, cutscenes\n"
+          old_lock = (
               "\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {\n"
               "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
               "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
-              "\t\t}\n"
-              "\n"
-              "\t\t/* Gameblabla \n"
-              "\t\t * Skips playing on channel 255.\n"
-              "\t\t * Fixes missing audio in Blue's Clues : Blue's Big Musical. (Should also fix Taxi 2)\n"
-              "\t\t * TODO : Check if this is the proper behaviour.\n"
-              "\t\t * */\n"
-              "\t\tif((cdr.Transfer[4 + 2] & 0x4) &&\n"
-              "\t\t\t (cdr.Transfer[4 + 1] == cdr.Channel) &&\n"
-              "\t\t\t (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {\n"
-              "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);\n"
-              "\t\t\tif (!ret) {\n"
-              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);\n"
-              "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);\n"
-              "\t\t\t\tcdr.FirstSector = 0;\n"
-              "\t\t\t}\n"
-              "\t\t\telse cdr.FirstSector = -1;\n"
-              "\t\t}\n"
-              "\t}"
+              "\t\t}"
+          )
+          new_lock = (
+              "\t\tif (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {\n"
+              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
+              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
+              "\t\t}"
           )
 
-          new_cdxa_block = "\n".join([
-              "\tif (cdr.Transfer[0] == 0x05 && cdr.Transfer[1] == 0x28 && cdr.Transfer[2] == 0x72) g_cat_scene = 1;",
-              "\telse if (cdr.Transfer[0] == 0x06 && cdr.Transfer[1] == 0x48) g_cat_scene = 0;",
-              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA",
-              "\t\tif (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {",
-              "\t\t\tcdr.File = cdr.Transfer[4 + 0];",
-              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];",
-              "\t\t}",
-              "\t\tif ((cdr.Transfer[4 + 2] & 0x4) &&",
-              "\t\t    (cdr.Transfer[4 + 1] == cdr.Channel) &&",
-              "\t\t    (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {",
-              "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);",
-              "\t\t\tif (!ret) {",
-              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);",
-              "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);",
-              "\t\t\t\tcdr.FirstSector = 0;",
-              "\t\t\t}",
-              "\t\t\telse cdr.FirstSector = -1;",
-              "\t\t}",
-              "\t}"
-          ])
-
-          if old_cdxa_block not in cdrom:
-              print("ERROR: old_cdxa_block not found in cdrom.c!")
+          if old_lock not in cdrom:
+              print("ERROR: old_lock not found in cdrom.c!")
               sys.exit(1)
 
-          cdrom = cdrom.replace(old_cdxa_block, new_cdxa_block, 1)
+          cdrom = cdrom.replace(old_lock, new_lock, 1)
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
-          print("SUCCESS 2: Patched libpcsxcore/cdrom.c!")
+          print("SUCCESS 2: Cleanly patched libpcsxcore/cdrom.c!")
           EOF
 
-          python3 patch_v26.py > ../build_v26_report.txt
-          rm -f patch_v26.py
+          python3 patch_v27.py > ../build_v27_report.txt
+          rm -f patch_v27.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -193,8 +124,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V26 ===" >> ../build_v26_report.txt
-          git diff libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v26_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V27 ===" >> ../build_v27_report.txt
+          git diff libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v27_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -206,32 +137,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V26_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V27_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V26_FLAGS"
-            export CXXFLAGS="$A9_V26_FLAGS"
+            export CFLAGS="$A9_V27_FLAGS"
+            export CXXFLAGS="$A9_V27_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V26_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V26_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V27_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V27_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v26.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v27.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v26_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v27_report.txt
           '
-          cat build_v26_report.txt
+          cat build_v27_report.txt
 
-      - name: Upload v26 .so File & Report
+      - name: Upload v27 Clean .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v26-cat-unmute-xatrace
+          name: pcsx-rearmed-v27-clean-release
           path: |
             pcsx_rearmed_libretro.so
-            build_v26_report.txt
-            build_v26.log
+            build_v27_report.txt
+            build_v27.log
