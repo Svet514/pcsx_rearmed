@@ -109,4 +109,109 @@ jobs:
               "\t\t\t (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {\n"
               "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);\n"
               "\t\t\tif (!ret) {\n"
-              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa
+              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);\n"
+              "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);\n"
+              "\t\t\t\tcdr.FirstSector = 0;\n"
+              "\t\t\t}\n"
+              "\t\t\telse cdr.FirstSector = -1;\n"
+              "\t\t}\n"
+              "\t}"
+          )
+
+          new_cdxa_block = "\n".join([
+              "\tif (cdr.Transfer[0] == 0x05) {",
+              "\t\tstatic int m05_log = 0;",
+              "\t\tif (m05_log < 200) {",
+              "\t\t\tFILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
+              "\t\t\tif (fp) { fprintf(fp, \"CAT_M05: %02x:%02x:%02x Mode=%02x First=%d Muted=%d Flt=%d:%d Sec=%d:%d Sub=%02x Cod=%02x%c\", cdr.Transfer[0], cdr.Transfer[1], cdr.Transfer[2], cdr.Mode, cdr.FirstSector, cdr.Muted, cdr.File, cdr.Channel, cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], cdr.Transfer[4+3], 10); fclose(fp); }",
+              "\t\t\tm05_log++;",
+              "\t\t}",
+              "\t}",
+              "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA",
+              "\t\tif (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {",
+              "\t\t\tcdr.File = cdr.Transfer[4 + 0];",
+              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];",
+              "\t\t}",
+              "\t\tif ((cdr.Transfer[4 + 2] & 0x4) &&",
+              "\t\t    (cdr.Transfer[4 + 1] == cdr.Channel) &&",
+              "\t\t    (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {",
+              "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);",
+              "\t\t\tif (cdr.Transfer[0] == 0x05) {",
+              "\t\t\t\tstatic int xa05_log = 0;",
+              "\t\t\t\tif (xa05_log < 50) {",
+              "\t\t\t\t\tFILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
+              "\t\t\t\t\tif (fp) { fprintf(fp, \"CAT_XA_DEC: ret=%d nsamples=%d freq=%d stereo=%d%c\", ret, cdr.Xa.nsamples, cdr.Xa.freq, cdr.Xa.stereo, 10); fclose(fp); }",
+              "\t\t\t\t\txa05_log++;",
+              "\t\t\t\t}",
+              "\t\t\t}",
+              "\t\t\tif (!ret) {",
+              "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);",
+              "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);",
+              "\t\t\t\tcdr.FirstSector = 0;",
+              "\t\t\t}",
+              "\t\t\telse cdr.FirstSector = -1;",
+              "\t\t}",
+              "\t}"
+          ])
+
+          if old_cdxa_block not in cdrom:
+              print("ERROR: old_cdxa_block not found in cdrom.c!")
+              sys.exit(1)
+
+          cdrom = cdrom.replace(old_cdxa_block, new_cdxa_block, 1)
+          with open("libpcsxcore/cdrom.c", "w") as f:
+              f.write(cdrom)
+          print("SUCCESS 2: Patched libpcsxcore/cdrom.c with CAT_M05 & CAT_XA_DEC loggers!")
+          EOF
+
+          python3 patch_v24.py > ../build_v24_report.txt
+          rm -f patch_v24.py
+
+          # Optimize Makefiles
+          sed -i 's/-O2/-O3/g' Makefile.libretro
+          sed -i 's/-O2/-O3/g' Makefile
+          sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
+          sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
+
+          echo "=== VERIFIED GIT DIFF FOR V24 ===" >> ../build_v24_report.txt
+          git diff libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v24_report.txt
+
+      - name: Compile Inside Ubuntu 18.04 Container
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work ubuntu:18.04 bash -e -c '
+            apt-get update
+            apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi make binutils
+
+            cd /work/src
+            find . -name "*.o" -delete
+            rm -f pcsx_rearmed_libretro.so
+
+            A9_V24_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
+
+            export CFLAGS="$A9_V24_FLAGS"
+            export CXXFLAGS="$A9_V24_FLAGS"
+            export ASFLAGS="$ASM_FLAGS"
+
+            make -f Makefile.libretro \
+              platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
+              CC="arm-linux-gnueabi-gcc $A9_V24_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V24_FLAGS -static-libstdc++ -static-libgcc" \
+              AS="arm-linux-gnueabi-as $ASM_FLAGS" \
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v24.log
+
+            arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
+            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v24_report.txt
+          '
+          cat build_v24_report.txt
+
+      - name: Upload v24 .so File & Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcsx-rearmed-v24-moviesync-catm05
+          path: |
+            pcsx_rearmed_libretro.so
+            build_v24_report.txt
+            build_v24.log
