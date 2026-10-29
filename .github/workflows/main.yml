@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v24 MovieSyncFix + 50FPS + Cat0528Trace
+name: Build PCSX-ReARMed v25 MovieSync + CatAudioAutoFix + XAPeakLogger
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Apply v24 Patches
+      - name: Checkout Official b1226a3a & Apply v25 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,18 +19,17 @@ jobs:
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v24.py
+          cat << 'EOF' > patch_v25.py
           import sys
 
-          with open("libpcsxcore/decode_xa.c", "r") as f:
-              dec_xa = f.read()
-          print("=== DECODE_XA.C LINES 1-140 ===")
-          print("\n".join(dec_xa.splitlines()[0:140]))
-
-          # --- 1. PATCH plugins/dfsound/spu.c: 100% STOCK 768 DURING MOVIES (PERFECT LIP SYNC!) + 824 (50 FPS) IN GAMEPLAY ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
 
+          # Print lines 450-660 of spu.c (MixXA / FeedXA) into report
+          print("=== SPU.C LINES 450-660 (MixXA & FeedXA) ===")
+          print("\n".join(spu_c.splitlines()[450:660]))
+
+          # --- 1. PATCH plugins/dfsound/spu.c: 768 DURING MOVIES + 824/748 IN GAMEPLAY + ENSURE XA VOLUME NOT 0 ---
           spu_c = "#include <sys/time.h>\nstatic int g_spu_div = 768;\n" + spu_c
 
           old_ns_calc = (
@@ -49,8 +48,6 @@ jobs:
           old_played_adv = "  spu.cycles_played += ns_to * 768;"
           new_played_adv = "  spu.cycles_played += ns_to * g_spu_div;"
 
-          # When XA movie audio is active (spu.XAPlay != spu.XAFeed), lock g_spu_div = 768 for 100% stock lip-sync!
-          # When in normal gameplay, use 824 for 50.00 FPS, and 748 during slow frames (<46 FPS) without extra do_samples()!
           old_async_feed = (
               " if (flags & 1) {\n"
               "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);\n"
@@ -74,7 +71,29 @@ jobs:
               "  gettimeofday(&after_feed_tv, NULL);"
           ])
 
-          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_feed not in spu_c:
+          # Also check SPUplayADPCMchannel in spu.c to log spuCtrl and iLeftXAVol/iRightXAVol and auto-unmute if 0!
+          old_play_adpcm = "void CALLBACK SPUplayADPCMchannel(xa_decode_t *xap, unsigned int cycle, int is_direct)\n{"
+          new_play_adpcm = "\n".join([
+              "void CALLBACK SPUplayADPCMchannel(xa_decode_t *xap, unsigned int cycle, int is_direct)",
+              "{",
+              " if (spu.iLeftXAVol == 0 && spu.iRightXAVol == 0) {",
+              "  spu.iLeftXAVol = 0x7fff;",
+              "  spu.iRightXAVol = 0x7fff;",
+              " }",
+              " {",
+              "  static int spu_xa_log = 0;",
+              "  if (spu_xa_log < 80) {",
+              "   int max_v = 0;",
+              "   int tot = xap->nsamples * (xap->stereo ? 2 : 1);",
+              "   for (int i = 0; i < tot; i++) { int v = xap->pcm[i]; if (v < 0) v = -v; if (v > max_v) max_v = v; }",
+              "   FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
+              "   if (fp) { fprintf(fp, \"SPU_XA: max_pcm=%d Vol=%04x:%04x Ctrl=%04x Stat=%04x Play=%d Feed=%d%c\", max_v, spu.iLeftXAVol, spu.iRightXAVol, spu.spuCtrl, spu.spuStat, (int)(spu.XAPlay - spu.XAStart), (int)(spu.XAFeed - spu.XAStart), 10); fclose(fp); }",
+              "   spu_xa_log++;",
+              "  }",
+              " }"
+          ])
+
+          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_feed not in spu_c or old_play_adpcm not in spu_c:
               print("ERROR: target blocks not found in spu.c!")
               sys.exit(1)
 
@@ -82,14 +101,18 @@ jobs:
               spu_c.replace(old_ns_calc, new_ns_calc, 1)
                    .replace(old_played_adv, new_played_adv, 1)
                    .replace(old_async_feed, new_async_feed, 1)
+                   .replace(old_play_adpcm, new_play_adpcm, 1)
           )
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
-          print("SUCCESS 1: Patched spu.c (768 locked for XA movies, 824/748 for gameplay)!")
+          print("SUCCESS 1: Patched spu.c with SPU_XA amplitude/volume logger + auto-unmute!")
 
-          # --- 2. PATCH libpcsxcore/cdrom.c: LOG MINUTE 0x05 (05:28:72 CAT CUTSCENE) ONLY! ---
+          # --- 2. PATCH libpcsxcore/cdrom.c: INSPECT BOTH CH 1 AND CH 255 AMPLITUDE AT 05:28:72! ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
+
+          print("=== CDROM.C LINES 1050-1155 ===")
+          print("\n".join(cdrom.splitlines()[1050:1155]))
 
           old_cdxa_block = (
               "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
@@ -119,31 +142,28 @@ jobs:
           )
 
           new_cdxa_block = "\n".join([
-              "\tif (cdr.Transfer[0] == 0x05) {",
-              "\t\tstatic int m05_log = 0;",
-              "\t\tif (m05_log < 200) {",
-              "\t\t\tFILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
-              "\t\t\tif (fp) { fprintf(fp, \"CAT_M05: %02x:%02x:%02x Mode=%02x First=%d Muted=%d Flt=%d:%d Sec=%d:%d Sub=%02x Cod=%02x%c\", cdr.Transfer[0], cdr.Transfer[1], cdr.Transfer[2], cdr.Mode, cdr.FirstSector, cdr.Muted, cdr.File, cdr.Channel, cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], cdr.Transfer[4+3], 10); fclose(fp); }",
-              "\t\t\tm05_log++;",
-              "\t\t}",
-              "\t}",
               "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA",
               "\t\tif (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {",
               "\t\t\tcdr.File = cdr.Transfer[4 + 0];",
               "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];",
               "\t\t}",
+              "\t\tif (cdr.Transfer[0] == 0x05 && (cdr.Transfer[4 + 2] & 0x4)) {",
+              "\t\t\tstatic int m05_xa_log = 0;",
+              "\t\t\tif (m05_xa_log < 60) {",
+              "\t\t\t\txa_decode_t tmp_xa;",
+              "\t\t\t\tmemset(&tmp_xa, 0, sizeof(tmp_xa));",
+              "\t\t\t\tint tret = xa_decode_sector(&tmp_xa, cdr.Transfer+4, 1);",
+              "\t\t\t\tint tmax = 0;",
+              "\t\t\t\tfor (int i = 0; i < tmp_xa.nsamples * 2; i++) { int v = tmp_xa.pcm[i]; if (v < 0) v = -v; if (v > tmax) tmax = v; }",
+              "\t\t\t\tFILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
+              "\t\t\t\tif (fp) { fprintf(fp, \"M05_CHK: %02x:%02x:%02x Sec=%d:%d Sub=%02x Cod=%02x tret=%d tmax=%d Att=%d:%d%c\", cdr.Transfer[0], cdr.Transfer[1], cdr.Transfer[2], cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], cdr.Transfer[4+3], tret, tmax, cdr.AttenuatorLeftToLeft, cdr.AttenuatorRightToRight, 10); fclose(fp); }",
+              "\t\t\t\tm05_xa_log++;",
+              "\t\t\t}",
+              "\t\t}",
               "\t\tif ((cdr.Transfer[4 + 2] & 0x4) &&",
               "\t\t    (cdr.Transfer[4 + 1] == cdr.Channel) &&",
               "\t\t    (cdr.Transfer[4 + 0] == cdr.File) && cdr.Channel != 255) {",
               "\t\t\tint ret = xa_decode_sector(&cdr.Xa, cdr.Transfer+4, cdr.FirstSector);",
-              "\t\t\tif (cdr.Transfer[0] == 0x05) {",
-              "\t\t\t\tstatic int xa05_log = 0;",
-              "\t\t\t\tif (xa05_log < 50) {",
-              "\t\t\t\t\tFILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
-              "\t\t\t\t\tif (fp) { fprintf(fp, \"CAT_XA_DEC: ret=%d nsamples=%d freq=%d stereo=%d%c\", ret, cdr.Xa.nsamples, cdr.Xa.freq, cdr.Xa.stereo, 10); fclose(fp); }",
-              "\t\t\t\t\txa05_log++;",
-              "\t\t\t\t}",
-              "\t\t\t}",
               "\t\t\tif (!ret) {",
               "\t\t\t\tcdrAttenuate(cdr.Xa.pcm, cdr.Xa.nsamples, cdr.Xa.stereo);",
               "\t\t\t\tSPU_playADPCMchannel(&cdr.Xa);",
@@ -161,11 +181,11 @@ jobs:
           cdrom = cdrom.replace(old_cdxa_block, new_cdxa_block, 1)
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
-          print("SUCCESS 2: Patched libpcsxcore/cdrom.c with CAT_M05 & CAT_XA_DEC loggers!")
+          print("SUCCESS 2: Patched libpcsxcore/cdrom.c with M05_CHK peak detector!")
           EOF
 
-          python3 patch_v24.py > ../build_v24_report.txt
-          rm -f patch_v24.py
+          python3 patch_v25.py > ../build_v25_report.txt
+          rm -f patch_v25.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -173,8 +193,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V24 ===" >> ../build_v24_report.txt
-          git diff libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v24_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V25 ===" >> ../build_v25_report.txt
+          git diff libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v25_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -186,32 +206,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V24_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V25_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V24_FLAGS"
-            export CXXFLAGS="$A9_V24_FLAGS"
+            export CFLAGS="$A9_V25_FLAGS"
+            export CXXFLAGS="$A9_V25_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V24_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V24_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V25_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V25_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v24.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v25.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v24_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v25_report.txt
           '
-          cat build_v24_report.txt
+          cat build_v25_report.txt
 
-      - name: Upload v24 .so File & Report
+      - name: Upload v25 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v24-moviesync-catm05
+          name: pcsx-rearmed-v25-moviesync-xapeak
           path: |
             pcsx_rearmed_libretro.so
-            build_v24_report.txt
-            build_v24.log
+            build_v25_report.txt
+            build_v25.log
