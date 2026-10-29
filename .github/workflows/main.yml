@@ -25,11 +25,7 @@ jobs:
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
 
-          # Print lines 450-660 of spu.c (MixXA / FeedXA) into report
-          print("=== SPU.C LINES 450-660 (MixXA & FeedXA) ===")
-          print("\n".join(spu_c.splitlines()[450:660]))
-
-          # --- 1. PATCH plugins/dfsound/spu.c: 768 DURING MOVIES + 824/748 IN GAMEPLAY + ENSURE XA VOLUME NOT 0 ---
+          # --- 1. PATCH plugins/dfsound/spu.c: 768 DURING MOVIES + 824/748 IN GAMEPLAY ---
           spu_c = "#include <sys/time.h>\nstatic int g_spu_div = 768;\n" + spu_c
 
           old_ns_calc = (
@@ -71,29 +67,25 @@ jobs:
               "  gettimeofday(&after_feed_tv, NULL);"
           ])
 
-          # Also check SPUplayADPCMchannel in spu.c to log spuCtrl and iLeftXAVol/iRightXAVol and auto-unmute if 0!
-          old_play_adpcm = "void CALLBACK SPUplayADPCMchannel(xa_decode_t *xap, unsigned int cycle, int is_direct)\n{"
-          new_play_adpcm = "\n".join([
-              "void CALLBACK SPUplayADPCMchannel(xa_decode_t *xap, unsigned int cycle, int is_direct)",
-              "{",
-              " if (spu.iLeftXAVol == 0 && spu.iRightXAVol == 0) {",
-              "  spu.iLeftXAVol = 0x7fff;",
-              "  spu.iRightXAVol = 0x7fff;",
-              " }",
+          # Match FeedXA(xap); inside SPUplayADPCMchannel (guaranteed single-line match!)
+          old_feed_xa = " FeedXA(xap);"
+          new_feed_xa = "\n".join([
+              " if (spu.iLeftXAVol == 0 && spu.iRightXAVol == 0) { spu.iLeftXAVol = 0x7fff; spu.iRightXAVol = 0x7fff; }",
               " {",
               "  static int spu_xa_log = 0;",
-              "  if (spu_xa_log < 80) {",
+              "  if (spu_xa_log < 100) {",
               "   int max_v = 0;",
               "   int tot = xap->nsamples * (xap->stereo ? 2 : 1);",
               "   for (int i = 0; i < tot; i++) { int v = xap->pcm[i]; if (v < 0) v = -v; if (v > max_v) max_v = v; }",
               "   FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
-              "   if (fp) { fprintf(fp, \"SPU_XA: max_pcm=%d Vol=%04x:%04x Ctrl=%04x Stat=%04x Play=%d Feed=%d%c\", max_v, spu.iLeftXAVol, spu.iRightXAVol, spu.spuCtrl, spu.spuStat, (int)(spu.XAPlay - spu.XAStart), (int)(spu.XAFeed - spu.XAStart), 10); fclose(fp); }",
+              "   if (fp) { fprintf(fp, \"SPU_XA: max_pcm=%d Vol=%04x:%04x Ctrl=%04x Stat=%04x%c\", max_v, spu.iLeftXAVol, spu.iRightXAVol, spu.spuCtrl, spu.spuStat, 10); fclose(fp); }",
               "   spu_xa_log++;",
               "  }",
-              " }"
+              " }",
+              " FeedXA(xap);"
           ])
 
-          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_feed not in spu_c or old_play_adpcm not in spu_c:
+          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_feed not in spu_c or old_feed_xa not in spu_c:
               print("ERROR: target blocks not found in spu.c!")
               sys.exit(1)
 
@@ -101,7 +93,7 @@ jobs:
               spu_c.replace(old_ns_calc, new_ns_calc, 1)
                    .replace(old_played_adv, new_played_adv, 1)
                    .replace(old_async_feed, new_async_feed, 1)
-                   .replace(old_play_adpcm, new_play_adpcm, 1)
+                   .replace(old_feed_xa, new_feed_xa, 1)
           )
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
@@ -110,9 +102,6 @@ jobs:
           # --- 2. PATCH libpcsxcore/cdrom.c: INSPECT BOTH CH 1 AND CH 255 AMPLITUDE AT 05:28:72! ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
-
-          print("=== CDROM.C LINES 1050-1155 ===")
-          print("\n".join(cdrom.splitlines()[1050:1155]))
 
           old_cdxa_block = (
               "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA\n"
