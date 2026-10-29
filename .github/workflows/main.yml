@@ -113,13 +113,23 @@ jobs:
           # --- 2. LOG SPU DMA TRANSFERS DURING CAT CUTSCENE (plugins/dfsound/dma.c) ---
           with open("plugins/dfsound/dma.c", "r") as f:
               dma_c = f.read()
-          old_dma_w = "void CALLBACK SPUwriteDMAMem(unsigned short *pusPSXMem, int iSize,"
-          new_dma_w = "extern int g_cat_active;\nvoid CALLBACK SPUwriteDMAMem(unsigned short *pusPSXMem, int iSize,"
-          dma_c = dma_c.replace(old_dma_w, new_dma_w, 1).replace(
-              "unsigned int cycles)\n{",
-              "unsigned int cycles)\n{\n if (g_cat_active) { static int d_log = 0; if (d_log < 100) { FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\"); if (fp) { fprintf(fp, \"CAT_DMA_W: spuAddr=%05x size=%d%c\", spu.spuAddr, iSize, 10); fclose(fp); } d_log++; } }",
-              1
+
+          dma_c = "extern int g_cat_active;\n" + dma_c
+          old_dma_w = (
+              "void CALLBACK SPUwriteDMAMem(unsigned short *pusPSXMem, int iSize,\n"
+              " unsigned int cycles)\n"
+              "{"
           )
+          new_dma_w = (
+              "void CALLBACK SPUwriteDMAMem(unsigned short *pusPSXMem, int iSize,\n"
+              " unsigned int cycles)\n"
+              "{\n"
+              " if (g_cat_active) { static int d_log = 0; if (d_log < 100) { FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\"); if (fp) { fprintf(fp, \"CAT_DMA_W: spuAddr=%05x size=%d%c\", spu.spuAddr, iSize, 10); fclose(fp); } d_log++; } }"
+          )
+          if old_dma_w not in dma_c:
+              print("ERROR: old_dma_w not found in dma.c!")
+              sys.exit(1)
+          dma_c = dma_c.replace(old_dma_w, new_dma_w, 1)
           with open("plugins/dfsound/dma.c", "w") as f:
               f.write(dma_c)
           print("SUCCESS 2: Patched plugins/dfsound/dma.c!")
@@ -176,42 +186,4 @@ jobs:
           echo "=== VERIFIED GIT DIFF FOR V22 ===" >> ../build_v22_report.txt
           git diff libpcsxcore/cdrom.c libpcsxcore/decode_xa.c plugins/dfsound/spu.c plugins/dfsound/dma.c >> ../build_v22_report.txt
 
-      - name: Compile Inside Ubuntu 18.04 Container
-        run: |
-          docker run --rm -v "$PWD:/work" -w /work ubuntu:18.04 bash -e -c '
-            apt-get update
-            apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi make binutils
-
-            cd /work/src
-            find . -name "*.o" -delete
-            rm -f pcsx_rearmed_libretro.so
-
-            A9_V22_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
-            ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
-
-            export CFLAGS="$A9_V22_FLAGS"
-            export CXXFLAGS="$A9_V22_FLAGS"
-            export ASFLAGS="$ASM_FLAGS"
-
-            make -f Makefile.libretro \
-              platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V22_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V22_FLAGS -static-libstdc++ -static-libgcc" \
-              AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v22.log
-
-            arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
-            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v22_report.txt
-          '
-          cat build_v22_report.txt
-
-      - name: Upload v22 .so File & Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pcsx-rearmed-v22-true50fps-cat03
-          path: |
-            pcsx_rearmed_libretro.so
-            build_v22_report.txt
-            build_v22.log
+      - name: Compile Inside Ubuntu 1
