@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v21 PureAudio-50FPS + SPU-Cutscene-Inspector
+name: Build PCSX-ReARMed v22 True-50FPS-NoLag + Minute03-Cat-Logger
 
 on:
   workflow_dispatch:
@@ -10,33 +10,23 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Apply v21 Patches
+      - name: Checkout Official b1226a3a & Apply v22 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
           git checkout b1226a3ab49a2e82e55a7123eb68fded56091044
 
-          # 1. Add scph5502.bin to BIOS list (snd_feed stays 100% untouched!)
+          # 1. Add scph5502.bin to BIOS list (snd_feed stays 100% stock!)
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v21.py
+          cat << 'EOF' > patch_v22.py
           import sys
 
+          # --- 1. PATCH plugins/dfsound/spu.c: TRUE EMU_US (NO HYSTERESIS TRAP -> 50 FPS + 0 LAG AT 43 FPS) ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
 
-          print("=== SPU.C LINES 660-795 (start_channels & do_channels) ===")
-          print("\n".join(spu_c.splitlines()[660:795]))
-
-          with open("plugins/dfsound/registers.c", "r") as f:
-              reg_c = f.read()
-          print("=== REGISTERS.C LINES 1-220 ===")
-          print("\n".join(reg_c.splitlines()[0:220]))
-
-          # --- 1. DYNAMIC CYCLE DIVIDER IN do_samples (spu.c) ---
-          # Pure stock audio (no snd_feed resampler!).
-          # Uses divider 816 at 47-50 FPS (uncaps 50 FPS!) and stock V13 divider 768 when FPS < 47 (Big Bird 42 FPS)!
-          spu_c = "#include <sys/time.h>\nstatic int g_spu_div = 816;\n" + spu_c
+          spu_c = "#include <sys/time.h>\nstatic int g_spu_div = 826;\nint g_cat_active = 0;\n" + spu_c
 
           old_ns_calc = (
               " if (cycle_diff < 2 * 768)\n"
@@ -54,6 +44,7 @@ jobs:
           old_played_adv = "  spu.cycles_played += ns_to * 768;"
           new_played_adv = "  spu.cycles_played += ns_to * g_spu_div;"
 
+          # Measure emu_us OUTSIDE out_current->feed() so tinyalsa blocking never traps g_spu_div!
           old_async_feed = (
               " if (flags & 1) {\n"
               "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);\n"
@@ -61,44 +52,42 @@ jobs:
           )
           new_async_feed = "\n".join([
               " if (flags & 1) {",
-              "  static struct timeval last_tv = {0, 0};",
-              "  struct timeval now_tv;",
-              "  gettimeofday(&now_tv, NULL);",
-              "  if (last_tv.tv_sec != 0) {",
-              "   long dt_us = (now_tv.tv_sec - last_tv.tv_sec) * 1000000L + (now_tv.tv_usec - last_tv.tv_usec);",
-              "   if (dt_us > 21800) g_spu_div = 768;",
-              "   else if (dt_us < 20800) g_spu_div = 816;",
-              "  }",
-              "  last_tv = now_tv;",
-              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);",
-              "  spu.pS = (short *)spu.pSpuBuffer;"
-          ])
-
-          # --- 2. LOG CAT CUTSCENE SPU CHANNELS AFTER start_channels() IN do_channels() ---
-          old_do_ch = " mask = spu.dwChannelOn & 0xffffff;"
-          new_do_ch = "\n".join([
-              " mask = spu.dwChannelOn & 0xffffff;",
-              " {",
-              "  static int cat_ch_log = 0;",
-              "  if (cat_ch_log < 120 && (spu.dwChannelOn & 0x07)) {",
-              "   for (ch = 0; ch < 3; ch++) {",
-              "    if ((spu.dwChannelOn & (1 << ch)) && (spu.s_chan[ch].pCurr - spu.spuMemC) > 0x2000) {",
-              "     FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
-              "     if (fp) {",
-              "      unsigned char *pc = spu.s_chan[ch].pCurr;",
-              "      unsigned char *pl = spu.s_chan[ch].pLoop;",
-              "      fprintf(fp, \"CAT_CH%d: curr=%05x(hdr=%02x:%02x) loop=%05x(hdr=%02x:%02x) prevf=%d env=%x state=%d vol=%d:%d%c\",",
-              "       ch, (unsigned int)(pc - spu.spuMemC), pc[0], pc[1],",
-              "       (unsigned int)(pl - spu.spuMemC), pl[0], pl[1],",
-              "       spu.s_chan[ch].prevflags, spu.s_chan[ch].ADSRX.EnvelopeVol, spu.s_chan[ch].ADSRX.State,",
-              "       spu.s_chan[ch].iLeftVolume, spu.s_chan[ch].iRightVolume, 10);",
-              "      fclose(fp);",
-              "     }",
-              "     cat_ch_log++;",
+              "  static struct timeval after_feed_tv = {0, 0};",
+              "  struct timeval before_feed_tv;",
+              "  gettimeofday(&before_feed_tv, NULL);",
+              "  if (after_feed_tv.tv_sec != 0) {",
+              "   long emu_us = (before_feed_tv.tv_sec - after_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - after_feed_tv.tv_usec);",
+              "   if (emu_us > 21000 && emu_us < 60000) {",
+              "    g_spu_div = 720;",
+              "    int gen_s = ((unsigned char *)spu.pS - spu.pSpuBuffer) >> 2;",
+              "    int need_s = (int)((emu_us * 430L) / 10000L);",
+              "    if (need_s - gen_s > 12 && need_s - gen_s < 300) {",
+              "     spu.cycles_played -= (unsigned int)((need_s - gen_s) * 720);",
+              "     do_samples(cycle, 1);",
               "    }",
+              "   } else if (emu_us > 19500) {",
+              "    g_spu_div = 780;",
+              "   } else {",
+              "    g_spu_div = 826;",
               "   }",
               "  }",
-              " }"
+              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);",
+              "  spu.pS = (short *)spu.pSpuBuffer;",
+              "  gettimeofday(&after_feed_tv, NULL);"
+          ])
+
+          # Log SPU channels ONLY when g_cat_active == 1 (at 03:00:13+ when Cat Cutscene is actually on screen!)
+          old_do_ch = " mask = spu.dwNewChannel & 0xffffff;"
+          new_do_ch = "\n".join([
+              " if (g_cat_active && spu.dwNewChannel) {",
+              "  static int cat_kon_log = 0;",
+              "  if (cat_kon_log < 100) {",
+              "   FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
+              "   if (fp) { fprintf(fp, \"CAT_KON: New=%06x On=%06x Ctrl=%04x%c\", spu.dwNewChannel, spu.dwChannelOn, spu.spuCtrl, 10); fclose(fp); }",
+              "   cat_kon_log++;",
+              "  }",
+              " }",
+              " mask = spu.dwNewChannel & 0xffffff;"
           ])
 
           if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_feed not in spu_c or old_do_ch not in spu_c:
@@ -113,21 +102,45 @@ jobs:
           )
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
-          print("SUCCESS 1: Patched spu.c with pure dynamic 816/768 divider + CAT_CH inspector!")
 
-          # --- 3. KEEP CLEAN CHANNEL 255 FIX + LOG ALL CdlReadS/CdlPlay SECTORS AT 02:56+ IN cdrom.c ---
+          with open("libpcsxcore/decode_xa.c", "r") as f:
+              dec_xa = f.read()
+          dec_xa = dec_xa.replace("44100", "41500")
+          with open("libpcsxcore/decode_xa.c", "w") as f:
+              f.write(dec_xa)
+          print("SUCCESS 1: Patched spu.c & decode_xa.c for 50.00 FPS + 43 FPS cushion!")
+
+          # --- 2. LOG SPU DMA TRANSFERS DURING CAT CUTSCENE (plugins/dfsound/dma.c) ---
+          with open("plugins/dfsound/dma.c", "r") as f:
+              dma_c = f.read()
+          old_dma_w = "void CALLBACK SPUwriteDMAMem(unsigned short *pusPSXMem, int iSize,"
+          new_dma_w = "extern int g_cat_active;\nvoid CALLBACK SPUwriteDMAMem(unsigned short *pusPSXMem, int iSize,"
+          dma_c = dma_c.replace(old_dma_w, new_dma_w, 1).replace(
+              "unsigned int cycles)\n{",
+              "unsigned int cycles)\n{\n if (g_cat_active) { static int d_log = 0; if (d_log < 100) { FILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\"); if (fp) { fprintf(fp, \"CAT_DMA_W: spuAddr=%05x size=%d%c\", spu.spuAddr, iSize, 10); fclose(fp); } d_log++; } }",
+              1
+          )
+          with open("plugins/dfsound/dma.c", "w") as f:
+              f.write(dma_c)
+          print("SUCCESS 2: Patched plugins/dfsound/dma.c!")
+
+          # --- 3. LOG MINUTE 03:00:13+ SECTORS & COMMANDS IN libpcsxcore/cdrom.c ---
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
+          cdrom = "extern int g_cat_active;\n" + cdrom
           old_cdxa_top = "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA"
           new_cdxa_top = "\n".join([
-              "\tif (cdr.FirstSector == 1 && cdr.Transfer[0] == 0x02 && cdr.Transfer[1] >= 0x56) {",
-              "\t\tstatic int cat_cd_log = 0;",
-              "\t\tif (cat_cd_log < 100) {",
+              "\tif (cdr.Transfer[0] == 0x03 && cdr.Transfer[1] <= 0x06) {",
+              "\t\tg_cat_active = 1;",
+              "\t\tstatic int cat03_log = 0;",
+              "\t\tif (cat03_log < 150) {",
               "\t\t\tFILE *fp = fopen(\"/tmp/cat_trace.log\", \"a\");",
-              "\t\t\tif (fp) { fprintf(fp, \"CAT_CD: %02x:%02x:%02x Mode=%02x Muted=%d XaCfg=%d Flt=%d:%d Sec=%d:%d Sub=%02x Cod=%02x%c\", cdr.Transfer[0], cdr.Transfer[1], cdr.Transfer[2], cdr.Mode, cdr.Muted, Config.Xa, cdr.File, cdr.Channel, cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], cdr.Transfer[4+3], 10); fclose(fp); }",
-              "\t\t\tcat_cd_log++;",
+              "\t\t\tif (fp) { fprintf(fp, \"CAT_03: %02x:%02x:%02x Mode=%02x First=%d Flt=%d:%d Sec=%d:%d Sub=%02x Cod=%02x%c\", cdr.Transfer[0], cdr.Transfer[1], cdr.Transfer[2], cdr.Mode, cdr.FirstSector, cdr.File, cdr.Channel, cdr.Transfer[4+0], cdr.Transfer[4+1], cdr.Transfer[4+2], cdr.Transfer[4+3], 10); fclose(fp); }",
+              "\t\t\tcat03_log++;",
               "\t\t}",
+              "\t} else if (cdr.Transfer[0] > 0x03) {",
+              "\t\tg_cat_active = 0;",
               "\t}",
               "\tif ((!cdr.Muted) && (cdr.Mode & MODE_STRSND) && (!Config.Xa) && (cdr.FirstSector != -1)) { // CD-XA"
           ])
@@ -148,11 +161,11 @@ jobs:
           cdrom = cdrom.replace(old_cdxa_top, new_cdxa_top, 1).replace(old_lock, new_lock, 1)
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
-          print("SUCCESS 2: Patched libpcsxcore/cdrom.c with CAT_CD sector logger at 02:56+!")
+          print("SUCCESS 3: Patched libpcsxcore/cdrom.c to capture 03:00:13+ Cat Cutscene sectors!")
           EOF
 
-          python3 patch_v21.py > ../build_v21_report.txt
-          rm -f patch_v21.py
+          python3 patch_v22.py > ../build_v22_report.txt
+          rm -f patch_v22.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -160,8 +173,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V21 ===" >> ../build_v21_report.txt
-          git diff frontend/libretro.c libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v21_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V22 ===" >> ../build_v22_report.txt
+          git diff libpcsxcore/cdrom.c libpcsxcore/decode_xa.c plugins/dfsound/spu.c plugins/dfsound/dma.c >> ../build_v22_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -173,32 +186,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V21_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V22_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V21_FLAGS"
-            export CXXFLAGS="$A9_V21_FLAGS"
+            export CFLAGS="$A9_V22_FLAGS"
+            export CXXFLAGS="$A9_V22_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V21_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V21_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V22_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V22_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v21.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v22.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v21_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v22_report.txt
           '
-          cat build_v21_report.txt
+          cat build_v22_report.txt
 
-      - name: Upload v21 .so File & Report
+      - name: Upload v22 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v21-puresound-catinspect
+          name: pcsx-rearmed-v22-true50fps-cat03
           path: |
             pcsx_rearmed_libretro.so
-            build_v21_report.txt
-            build_v21.log
+            build_v22_report.txt
+            build_v22.log
