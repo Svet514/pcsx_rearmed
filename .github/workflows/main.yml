@@ -94,17 +94,17 @@ jobs:
               libretro_c = f.read()
 
           target_env_call = "environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)"
-          target_update_fn = "static void update_variables(bool in_flight)"
+          target_multitap_fn = "static void update_multitap("
 
-          if target_env_call not in libretro_c or target_update_fn not in libretro_c:
+          if target_env_call not in libretro_c or target_multitap_fn not in libretro_c:
               print("ERROR: target strings not found in frontend/libretro.c!")
               sys.exit(1)
 
           helper_fn = "\n".join([
-              "static bool get_game_var(struct retro_variable *v)",
+              "static int get_game_var(struct retro_variable *v)",
               "{",
               "\tif (!environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, v) || !v->value)",
-              "\t\treturn false;",
+              "\t\treturn 0;",
               "\tif (CdromId[0] != '\\0') {",
               "\t\tif ((strncmp(CdromId, \"SLES03180\", 9) == 0 || strncmp(CdromId, \"SLUS01180\", 9) == 0) &&",
               "\t\t    strcmp(v->key, \"pcsx_rearmed_gpu_unai_lighting\") == 0) {",
@@ -121,14 +121,14 @@ jobs:
               "\t\t\t\tv->value = \"57\";",
               "\t\t}",
               "\t}",
-              "\treturn true;",
+              "\treturn 1;",
               "}",
               "",
-              "static void update_variables(bool in_flight)"
+              "static void update_multitap("
           ])
 
           libretro_c = libretro_c.replace(target_env_call, "get_game_var(&var)")
-          libretro_c = libretro_c.replace(target_update_fn, helper_fn, 1)
+          libretro_c = libretro_c.replace(target_multitap_fn, helper_fn, 1)
 
           # Re-run update_variables(true) right after CheckCdrom() in retro_load_game so CdromId overrides apply immediately
           if "CheckCdrom();" in libretro_c:
@@ -136,7 +136,7 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(libretro_c)
-          print("SUCCESS 3: Patched frontend/libretro.c with get_game_var() per-game profiles!")
+          print("SUCCESS 3: Patched frontend/libretro.c with get_game_var() placed above update_multitap!")
           EOF
 
           python3 patch_v28.py | tee ../build_v28_report.txt
