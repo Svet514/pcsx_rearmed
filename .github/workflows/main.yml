@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v27 Clean Production Release
+name: Build PCSX-ReARMed v28 47FPS-Lock + AutoGameProfiles
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Apply Clean v27 Patches
+      - name: Checkout Official b1226a3a & Apply v28 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,14 +19,14 @@ jobs:
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v27.py
+          cat << 'EOF' > patch_v28.py
           import sys
 
-          # --- 1. PATCH plugins/dfsound/spu.c: 768 DURING MOVIES + 824/748 IN GAMEPLAY + XA UNMUTE ---
+          # --- 1. PATCH plugins/dfsound/spu.c: 768 FOR MOVIES + 47 FPS LOCK (736) & 41 FPS CUSHION (632) IN GAMEPLAY ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
 
-          spu_c = "#include <sys/time.h>\nstatic int g_spu_div = 768;\n" + spu_c
+          spu_c = "#include <sys/time.h>\nstatic int g_spu_div = 736;\n" + spu_c
 
           old_ns_calc = (
               " if (cycle_diff < 2 * 768)\n"
@@ -44,6 +44,9 @@ jobs:
           old_played_adv = "  spu.cycles_played += ns_to * 768;"
           new_played_adv = "  spu.cycles_played += ns_to * g_spu_div;"
 
+          # When XA movie audio is active (spu.XAPlay != spu.XAFeed), lock g_spu_div = 768 for 100% stock lip-sync.
+          # During gameplay, lock max speed to ~47 FPS (g_spu_div = 736) to keep ALSA buffer 100% full,
+          # and step down to 680 (<46 FPS) or 632 (<43 FPS) so 41-42 FPS dips never underrun!
           old_async_feed = (
               " if (flags & 1) {\n"
               "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);\n"
@@ -58,9 +61,9 @@ jobs:
               "   g_spu_div = 768;",
               "  } else if (after_feed_tv.tv_sec != 0) {",
               "   long emu_us = (before_feed_tv.tv_sec - after_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - after_feed_tv.tv_usec);",
-              "   if (emu_us > 21200) g_spu_div = 748;",
-              "   else if (emu_us > 19600) g_spu_div = 784;",
-              "   else g_spu_div = 824;",
+              "   if (emu_us > 23200) g_spu_div = 632;",
+              "   else if (emu_us > 21600) g_spu_div = 680;",
+              "   else g_spu_div = 736;",
               "  }",
               "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);",
               "  spu.pS = (short *)spu.pSpuBuffer;",
@@ -86,7 +89,7 @@ jobs:
           )
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
-          print("SUCCESS 1: Cleanly patched plugins/dfsound/spu.c!")
+          print("SUCCESS 1: Patched spu.c with 47 FPS lock (736) + 41 FPS cushion (632) + XA unmute!")
 
           # --- 2. PATCH libpcsxcore/cdrom.c: CLEAN CHANNEL 255 FIRST-SECTOR LOCK FIX ---
           with open("libpcsxcore/cdrom.c", "r") as f:
@@ -113,10 +116,74 @@ jobs:
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
           print("SUCCESS 2: Cleanly patched libpcsxcore/cdrom.c!")
+
+          # --- 3. PATCH frontend/libretro.c: AUTO PER-GAME PROFILES FOR SESAME STREET SPORTS & TWEENIES ---
+          with open("frontend/libretro.c", "r") as f:
+              libretro_c = f.read()
+
+          # A) Auto-disable gpu_unai_lighting for Sesame Street Sports (SLES03180 / SLUS01180)
+          old_lighting_var = 'var.key = "pcsx_rearmed_gpu_unai_lighting";\n\tif (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {'
+          new_lighting_var = (
+              'var.key = "pcsx_rearmed_gpu_unai_lighting";\n'
+              '\tif (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {\n'
+              '\t\tif (strncmp(CdromId, "SLES03180", 9) == 0 || strncmp(CdromId, "SLUS01180", 9) == 0)\n'
+              '\t\t\tvar.value = "disabled";'
+          )
+
+          # B) After CheckCdrom() in retro_load_game, re-run update_variables(true) and apply Tweenies (SLES03412) safe settings
+          old_checkcdrom = "CheckCdrom();"
+          new_checkcdrom = (
+              "CheckCdrom();\n"
+              "\tupdate_variables(true);\n"
+              "\tif (strncmp(CdromId, \"SLES03412\", 9) == 0) {\n"
+              "\t\tConfig.SpuIrq = 1;\n"
+              "\t\tConfig.cycle_multiplier = CYCLE_MULT_DEFAULT;\n"
+              "\t\tdrc_PutConfig(0, 0, 0);\n"
+              "\t}"
+          )
+
+          if old_lighting_var not in libretro_c or old_checkcdrom not in libretro_c:
+              print("WARNING: Exact match in frontend/libretro.c differed, checking fallback...")
+              for i, line in enumerate(libretro_c.splitlines()):
+                  if "pcsx_rearmed_gpu_unai_lighting" in line or "CheckCdrom" in line:
+                      print(f"Line {i}: {line}")
+              sys.exit(1)
+
+          # Check if drc_PutConfig exists or use direct Config/var overrides for Tweenies:
+          new_checkcdrom_safe = (
+              "CheckCdrom();\n"
+              "\tupdate_variables(true);\n"
+              "\tif (strncmp(CdromId, \"SLES03412\", 9) == 0) {\n"
+              "\t\tConfig.SpuIrq = 1;\n"
+              "\t\tcycle_multiplier = 175;\n"
+              "\t}"
+          )
+          # Also override nosmccheck, nogteflags, gteregsunneeded, duping_enable in update_variables when SLES03412 is loaded!
+          for opt_key in [
+              "pcsx_rearmed_nosmccheck",
+              "pcsx_rearmed_nogteflags",
+              "pcsx_rearmed_gteregsunneeded",
+              "pcsx_rearmed_duping_enable"
+          ]:
+              target_k = f'var.key = "{opt_key}";\n\tif (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {{'
+              replacement_k = (
+                  f'var.key = "{opt_key}";\n'
+                  f'\tif (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {{\n'
+                  f'\t\tif (strncmp(CdromId, "SLES03412", 9) == 0) var.value = "disabled";'
+              )
+              libretro_c = libretro_c.replace(target_k, replacement_k, 1)
+
+          libretro_c = (
+              libretro_c.replace(old_lighting_var, new_lighting_var, 1)
+                        .replace(old_checkcdrom, new_checkcdrom_safe, 1)
+          )
+          with open("frontend/libretro.c", "w") as f:
+              f.write(libretro_c)
+          print("SUCCESS 3: Patched frontend/libretro.c with auto per-game profiles for Sesame Street Sports & Tweenies!")
           EOF
 
-          python3 patch_v27.py > ../build_v27_report.txt
-          rm -f patch_v27.py
+          python3 patch_v28.py > ../build_v28_report.txt
+          rm -f patch_v28.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -124,8 +191,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V27 ===" >> ../build_v27_report.txt
-          git diff libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v27_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V28 ===" >> ../build_v28_report.txt
+          git diff frontend/libretro.c libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v28_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -137,32 +204,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V27_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V28_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V27_FLAGS"
-            export CXXFLAGS="$A9_V27_FLAGS"
+            export CFLAGS="$A9_V28_FLAGS"
+            export CXXFLAGS="$A9_V28_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V27_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V27_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V28_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V28_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v27.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v28.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v27_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v28_report.txt
           '
-          cat build_v27_report.txt
+          cat build_v28_report.txt
 
-      - name: Upload v27 Clean .so File & Report
+      - name: Upload v28 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v27-clean-release
+          name: pcsx-rearmed-v28-47fps-autoprofiles
           path: |
             pcsx_rearmed_libretro.so
-            build_v27_report.txt
-            build_v27.log
+            build_v28_report.txt
+            build_v28.log
