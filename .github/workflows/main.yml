@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v28 47FPS-Lock + AutoGameProfiles
+name: Build PCSX-ReARMed v28 Constant47FPS + AutoGameProfiles
 
 on:
   workflow_dispatch:
@@ -22,11 +22,9 @@ jobs:
           cat << 'EOF' > patch_v28.py
           import sys
 
-          # --- 1. PATCH plugins/dfsound/spu.c: 768 FOR MOVIES + 47 FPS LOCK (736) & 41 FPS CUSHION (632) IN GAMEPLAY ---
+          # --- 1. PATCH plugins/dfsound/spu.c: ZERO-OVERHEAD CONSTANT 768 (MOVIES) / 720 (~46.9 FPS GAMEPLAY) ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
-
-          spu_c = "#include <sys/time.h>\nstatic int g_spu_div = 736;\n" + spu_c
 
           old_ns_calc = (
               " if (cycle_diff < 2 * 768)\n"
@@ -35,40 +33,15 @@ jobs:
               " ns_to = (cycle_diff / 768 + 1) & ~1;"
           )
           new_ns_calc = (
-              " if (cycle_diff < 2 * g_spu_div)\n"
+              " const int spu_div = (spu.XAPlay != spu.XAFeed) ? 768 : 720;\n"
+              " if (cycle_diff < 2 * spu_div)\n"
               "  return;\n"
               "\n"
-              " ns_to = (cycle_diff / g_spu_div + 1) & ~1;"
+              " ns_to = (((spu.XAPlay != spu.XAFeed) ? (cycle_diff / 768) : (cycle_diff / 720)) + 1) & ~1;"
           )
 
           old_played_adv = "  spu.cycles_played += ns_to * 768;"
-          new_played_adv = "  spu.cycles_played += ns_to * g_spu_div;"
-
-          # When XA movie audio is active (spu.XAPlay != spu.XAFeed), lock g_spu_div = 768 for 100% stock lip-sync.
-          # During gameplay, lock max speed to ~47 FPS (g_spu_div = 736) to keep ALSA buffer 100% full,
-          # and step down to 680 (<46 FPS) or 632 (<43 FPS) so 41-42 FPS dips never underrun!
-          old_async_feed = (
-              " if (flags & 1) {\n"
-              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);\n"
-              "  spu.pS = (short *)spu.pSpuBuffer;"
-          )
-          new_async_feed = "\n".join([
-              " if (flags & 1) {",
-              "  static struct timeval after_feed_tv = {0, 0};",
-              "  struct timeval before_feed_tv;",
-              "  gettimeofday(&before_feed_tv, NULL);",
-              "  if (spu.XAPlay != spu.XAFeed) {",
-              "   g_spu_div = 768;",
-              "  } else if (after_feed_tv.tv_sec != 0) {",
-              "   long emu_us = (before_feed_tv.tv_sec - after_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - after_feed_tv.tv_usec);",
-              "   if (emu_us > 23200) g_spu_div = 632;",
-              "   else if (emu_us > 21600) g_spu_div = 680;",
-              "   else g_spu_div = 736;",
-              "  }",
-              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);",
-              "  spu.pS = (short *)spu.pSpuBuffer;",
-              "  gettimeofday(&after_feed_tv, NULL);"
-          ])
+          new_played_adv = "  spu.cycles_played += ns_to * spu_div;"
 
           old_feed_xa = " FeedXA(xap);"
           new_feed_xa = "\n".join([
@@ -77,19 +50,18 @@ jobs:
               " FeedXA(xap);"
           ])
 
-          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_feed not in spu_c or old_feed_xa not in spu_c:
+          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_feed_xa not in spu_c:
               print("ERROR: target blocks not found in spu.c!")
               sys.exit(1)
 
           spu_c = (
               spu_c.replace(old_ns_calc, new_ns_calc, 1)
                    .replace(old_played_adv, new_played_adv, 1)
-                   .replace(old_async_feed, new_async_feed, 1)
                    .replace(old_feed_xa, new_feed_xa, 1)
           )
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
-          print("SUCCESS 1: Patched spu.c with 47 FPS lock (736) + 41 FPS cushion (632) + XA unmute!")
+          print("SUCCESS 1: Patched spu.c with zero-syscall compile-time constant 720 (~46.9 FPS) / 768 (XA movies)!")
 
           # --- 2. PATCH libpcsxcore/cdrom.c: CLEAN CHANNEL 255 FIRST-SECTOR LOCK FIX ---
           with open("libpcsxcore/cdrom.c", "r") as f:
@@ -117,72 +89,57 @@ jobs:
               f.write(cdrom)
           print("SUCCESS 2: Cleanly patched libpcsxcore/cdrom.c!")
 
-          # --- 3. PATCH frontend/libretro.c: AUTO PER-GAME PROFILES FOR SESAME STREET SPORTS & TWEENIES ---
+          # --- 3. PATCH frontend/libretro.c: AUTO PER-GAME PROFILES VIA get_game_var() ---
           with open("frontend/libretro.c", "r") as f:
               libretro_c = f.read()
 
-          # A) Auto-disable gpu_unai_lighting for Sesame Street Sports (SLES03180 / SLUS01180)
-          old_lighting_var = 'var.key = "pcsx_rearmed_gpu_unai_lighting";\n\tif (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {'
-          new_lighting_var = (
-              'var.key = "pcsx_rearmed_gpu_unai_lighting";\n'
-              '\tif (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {\n'
-              '\t\tif (strncmp(CdromId, "SLES03180", 9) == 0 || strncmp(CdromId, "SLUS01180", 9) == 0)\n'
-              '\t\t\tvar.value = "disabled";'
-          )
+          target_env_call = "environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)"
+          target_update_fn = "static void update_variables(bool in_flight)"
 
-          # B) After CheckCdrom() in retro_load_game, re-run update_variables(true) and apply Tweenies (SLES03412) safe settings
-          old_checkcdrom = "CheckCdrom();"
-          new_checkcdrom = (
-              "CheckCdrom();\n"
-              "\tupdate_variables(true);\n"
-              "\tif (strncmp(CdromId, \"SLES03412\", 9) == 0) {\n"
-              "\t\tConfig.SpuIrq = 1;\n"
-              "\t\tConfig.cycle_multiplier = CYCLE_MULT_DEFAULT;\n"
-              "\t\tdrc_PutConfig(0, 0, 0);\n"
-              "\t}"
-          )
-
-          if old_lighting_var not in libretro_c or old_checkcdrom not in libretro_c:
-              print("WARNING: Exact match in frontend/libretro.c differed, checking fallback...")
-              for i, line in enumerate(libretro_c.splitlines()):
-                  if "pcsx_rearmed_gpu_unai_lighting" in line or "CheckCdrom" in line:
-                      print(f"Line {i}: {line}")
+          if target_env_call not in libretro_c or target_update_fn not in libretro_c:
+              print("ERROR: target strings not found in frontend/libretro.c!")
               sys.exit(1)
 
-          # Check if drc_PutConfig exists or use direct Config/var overrides for Tweenies:
-          new_checkcdrom_safe = (
-              "CheckCdrom();\n"
-              "\tupdate_variables(true);\n"
-              "\tif (strncmp(CdromId, \"SLES03412\", 9) == 0) {\n"
-              "\t\tConfig.SpuIrq = 1;\n"
-              "\t\tcycle_multiplier = 175;\n"
-              "\t}"
-          )
-          # Also override nosmccheck, nogteflags, gteregsunneeded, duping_enable in update_variables when SLES03412 is loaded!
-          for opt_key in [
-              "pcsx_rearmed_nosmccheck",
-              "pcsx_rearmed_nogteflags",
-              "pcsx_rearmed_gteregsunneeded",
-              "pcsx_rearmed_duping_enable"
-          ]:
-              target_k = f'var.key = "{opt_key}";\n\tif (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {{'
-              replacement_k = (
-                  f'var.key = "{opt_key}";\n'
-                  f'\tif (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {{\n'
-                  f'\t\tif (strncmp(CdromId, "SLES03412", 9) == 0) var.value = "disabled";'
-              )
-              libretro_c = libretro_c.replace(target_k, replacement_k, 1)
+          helper_fn = "\n".join([
+              "static bool get_game_var(struct retro_variable *v)",
+              "{",
+              "\tif (!environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, v) || !v->value)",
+              "\t\treturn false;",
+              "\tif (CdromId[0] != '\\0') {",
+              "\t\tif ((strncmp(CdromId, \"SLES03180\", 9) == 0 || strncmp(CdromId, \"SLUS01180\", 9) == 0) &&",
+              "\t\t    strcmp(v->key, \"pcsx_rearmed_gpu_unai_lighting\") == 0) {",
+              "\t\t\tv->value = \"disabled\";",
+              "\t\t} else if (strncmp(CdromId, \"SLES03412\", 9) == 0) {",
+              "\t\t\tif (strcmp(v->key, \"pcsx_rearmed_nosmccheck\") == 0 ||",
+              "\t\t\t    strcmp(v->key, \"pcsx_rearmed_nogteflags\") == 0 ||",
+              "\t\t\t    strcmp(v->key, \"pcsx_rearmed_gteregsunneeded\") == 0 ||",
+              "\t\t\t    strcmp(v->key, \"pcsx_rearmed_duping_enable\") == 0)",
+              "\t\t\t\tv->value = \"disabled\";",
+              "\t\t\telse if (strcmp(v->key, \"pcsx_rearmed_spuirq\") == 0)",
+              "\t\t\t\tv->value = \"enabled\";",
+              "\t\t\telse if (strcmp(v->key, \"pcsx_rearmed_psxclock\") == 0)",
+              "\t\t\t\tv->value = \"57\";",
+              "\t\t}",
+              "\t}",
+              "\treturn true;",
+              "}",
+              "",
+              "static void update_variables(bool in_flight)"
+          ])
 
-          libretro_c = (
-              libretro_c.replace(old_lighting_var, new_lighting_var, 1)
-                        .replace(old_checkcdrom, new_checkcdrom_safe, 1)
-          )
+          libretro_c = libretro_c.replace(target_env_call, "get_game_var(&var)")
+          libretro_c = libretro_c.replace(target_update_fn, helper_fn, 1)
+
+          # Re-run update_variables(true) right after CheckCdrom() in retro_load_game so CdromId overrides apply immediately
+          if "CheckCdrom();" in libretro_c:
+              libretro_c = libretro_c.replace("CheckCdrom();", "CheckCdrom();\n\tupdate_variables(true);", 1)
+
           with open("frontend/libretro.c", "w") as f:
               f.write(libretro_c)
-          print("SUCCESS 3: Patched frontend/libretro.c with auto per-game profiles for Sesame Street Sports & Tweenies!")
+          print("SUCCESS 3: Patched frontend/libretro.c with get_game_var() per-game profiles!")
           EOF
 
-          python3 patch_v28.py > ../build_v28_report.txt
+          python3 patch_v28.py | tee ../build_v28_report.txt
           rm -f patch_v28.py
 
           # Optimize Makefiles
@@ -228,7 +185,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v28-47fps-autoprofiles
+          name: pcsx-rearmed-v28-constant47fps-autoprofiles
           path: |
             pcsx_rearmed_libretro.so
             build_v28_report.txt
