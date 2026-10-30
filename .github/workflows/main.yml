@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v28 Constant47FPS + AutoGameProfiles
+name: Build PCSX-ReARMed v29 Zstd-CHD + 47.5FPS + FixedAutoProfiles
 
 on:
   workflow_dispatch:
@@ -10,21 +10,55 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Official b1226a3a & Apply v28 Patches
+      - name: Checkout b1226a3a, Upgrade libchdr with Zstd, & Apply v29 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
+          git remote add notaz https://github.com/notaz/pcsx_rearmed.git
+          git fetch notaz master
           git checkout b1226a3ab49a2e82e55a7123eb68fded56091044
+
+          # Upgrade deps/libchdr to latest upstream (adds Zstd 1.5.7 + LZMA 26.02 CHD support)
+          rm -rf deps/libchdr
+          git checkout notaz/master -- deps/libchdr
 
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v28.py
+          cat << 'EOF' > patch_v29.py
           import sys
+          import subprocess
 
-          # --- 1. PATCH plugins/dfsound/spu.c: ZERO-OVERHEAD CONSTANT 768 (MOVIES) / 720 (~46.9 FPS GAMEPLAY) ---
+          # --- 0. UPDATE Makefile HAVE_CHD BLOCK TO INCLUDE ZSTD & NEW LIBCHDR ---
+          notaz_mk = subprocess.check_output(["git", "show", "notaz/master:Makefile"]).decode("utf-8")
+          with open("Makefile", "r") as f:
+              cur_mk = f.read()
+
+          start_marker = '# libchdr\nifeq "$(HAVE_CHD)" "1"'
+          end_marker = "endif\n\nifeq \"$(ARCH)\""
+
+          if start_marker in notaz_mk and start_marker in cur_mk:
+              n_start = notaz_mk.index(start_marker)
+              n_end = notaz_mk.index("endif\n", n_start) + len("endif\n")
+              new_chd_block = notaz_mk[n_start:n_end]
+              # Ensure ZSTD_DISABLE_ASM is defined for ARMv7 softfp compatibility
+              new_chd_block = new_chd_block.replace("-DHAVE_CHD", "-DHAVE_CHD -DZSTD_DISABLE_ASM")
+
+              c_start = cur_mk.index(start_marker)
+              c_end = cur_mk.index("endif\n", c_start) + len("endif\n")
+              cur_mk = cur_mk[:c_start] + new_chd_block + cur_mk[c_end:]
+              with open("Makefile", "w") as f:
+                  f.write(cur_mk)
+              print("SUCCESS 0: Upgraded Makefile libchdr block with Zstd (cdzs) support!")
+          else:
+              print("ERROR: Could not locate HAVE_CHD block in Makefile!")
+              sys.exit(1)
+
+          # --- 1. PATCH plugins/dfsound/spu.c: COMPILE-TIME CONSTANTS 768 (MOVIES) / 732 (~47.5 FPS) / 640 (41 FPS CUSHION) ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
+
+          spu_c = "#include <sys/time.h>\nstatic int g_slow_frame = 0;\n" + spu_c
 
           old_ns_calc = (
               " if (cycle_diff < 2 * 768)\n"
@@ -32,16 +66,44 @@ jobs:
               "\n"
               " ns_to = (cycle_diff / 768 + 1) & ~1;"
           )
-          new_ns_calc = (
-              " const int spu_div = (spu.XAPlay != spu.XAFeed) ? 768 : 720;\n"
-              " if (cycle_diff < 2 * spu_div)\n"
-              "  return;\n"
-              "\n"
-              " ns_to = (((spu.XAPlay != spu.XAFeed) ? (cycle_diff / 768) : (cycle_diff / 720)) + 1) & ~1;"
-          )
+          new_ns_calc = "\n".join([
+              " int spu_div;",
+              " if (spu.XAPlay != spu.XAFeed) {",
+              "  spu_div = 768;",
+              "  if (cycle_diff < 2 * 768) return;",
+              "  ns_to = (cycle_diff / 768 + 1) & ~1;",
+              " } else if (g_slow_frame) {",
+              "  spu_div = 640;",
+              "  if (cycle_diff < 2 * 640) return;",
+              "  ns_to = (cycle_diff / 640 + 1) & ~1;",
+              " } else {",
+              "  spu_div = 732;",
+              "  if (cycle_diff < 2 * 732) return;",
+              "  ns_to = (cycle_diff / 732 + 1) & ~1;",
+              " }"
+          ])
 
           old_played_adv = "  spu.cycles_played += ns_to * 768;"
           new_played_adv = "  spu.cycles_played += ns_to * spu_div;"
+
+          old_async_feed = (
+              " if (flags & 1) {\n"
+              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);\n"
+              "  spu.pS = (short *)spu.pSpuBuffer;"
+          )
+          new_async_feed = "\n".join([
+              " if (flags & 1) {",
+              "  static struct timeval after_feed_tv = {0, 0};",
+              "  struct timeval before_feed_tv;",
+              "  gettimeofday(&before_feed_tv, NULL);",
+              "  if (after_feed_tv.tv_sec != 0) {",
+              "   long emu_us = (before_feed_tv.tv_sec - after_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - after_feed_tv.tv_usec);",
+              "   g_slow_frame = (emu_us > 22200 && emu_us < 65000) ? 1 : 0;",
+              "  }",
+              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);",
+              "  spu.pS = (short *)spu.pSpuBuffer;",
+              "  gettimeofday(&after_feed_tv, NULL);"
+          ])
 
           old_feed_xa = " FeedXA(xap);"
           new_feed_xa = "\n".join([
@@ -50,18 +112,19 @@ jobs:
               " FeedXA(xap);"
           ])
 
-          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_feed_xa not in spu_c:
+          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_feed not in spu_c or old_feed_xa not in spu_c:
               print("ERROR: target blocks not found in spu.c!")
               sys.exit(1)
 
           spu_c = (
               spu_c.replace(old_ns_calc, new_ns_calc, 1)
                    .replace(old_played_adv, new_played_adv, 1)
+                   .replace(old_async_feed, new_async_feed, 1)
                    .replace(old_feed_xa, new_feed_xa, 1)
           )
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
-          print("SUCCESS 1: Patched spu.c with zero-syscall compile-time constant 720 (~46.9 FPS) / 768 (XA movies)!")
+          print("SUCCESS 1: Patched spu.c with compile-time constants 768 (Movies) / 732 (~47.5 FPS) / 640 (Slow-frame cushion)!")
 
           # --- 2. PATCH libpcsxcore/cdrom.c: CLEAN CHANNEL 255 FIRST-SECTOR LOCK FIX ---
           with open("libpcsxcore/cdrom.c", "r") as f:
@@ -89,58 +152,107 @@ jobs:
               f.write(cdrom)
           print("SUCCESS 2: Cleanly patched libpcsxcore/cdrom.c!")
 
-          # --- 3. PATCH frontend/libretro.c: AUTO PER-GAME PROFILES VIA get_game_var() ---
+          # --- 3. PATCH frontend/libretro.c: CASE-INSENSITIVE FILENAME + CDROMID AUTO-PROFILES ---
           with open("frontend/libretro.c", "r") as f:
               libretro_c = f.read()
 
-          target_env_call = "environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)"
-          target_multitap_fn = "static void update_multitap("
+          target_multitap_fn = "static void update_multitap(void)"
+          target_in_flight = "   if (in_flight)\n      plugin_call_rearmed_cbs();"
+          target_load_game = "bool retro_load_game(const struct retro_game_info *info)\n{"
+          target_check_cdrom = "if (CheckCdrom() == -1)"
 
-          if target_env_call not in libretro_c or target_multitap_fn not in libretro_c:
-              print("ERROR: target strings not found in frontend/libretro.c!")
-              sys.exit(1)
+          for name, t in [
+              ("target_multitap_fn", target_multitap_fn),
+              ("target_in_flight", target_in_flight),
+              ("target_load_game", target_load_game),
+              ("target_check_cdrom", target_check_cdrom),
+          ]:
+              if t not in libretro_c:
+                  print(f"ERROR: {name} not found in frontend/libretro.c!")
+                  sys.exit(1)
 
-          helper_fn = "\n".join([
-              "static int get_game_var(struct retro_variable *v)",
+          helper_block = "\n".join([
+              "static char g_rom_path[512] = {0};",
+              "",
+              "static int is_sesame_game(void)",
               "{",
-              "\tif (!environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, v) || !v->value)",
-              "\t\treturn 0;",
-              "\tif (CdromId[0] != '\\0') {",
-              "\t\tif ((strncmp(CdromId, \"SLES03180\", 9) == 0 || strncmp(CdromId, \"SLUS01180\", 9) == 0) &&",
-              "\t\t    strcmp(v->key, \"pcsx_rearmed_gpu_unai_lighting\") == 0) {",
-              "\t\t\tv->value = \"disabled\";",
-              "\t\t} else if (strncmp(CdromId, \"SLES03412\", 9) == 0) {",
-              "\t\t\tif (strcmp(v->key, \"pcsx_rearmed_nosmccheck\") == 0 ||",
-              "\t\t\t    strcmp(v->key, \"pcsx_rearmed_nogteflags\") == 0 ||",
-              "\t\t\t    strcmp(v->key, \"pcsx_rearmed_gteregsunneeded\") == 0 ||",
-              "\t\t\t    strcmp(v->key, \"pcsx_rearmed_duping_enable\") == 0)",
-              "\t\t\t\tv->value = \"disabled\";",
-              "\t\t\telse if (strcmp(v->key, \"pcsx_rearmed_spuirq\") == 0)",
-              "\t\t\t\tv->value = \"enabled\";",
-              "\t\t\telse if (strcmp(v->key, \"pcsx_rearmed_psxclock\") == 0)",
-              "\t\t\t\tv->value = \"57\";",
-              "\t\t}",
-              "\t}",
-              "\treturn 1;",
+              "\tif (strncasecmp(CdromId, \"sles03180\", 9) == 0 || strncasecmp(CdromId, \"slus01180\", 9) == 0)",
+              "\t\treturn 1;",
+              "\tif (strcasestr(g_rom_path, \"sesame\") != NULL)",
+              "\t\treturn 1;",
+              "\treturn 0;",
               "}",
               "",
-              "static void update_multitap("
+              "static int is_tweenies_game(void)",
+              "{",
+              "\tif (strncasecmp(CdromId, \"sles03412\", 9) == 0)",
+              "\t\treturn 1;",
+              "\tif (strcasestr(g_rom_path, \"tweenies\") != NULL)",
+              "\t\treturn 1;",
+              "\treturn 0;",
+              "}",
+              "",
+              "static void apply_per_game_overrides(void)",
+              "{",
+              "\tif (is_sesame_game()) {",
+              "\t\tpl_rearmed_cbs.gpu_unai.lighting = 0;",
+              "\t} else if (is_tweenies_game()) {",
+              "#ifdef NEW_DYNAREC",
+              "\t\tnew_dynarec_hacks &= ~(NDHACK_NO_SMC_CHECK | NDHACK_GTE_UNNEEDED | NDHACK_GTE_NO_FLAGS);",
+              "#endif",
+              "\t\tduping_enable = false;",
+              "\t\tConfig.SpuIrq = 1;",
+              "\t\tcycle_multiplier = 10000 / 57;",
+              "\t}",
+              "}",
+              "",
+              "static void update_multitap(void)"
           ])
 
-          libretro_c = libretro_c.replace(target_env_call, "get_game_var(&var)")
-          libretro_c = libretro_c.replace(target_multitap_fn, helper_fn, 1)
+          new_in_flight = "\n".join([
+              "   apply_per_game_overrides();",
+              "   if (in_flight)",
+              "      plugin_call_rearmed_cbs();"
+          ])
 
-          # Re-run update_variables(true) right after CheckCdrom() in retro_load_game so CdromId overrides apply immediately
-          if "CheckCdrom();" in libretro_c:
-              libretro_c = libretro_c.replace("CheckCdrom();", "CheckCdrom();\n\tupdate_variables(true);", 1)
+          new_load_game = "\n".join([
+              "bool retro_load_game(const struct retro_game_info *info)",
+              "{",
+              "   if (info && info->path) {",
+              "      strncpy(g_rom_path, info->path, sizeof(g_rom_path) - 1);",
+              "      g_rom_path[sizeof(g_rom_path) - 1] = '\\0';",
+              "   } else {",
+              "      g_rom_path[0] = '\\0';",
+              "   }"
+          ])
+
+          # Also re-apply overrides and notify GPU plugin right after CheckCdrom() populates CdromId!
+          new_check_cdrom = "if (CheckCdrom() == -1)"
+          target_load_cdrom = "if (LoadCdrom() == -1)"
+          if target_load_cdrom not in libretro_c:
+              print("ERROR: target_load_cdrom not found in frontend/libretro.c!")
+              sys.exit(1)
+
+          new_load_cdrom = (
+              "apply_per_game_overrides();\n"
+              "\tplugin_call_rearmed_cbs();\n"
+              "\tif (LoadCdrom() == -1)"
+          )
+
+          libretro_c = (
+              libretro_c.replace(target_multitap_fn, helper_block, 1)
+                        .replace(target_in_flight, new_in_flight, 1)
+                        .replace(target_load_game, new_load_game, 1)
+                        .replace(target_load_cdrom, new_load_cdrom, 1)
+          )
 
           with open("frontend/libretro.c", "w") as f:
               f.write(libretro_c)
-          print("SUCCESS 3: Patched frontend/libretro.c with get_game_var() placed above update_multitap!")
+          print("SUCCESS 3: Patched frontend/libretro.c with verified filename + CdromId per-game overrides!")
           EOF
 
-          python3 patch_v28.py | tee ../build_v28_report.txt
-          rm -f patch_v28.py
+          python3 patch_v29.py | tee ../build_v29_report.txt
+          rm -f patch_v29.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -148,8 +260,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V28 ===" >> ../build_v28_report.txt
-          git diff frontend/libretro.c libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v28_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V29 ===" >> ../build_v29_report.txt
+          git diff Makefile frontend/libretro.c libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v29_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -161,32 +273,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V28_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V29_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V28_FLAGS"
-            export CXXFLAGS="$A9_V28_FLAGS"
+            export CFLAGS="$A9_V29_FLAGS"
+            export CXXFLAGS="$A9_V29_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V28_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V28_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V29_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V29_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v28.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v29.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v28_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v29_report.txt
           '
-          cat build_v28_report.txt
+          cat build_v29_report.txt
 
-      - name: Upload v28 .so File & Report
+      - name: Upload v29 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v28-constant47fps-autoprofiles
+          name: pcsx-rearmed-v29-zstd-47fps-profiles
           path: |
             pcsx_rearmed_libretro.so
-            build_v28_report.txt
-            build_v28.log
+            build_v29_report.txt
+            build_v29.lo
