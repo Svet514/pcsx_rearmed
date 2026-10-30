@@ -18,7 +18,7 @@ jobs:
           git fetch notaz master
           git checkout b1226a3ab49a2e82e55a7123eb68fded56091044
 
-          # Upgrade deps/libchdr to latest upstream (adds Zstd 1.5.7 + LZMA 26.02 CHD support)
+          # Upgrade deps/libchdr to latest upstream (adds Zstd + new LZMA CHD support)
           rm -rf deps/libchdr
           git checkout notaz/master -- deps/libchdr
 
@@ -27,32 +27,58 @@ jobs:
 
           cat << 'EOF' > patch_v29.py
           import sys
-          import subprocess
+          import os
+          import glob
 
-          # --- 0. UPDATE Makefile HAVE_CHD BLOCK TO INCLUDE ZSTD & NEW LIBCHDR ---
-          notaz_mk = subprocess.check_output(["git", "show", "notaz/master:Makefile"]).decode("utf-8")
+          # --- 0. CLEANLY GENERATE THE LIBCHDR + ZSTD MAKEFILE BLOCK FROM ACTUAL FILES ---
           with open("Makefile", "r") as f:
               cur_mk = f.read()
 
           start_marker = '# libchdr\nifeq "$(HAVE_CHD)" "1"'
-          end_marker = "endif\n\nifeq \"$(ARCH)\""
-
-          if start_marker in notaz_mk and start_marker in cur_mk:
-              n_start = notaz_mk.index(start_marker)
-              n_end = notaz_mk.index("endif\n", n_start) + len("endif\n")
-              new_chd_block = notaz_mk[n_start:n_end]
-              # Ensure ZSTD_DISABLE_ASM is defined for ARMv7 softfp compatibility
-              new_chd_block = new_chd_block.replace("-DHAVE_CHD", "-DHAVE_CHD -DZSTD_DISABLE_ASM")
-
-              c_start = cur_mk.index(start_marker)
-              c_end = cur_mk.index("endif\n", c_start) + len("endif\n")
-              cur_mk = cur_mk[:c_start] + new_chd_block + cur_mk[c_end:]
-              with open("Makefile", "w") as f:
-                  f.write(cur_mk)
-              print("SUCCESS 0: Upgraded Makefile libchdr block with Zstd (cdzs) support!")
-          else:
+          if start_marker not in cur_mk:
               print("ERROR: Could not locate HAVE_CHD block in Makefile!")
               sys.exit(1)
+
+          # In b1226a3a, the HAVE_CHD block has no nested ifeqs, so the first endif\n closes it cleanly
+          c_start = cur_mk.index(start_marker)
+          c_end = cur_mk.index("endif\n", c_start) + len("endif\n")
+
+          # Auto-discover all .c files and include dirs inside deps/libchdr
+          chd_c_files = []
+          chd_inc_dirs = set(["deps/libchdr/include", "deps/libchdr/include/libchdr"])
+          for root, dirs, files in os.walk("deps/libchdr"):
+              # Skip multi-threaded or non-standard test/example folders if any
+              if any(x in root for x in ["tests", "examples", "programs", "legacy", "dictBuilder", "deprecated"]):
+                  continue
+              for file in sorted(files):
+                  if file.endswith(".h"):
+                      chd_inc_dirs.add(root)
+                  elif file.endswith(".c"):
+                      # Skip multi-threaded lzma/zstd files on single-threaded build
+                      if file in ["LzFindMt.c", "LzFindOpt.c", "Threads.c", "zstdmt_compress.c", "pool.c", "threading.c"]:
+                          continue
+                      # Skip zstd compression/dict files (we only need decompression + common for reading CHDs!)
+                      if "compress" in root and "zlib" not in root:
+                          continue
+                      chd_c_files.append(os.path.join(root, file))
+
+          inc_flags = " ".join(f"-I{d}" for d in sorted(chd_inc_dirs))
+          obj_lines = " \\\n\t".join(f.replace(".c", ".o") for f in sorted(chd_c_files))
+
+          new_chd_block = (
+              '# libchdr\n'
+              'ifeq "$(HAVE_CHD)" "1"\n'
+              f'CFLAGS += {inc_flags} -DHAVE_CHD -D_7ZIP_ST -DZSTD_DISABLE_ASM\n'
+              f'CHD_OBJS = {obj_lines}\n'
+              '$(CHD_OBJS): CFLAGS += -Wno-unused -Wno-unused-function -Wno-deprecated-declarations\n'
+              'OBJS += $(CHD_OBJS)\n'
+              'endif\n'
+          )
+
+          cur_mk = cur_mk[:c_start] + new_chd_block + cur_mk[c_end:]
+          with open("Makefile", "w") as f:
+              f.write(cur_mk)
+          print(f"SUCCESS 0: Configured Makefile with {len(chd_c_files)} libchdr/Zstd/LZMA/zlib source files!")
 
           # --- 1. PATCH plugins/dfsound/spu.c: COMPILE-TIME CONSTANTS 768 (MOVIES) / 732 (~47.5 FPS) / 640 (41 FPS CUSHION) ---
           with open("plugins/dfsound/spu.c", "r") as f:
@@ -156,22 +182,22 @@ jobs:
           with open("frontend/libretro.c", "r") as f:
               libretro_c = f.read()
 
+          target_env_call = "environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)"
           target_multitap_fn = "static void update_multitap(void)"
-          target_in_flight = "   if (in_flight)\n      plugin_call_rearmed_cbs();"
           target_load_game = "bool retro_load_game(const struct retro_game_info *info)\n{"
-          target_check_cdrom = "if (CheckCdrom() == -1)"
+          target_load_cdrom = "if (LoadCdrom() == -1)"
 
           for name, t in [
+              ("target_env_call", target_env_call),
               ("target_multitap_fn", target_multitap_fn),
-              ("target_in_flight", target_in_flight),
               ("target_load_game", target_load_game),
-              ("target_check_cdrom", target_check_cdrom),
+              ("target_load_cdrom", target_load_cdrom),
           ]:
               if t not in libretro_c:
                   print(f"ERROR: {name} not found in frontend/libretro.c!")
                   sys.exit(1)
 
-          helper_block = "\n".join([
+          helper_fn = "\n".join([
               "static char g_rom_path[512] = {0};",
               "",
               "static int is_sesame_game(void)",
@@ -192,27 +218,28 @@ jobs:
               "\treturn 0;",
               "}",
               "",
-              "static void apply_per_game_overrides(void)",
+              "static int get_game_var(struct retro_variable *v)",
               "{",
+              "\tif (!environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, v) || !v->value)",
+              "\t\treturn 0;",
               "\tif (is_sesame_game()) {",
-              "\t\tpl_rearmed_cbs.gpu_unai.lighting = 0;",
+              "\t\tif (strcmp(v->key, \"pcsx_rearmed_gpu_unai_lighting\") == 0)",
+              "\t\t\tv->value = \"disabled\";",
               "\t} else if (is_tweenies_game()) {",
-              "#ifdef NEW_DYNAREC",
-              "\t\tnew_dynarec_hacks &= ~(NDHACK_NO_SMC_CHECK | NDHACK_GTE_UNNEEDED | NDHACK_GTE_NO_FLAGS);",
-              "#endif",
-              "\t\tduping_enable = false;",
-              "\t\tConfig.SpuIrq = 1;",
-              "\t\tcycle_multiplier = 10000 / 57;",
+              "\t\tif (strcmp(v->key, \"pcsx_rearmed_nosmccheck\") == 0 ||",
+              "\t\t    strcmp(v->key, \"pcsx_rearmed_nogteflags\") == 0 ||",
+              "\t\t    strcmp(v->key, \"pcsx_rearmed_gteregsunneeded\") == 0 ||",
+              "\t\t    strcmp(v->key, \"pcsx_rearmed_duping_enable\") == 0)",
+              "\t\t\tv->value = \"disabled\";",
+              "\t\telse if (strcmp(v->key, \"pcsx_rearmed_spuirq\") == 0)",
+              "\t\t\tv->value = \"enabled\";",
+              "\t\telse if (strcmp(v->key, \"pcsx_rearmed_psxclock\") == 0)",
+              "\t\t\tv->value = \"57\";",
               "\t}",
+              "\treturn 1;",
               "}",
               "",
               "static void update_multitap(void)"
-          ])
-
-          new_in_flight = "\n".join([
-              "   apply_per_game_overrides();",
-              "   if (in_flight)",
-              "      plugin_call_rearmed_cbs();"
           ])
 
           new_load_game = "\n".join([
@@ -226,29 +253,22 @@ jobs:
               "   }"
           ])
 
-          # Also re-apply overrides and notify GPU plugin right after CheckCdrom() populates CdromId!
-          new_check_cdrom = "if (CheckCdrom() == -1)"
-          target_load_cdrom = "if (LoadCdrom() == -1)"
-          if target_load_cdrom not in libretro_c:
-              print("ERROR: target_load_cdrom not found in frontend/libretro.c!")
-              sys.exit(1)
-
+          # Re-run update_variables(true) right before LoadCdrom() (which is immediately after CheckCdrom())
           new_load_cdrom = (
-              "apply_per_game_overrides();\n"
-              "\tplugin_call_rearmed_cbs();\n"
+              "update_variables(true);\n"
               "\tif (LoadCdrom() == -1)"
           )
 
           libretro_c = (
-              libretro_c.replace(target_multitap_fn, helper_block, 1)
-                        .replace(target_in_flight, new_in_flight, 1)
+              libretro_c.replace(target_env_call, "get_game_var(&var)")
+                        .replace(target_multitap_fn, helper_fn, 1)
                         .replace(target_load_game, new_load_game, 1)
                         .replace(target_load_cdrom, new_load_cdrom, 1)
           )
 
           with open("frontend/libretro.c", "w") as f:
               f.write(libretro_c)
-          print("SUCCESS 3: Patched frontend/libretro.c with verified filename + CdromId per-game overrides!")
+          print("SUCCESS 3: Patched frontend/libretro.c with get_game_var() checking g_rom_path + case-insensitive CdromId!")
           EOF
 
           python3 patch_v29.py | tee ../build_v29_report.txt
@@ -301,4 +321,4 @@ jobs:
           path: |
             pcsx_rearmed_libretro.so
             build_v29_report.txt
-            build_v29.lo
+            build_v29.log
