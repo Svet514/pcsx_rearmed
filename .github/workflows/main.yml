@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v30 Clean 46FPS-Lock + SesameStreetSportsLighting
+name: Build PCSX-ReARMed v31 Clean 46FPS-Lock + SesameLighting
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout b1226a3a & Apply Clean v30 Patches
+      - name: Checkout b1226a3a & Apply Clean v31 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -19,7 +19,7 @@ jobs:
           # 1. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v30.py
+          cat << 'EOF' > patch_v31.py
           import sys
 
           # --- 1. PATCH plugins/dfsound/spu.c: CONSTANT 768 (CUTSCENES) / 716 (~46 FPS GAMEPLAY) ---
@@ -89,11 +89,10 @@ jobs:
               f.write(cdrom)
           print("SUCCESS 2: Cleanly patched libpcsxcore/cdrom.c!")
 
-          # --- 3. PATCH frontend/libretro.c: DISABLE LIGHTING ONLY FOR "Sesame Street Sports" ---
+          # --- 3. PATCH frontend/libretro.c: AUTO-DISABLE LIGHTING FOR 'Sesame Street Sports' VIA CdromId / Title ---
           with open("frontend/libretro.c", "r") as f:
               libretro_c = f.read()
 
-          target_load_game = "bool retro_load_game(const struct retro_game_info *info)\n{"
           target_lighting_block = (
               '   var.key = "pcsx_rearmed_gpu_unai_lighting";\n'
               '   var.value = NULL;\n'
@@ -107,47 +106,35 @@ jobs:
               '   }'
           )
 
-          if target_load_game not in libretro_c or target_lighting_block not in libretro_c:
-              print("ERROR: target blocks not found in frontend/libretro.c!")
+          if target_lighting_block not in libretro_c:
+              print("ERROR: target_lighting_block not found in frontend/libretro.c!")
               sys.exit(1)
 
-          new_load_game = "\n".join([
-              "static char g_rom_path[512] = {0};",
-              "bool retro_load_game(const struct retro_game_info *info)",
-              "{",
-              "   if (info && info->path) {",
-              "      strncpy(g_rom_path, info->path, sizeof(g_rom_path) - 1);",
-              "      g_rom_path[sizeof(g_rom_path) - 1] = '\\0';",
-              "   } else {",
-              "      g_rom_path[0] = '\\0';",
-              "   }"
+          new_lighting_block = "\n".join([
+              '   var.key = "pcsx_rearmed_gpu_unai_lighting";',
+              '   var.value = NULL;',
+              '',
+              '   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)',
+              '   {',
+              '      if (strcmp(var.value, "disabled") == 0)',
+              '         pl_rearmed_cbs.gpu_unai.lighting = 0;',
+              '      else if (strcmp(var.value, "enabled") == 0)',
+              '         pl_rearmed_cbs.gpu_unai.lighting = 1;',
+              '   }',
+              '   /* Auto-disable lighting for Sesame Street Sports (SLES03180 / SLUS01180 or ID check) */',
+              '   if (strncasecmp(CdromId, "sles03180", 9) == 0 || strncasecmp(CdromId, "slus01180", 9) == 0 || strcasestr(CdromId, "sesame") != NULL)',
+              '      pl_rearmed_cbs.gpu_unai.lighting = 0;'
           ])
 
-          new_lighting_block = (
-              '   var.key = "pcsx_rearmed_gpu_unai_lighting";\n'
-              '   var.value = NULL;\n'
-              '\n'
-              '   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)\n'
-              '   {\n'
-              '      if (strcmp(var.value, "disabled") == 0 || strstr(g_rom_path, "Sesame Street Sports") != NULL)\n'
-              '         pl_rearmed_cbs.gpu_unai.lighting = 0;\n'
-              '      else if (strcmp(var.value, "enabled") == 0)\n'
-              '         pl_rearmed_cbs.gpu_unai.lighting = 1;\n'
-              '   }'
-          )
-
-          libretro_c = (
-              libretro_c.replace(target_load_game, new_load_game, 1)
-                        .replace(target_lighting_block, new_lighting_block, 1)
-          )
+          libretro_c = libretro_c.replace(target_lighting_block, new_lighting_block, 1)
 
           with open("frontend/libretro.c", "w") as f:
               f.write(libretro_c)
-          print("SUCCESS 3: Patched frontend/libretro.c to auto-disable lighting for 'Sesame Street Sports'!")
+          print("SUCCESS 3: Patched frontend/libretro.c with safe CdromId auto-lighting override for Sesame Street Sports!")
           EOF
 
-          python3 patch_v30.py | tee ../build_v30_report.txt
-          rm -f patch_v30.py
+          python3 patch_v31.py | tee ../build_v31_report.txt
+          rm -f patch_v31.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -155,8 +142,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V30 ===" >> ../build_v30_report.txt
-          git diff frontend/libretro.c libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v30_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V31 ===" >> ../build_v31_report.txt
+          git diff frontend/libretro.c libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v31_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -168,32 +155,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V30_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V31_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V30_FLAGS"
-            export CXXFLAGS="$A9_V30_FLAGS"
+            export CFLAGS="$A9_V31_FLAGS"
+            export CXXFLAGS="$A9_V31_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V30_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V30_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V31_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V31_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v30.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v31.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v30_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v31_report.txt
           '
-          cat build_v30_report.txt
+          cat build_v31_report.txt
 
-      - name: Upload v30 .so File & Report
+      - name: Upload v31 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v30-clean-46fps-sesame
+          name: pcsx-rearmed-v31-clean-46fps-sesame
           path: |
             pcsx_rearmed_libretro.so
-            build_v30_report.txt
-            build_v30.log
+            build_v31_report.txt
+            build_v31.log
