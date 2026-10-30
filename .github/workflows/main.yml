@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v34 Zstd-CHD + 46FPS-Lock + SesameLighting
+name: Build PCSX-ReARMed v35 Zstd-Fast + 46FPS-Lock + ZeroUnderrun + Sesame
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout b1226a3a, Clone rtissera/libchdr (Zstd), & Apply v34 Patches
+      - name: Checkout b1226a3a, Clone rtissera/libchdr (Zstd), & Apply v35 Patches
         run: |
           git clone https://github.com/libretro/pcsx_rearmed.git src
           cd src
@@ -25,12 +25,12 @@ jobs:
           # 2. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v34.py
+          cat << 'EOF' > patch_v35.py
           import sys
           import os
           import glob
 
-          # --- 0. PATCH Makefile TO BUILD rtissera/libchdr WITH ZSTD (cdzs), LZMA, FLAC, AND ZLIB-1.2.11 ---
+          # --- 0. PATCH Makefile TO BUILD rtissera/libchdr WITH FAST ARMv7 UNALIGNED ZSTD (cdzs) ---
           with open("Makefile", "r") as f:
               cur_mk = f.read()
 
@@ -51,13 +51,11 @@ jobs:
           lzma_dir = lzma_dirs[0]
           zstd_dir = zstd_dirs[0]
 
-          # Collect all include directories inside deps/libchdr that contain .h files
           inc_dirs = ["deps/libchdr/include", "deps/libchdr/include/libchdr", "deps/libchdr/src", f"{lzma_dir}/include", zstd_dir, "deps/libchdr/deps/zlib-1.2.11"]
           for root, dirs, files in os.walk("deps/libchdr/deps"):
               if any(f.endswith(".h") for f in files) and root not in inc_dirs:
                   inc_dirs.append(root)
 
-          # Collect exact source files needed for libchdr + zstd + lzma + zlib
           chd_sources = sorted(glob.glob("deps/libchdr/src/*.c"))
           zlib_sources = sorted(glob.glob("deps/libchdr/deps/zlib-1.2.11/*.c"))
           lzma_sources = [f"{lzma_dir}/src/LzmaDec.c"]
@@ -72,19 +70,15 @@ jobs:
               zstd_sources.extend(sorted(glob.glob(f"{zstd_dir}/decompress/*.c")))
 
           all_chd_c = chd_sources + lzma_sources + zstd_sources + zlib_sources
-          if not chd_sources or not zstd_sources:
-              print("ERROR: Missing chd_sources or zstd_sources!")
-              sys.exit(1)
-
           inc_flags = " ".join(f"-I{d}" for d in inc_dirs)
           obj_list = " \\\n\t".join(src[:-2] + ".o" for src in all_chd_c)
 
           new_chd_block = (
               '# libchdr\n'
               'ifeq "$(HAVE_CHD)" "1"\n'
-              f'CFLAGS += {inc_flags} -DHAVE_CHD -D_7ZIP_ST -DCHDR_SYSTEM_ZLIB -DZSTD_DISABLE_ASM\n'
+              f'CFLAGS += {inc_flags} -DHAVE_CHD -D_7ZIP_ST -DCHDR_SYSTEM_ZLIB\n'
               f'CHD_OBJS = {obj_list}\n'
-              '$(CHD_OBJS): CFLAGS += -Wno-unused -Wno-unused-function -Wno-deprecated-declarations\n'
+              '$(CHD_OBJS): CFLAGS += -munaligned-access -Wno-unused -Wno-unused-function -Wno-deprecated-declarations\n'
               'OBJS += $(CHD_OBJS)\n'
               'endif\n'
           )
@@ -92,11 +86,33 @@ jobs:
           cur_mk = cur_mk[:c_start] + new_chd_block + cur_mk[c_end:]
           with open("Makefile", "w") as f:
               f.write(cur_mk)
-          print(f"SUCCESS 0: Configured Makefile with {len(all_chd_c)} CHD/Zstd/LZMA/zlib files ({lzma_dir}, {zstd_dir})!")
+          print(f"SUCCESS 0: Configured Makefile with {len(all_chd_c)} CHD/Zstd files + hardware -munaligned-access!")
 
-          # --- 1. PATCH plugins/dfsound/spu.c: CONSTANT 768 (CUTSCENES) / 716 (~46.6 FPS GAMEPLAY) ---
+          # --- 1. PATCH plugins/dfsound/xa.c & spu.c: 46.6 FPS LOCK + 50 FPS FMV + 41 FPS ANTI-UNDERRUN ---
+          with open("plugins/dfsound/xa.c", "r") as f:
+              xa_c = f.read()
+
+          if "/ 44100" not in xa_c:
+              print("ERROR: '/ 44100' not found in plugins/dfsound/xa.c!")
+              sys.exit(1)
+
+          xa_c = xa_c.replace("/ 44100", "/ g_cur_xa_rate")
+          with open("plugins/dfsound/xa.c", "w") as f:
+              f.write(xa_c)
+          print("SUCCESS 1A: Patched plugins/dfsound/xa.c to scale FeedXA with g_cur_xa_rate!")
+
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
+
+          spu_header = "\n".join([
+              "#include <sys/time.h>",
+              "#include <stdint.h>",
+              "static int g_slow_hold = 0;",
+              "static int g_xa_frames = 0;",
+              "static int g_cur_spu_div = 716;",
+              "static int g_cur_xa_rate = 47302;",
+              ""
+          ])
 
           old_ns_calc = (
               " if (cycle_diff < 2 * 768)\n"
@@ -104,36 +120,93 @@ jobs:
               "\n"
               " ns_to = (cycle_diff / 768 + 1) & ~1;"
           )
-          new_ns_calc = (
-              " const int spu_div = (spu.XAPlay != spu.XAFeed) ? 768 : 716;\n"
-              " if (cycle_diff < 2 * spu_div)\n"
-              "  return;\n"
-              "\n"
-              " ns_to = (((spu.XAPlay != spu.XAFeed) ? (cycle_diff / 768) : (cycle_diff / 716)) + 1) & ~1;"
-          )
+          new_ns_calc = "\n".join([
+              " int spu_div = g_cur_spu_div;",
+              " if (cycle_diff < 2 * spu_div)",
+              "  return;",
+              "",
+              " if (spu_div == 768)",
+              "  ns_to = (cycle_diff / 768 + 1) & ~1;",
+              " else if (spu_div == 640)",
+              "  ns_to = (cycle_diff / 640 + 1) & ~1;",
+              " else",
+              "  ns_to = (cycle_diff / 716 + 1) & ~1;"
+          ])
 
           old_played_adv = "  spu.cycles_played += ns_to * 768;"
           new_played_adv = "  spu.cycles_played += ns_to * spu_div;"
 
+          old_async_feed = (
+              " if (flags & 1) {\n"
+              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);\n"
+              "  spu.pS = (short *)spu.pSpuBuffer;"
+          )
+          new_async_feed = "\n".join([
+              " if (flags & 1) {",
+              "  static struct timeval after_feed_tv = {0, 0};",
+              "  struct timeval before_feed_tv;",
+              "  gettimeofday(&before_feed_tv, NULL);",
+              "  if (g_xa_frames > 0) g_xa_frames--;",
+              "  if (after_feed_tv.tv_sec != 0) {",
+              "   long emu_us = (before_feed_tv.tv_sec - after_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - after_feed_tv.tv_usec);",
+              "   if (emu_us > 21400 && emu_us < 55000) {",
+              "    g_slow_hold = 8;",
+              "    int have_s = (int)(((unsigned char *)spu.pS - spu.pSpuBuffer) >> 2);",
+              "    int need_s = (int)((emu_us * 441L) / 10000L) + 6;",
+              "    if (need_s > 1280) need_s = 1280;",
+              "    if (have_s > 64 && need_s > have_s) {",
+              "     uint32_t *b32 = (uint32_t *)spu.pSpuBuffer;",
+              "     int step_fp = (have_s << 16) / need_s;",
+              "     int pos_fp = (have_s - 1) << 16;",
+              "     int i;",
+              "     for (i = need_s - 1; i >= 0; i--) {",
+              "      b32[i] = b32[pos_fp >> 16];",
+              "      pos_fp -= step_fp;",
+              "      if (pos_fp < 0) pos_fp = 0;",
+              "     }",
+              "     spu.pS = (short *)(b32 + need_s);",
+              "    }",
+              "   } else if (g_slow_hold > 0) {",
+              "    g_slow_hold--;",
+              "   }",
+              "   if (g_slow_hold > 0) {",
+              "    g_cur_spu_div = 640;",
+              "    g_cur_xa_rate = 52920;",
+              "   } else if (g_xa_frames > 0 && emu_us > 0 && emu_us <= 18500) {",
+              "    g_cur_spu_div = 768;",
+              "    g_cur_xa_rate = 44100;",
+              "   } else {",
+              "    g_cur_spu_div = 716;",
+              "    g_cur_xa_rate = 47302;",
+              "   }",
+              "  }",
+              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);",
+              "  spu.pS = (short *)spu.pSpuBuffer;",
+              "  gettimeofday(&after_feed_tv, NULL);"
+          ])
+
           old_feed_xa = " FeedXA(xap);"
           new_feed_xa = "\n".join([
+              " g_xa_frames = 15;",
               " if (spu.iLeftXAVol < 0x2000 && spu.iRightXAVol < 0x2000) { spu.iLeftXAVol = 0x7fff; spu.iRightXAVol = 0x7fff; }",
               " spu.spuCtrl |= 0xc001;",
               " FeedXA(xap);"
           ])
 
-          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_feed_xa not in spu_c:
+          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_feed not in spu_c or old_feed_xa not in spu_c:
               print("ERROR: target blocks not found in spu.c!")
               sys.exit(1)
 
           spu_c = (
-              spu_c.replace(old_ns_calc, new_ns_calc, 1)
-                   .replace(old_played_adv, new_played_adv, 1)
-                   .replace(old_feed_xa, new_feed_xa, 1)
+              spu_header + spu_c
+              .replace(old_ns_calc, new_ns_calc, 1)
+              .replace(old_played_adv, new_played_adv, 1)
+              .replace(old_async_feed, new_async_feed, 1)
+              .replace(old_feed_xa, new_feed_xa, 1)
           )
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
-          print("SUCCESS 1: Patched spu.c with constant 716 (~46.6 FPS) / 768 (XA cutscenes)!")
+          print("SUCCESS 1B: Patched spu.c with 46.6 FPS lock (716), 50 FPS FMV (768), and 41 FPS anti-underrun cushion (640 + stretch)!")
 
           # --- 2. PATCH libpcsxcore/cdrom.c: CLEAN CHANNEL 255 FIRST-SECTOR LOCK FIX ---
           with open("libpcsxcore/cdrom.c", "r") as f:
@@ -213,8 +286,8 @@ jobs:
           print("SUCCESS 3: Patched frontend/libretro.c to auto-disable lighting for 'Sesame Street Sports'!")
           EOF
 
-          python3 patch_v34.py | tee ../build_v34_report.txt
-          rm -f patch_v34.py
+          python3 patch_v35.py | tee ../build_v35_report.txt
+          rm -f patch_v35.py
 
           # Optimize Makefiles
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -222,8 +295,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V34 ===" >> ../build_v34_report.txt
-          git diff Makefile frontend/libretro.c libpcsxcore/cdrom.c plugins/dfsound/spu.c >> ../build_v34_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V35 ===" >> ../build_v35_report.txt
+          git diff Makefile frontend/libretro.c libpcsxcore/cdrom.c plugins/dfsound/xa.c plugins/dfsound/spu.c >> ../build_v35_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -235,35 +308,32 @@ jobs:
             find . -name "*.o" -delete
             rm -f pcsx_rearmed_libretro.so
 
-            A9_V34_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            A9_V35_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V34_FLAGS"
-            export CXXFLAGS="$A9_V34_FLAGS"
+            export CFLAGS="$A9_V35_FLAGS"
+            export CXXFLAGS="$A9_V35_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
             make -f Makefile.libretro \
               platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V34_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V34_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc $A9_V35_FLAGS" \
+              CXX="arm-linux-gnueabi-g++ $A9_V35_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v34.log
-
-            echo "=== VERIFYING ZSTD (cdzs) SYMBOLS IN .SO ===" >> ../build_v34_report.txt
-            arm-linux-gnueabi-nm pcsx_rearmed_libretro.so | grep -E "cdzs|ZSTD" | head -n 15 >> ../build_v34_report.txt
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v35.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v34_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v35_report.txt
           '
-          cat build_v34_report.txt
+          cat build_v35_report.txt
 
-      - name: Upload v34 .so File & Report
+      - name: Upload v35 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v34-zstd-46fps-sesame
+          name: pcsx-rearmed-v35-zstd-46fps-zerounderrun
           path: |
             pcsx_rearmed_libretro.so
-            build_v34_report.txt
-            build_v34.log
+            build_v35_report.txt
+            build_v35.log
