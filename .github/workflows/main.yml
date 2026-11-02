@@ -254,7 +254,6 @@ jobs:
               "#include \"pcsx_telemetry.h\"\n"
           )
 
-          # Wrap chd_read() calls in cdriso.c to measure exact Zstd/LZMA CHD decompression time
           if "chd_read(" in cdriso:
               cdriso_hdr += (
                   "#include <libchdr/chd.h>\n"
@@ -277,29 +276,38 @@ jobs:
               print("ERROR: chd_read( not found in cdriso.c!")
               sys.exit(1)
 
-          # --- 4. PATCH plugins/gpu_unai/gpulib_if.cpp: GPU UNAI PRIMITIVE & LIGHTING TELEMETRY ---
+          # --- 4. PATCH plugins/gpu_unai/gpulib_if.cpp: C++ RAII SCOPE TIMER + PRIMITIVE TELEMETRY ---
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
               gpulib_if = f.read()
 
-          gpu_hdr = '#include <sys/time.h>\nextern "C" {\n#include "pcsx_telemetry.h"\n}\n'
+          gpu_hdr = "\n".join([
+              '#include <sys/time.h>',
+              'extern "C" {',
+              '#include "pcsx_telemetry.h"',
+              '}',
+              'struct gpu_telem_scope_timer {',
+              '    struct timeval t0;',
+              '    gpu_telem_scope_timer() { gettimeofday(&t0, NULL); }',
+              '    ~gpu_telem_scope_timer() {',
+              '        struct timeval t1;',
+              '        gettimeofday(&t1, NULL);',
+              '        g_telem.frame_gpu_us += (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_usec - t0.tv_usec);',
+              '    }',
+              '};',
+              ''
+          ])
 
           m_start = re.search(r"int\s+do_cmd_list\s*\([^)]*\)\s*\{", gpulib_if)
           m_switch = re.search(r"switch\s*\(\s*cmd\s*\)\s*\{", gpulib_if)
-          m_end = re.search(r"\*cycles_sum_out\s*\+=\s*cycles_sum;[\s\S]*?return\s+pos;\s*\}", gpulib_if)
 
-          if not m_start or not m_switch or not m_end:
-              print(f"ERROR: Regex match failed in gpulib_if.cpp! start={bool(m_start)} switch={bool(m_switch)} end={bool(m_end)}")
+          if not m_start or not m_switch:
+              print(f"ERROR: Regex match failed in gpulib_if.cpp! start={bool(m_start)} switch={bool(m_switch)}")
               sys.exit(1)
 
           orig_start = m_start.group(0)
           orig_switch = m_switch.group(0)
-          orig_end = m_end.group(0)
 
-          new_cmd_start = (
-              orig_start + "\n"
-              "\tstruct timeval t_gpu0, t_gpu1;\n"
-              "\tgettimeofday(&t_gpu0, NULL);\n"
-          )
+          new_cmd_start = orig_start + "\n\tgpu_telem_scope_timer _gpu_timer;\n"
           new_switch = (
               "if (cmd >= 0x20 && cmd < 0x40) {\n"
               "\t\tg_telem.frame_poly_total++;\n"
@@ -318,21 +326,15 @@ jobs:
               "\t\tg_telem.frame_vram_writes++;\n"
               "\t}\n\t" + orig_switch
           )
-          new_cmd_end = (
-              "\tgettimeofday(&t_gpu1, NULL);\n"
-              "\tg_telem.frame_gpu_us += (t_gpu1.tv_sec - t_gpu0.tv_sec) * 1000000 + (t_gpu1.tv_usec - t_gpu0.tv_usec);\n"
-              + orig_end
-          )
 
           gpulib_if = (
               gpu_hdr + gpulib_if
               .replace(orig_start, new_cmd_start, 1)
               .replace(orig_switch, new_switch, 1)
-              .replace(orig_end, new_cmd_end, 1)
           )
           with open("plugins/gpu_unai/gpulib_if.cpp", "w") as f:
               f.write(gpulib_if)
-          print("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp with polygon/lighting/blending/sprite telemetry!")
+          print("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp with RAII scope timer & polygon/lighting/blending/sprite telemetry!")
 
           # --- 5. PATCH frontend/libretro.c: SESAME LIGHTING + /tmp/pcsx_telemetry.log LOGGER ---
           with open("frontend/libretro.c", "r") as f:
