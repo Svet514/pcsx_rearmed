@@ -257,7 +257,7 @@ jobs:
           if "chd_read(" in cdriso:
               cdriso_hdr += (
                   "#include <libchdr/chd.h>\n"
-                  "static inline chd_error telem_chd_read(chd_file *file, UINT32 hunknum, void *buffer) {\n"
+                  "static inline chd_error telem_chd_read(chd_file *file, uint32_t hunknum, void *buffer) {\n"
                   "    struct timeval t0, t1;\n"
                   "    gettimeofday(&t0, NULL);\n"
                   "    g_telem.frame_cd_reads++;\n"
@@ -504,7 +504,7 @@ jobs:
             A9_V27_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V27_FLAGS"
+            export CFLAGS="$A9_V27_FLAGS"[0m
             export CXXFLAGS="$A9_V27_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
