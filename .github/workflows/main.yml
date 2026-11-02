@@ -353,12 +353,13 @@ jobs:
               '         pl_rearmed_cbs.gpu_unai.lighting = 1;\n'
               '   }'
           )
-          target_retro_run = "void retro_run(void)\n{"
-          target_retro_run_end = "   video_cb(pl_vout_buf, pl_vout_w, pl_vout_h, pl_vout_w << 1);\n}"
+          m_retro_run = re.search(r"void\s+retro_run\s*\(\s*void\s*\)\s*\{", libretro_c)
 
-          if target_load_game not in libretro_c or target_lighting_block not in libretro_c or target_retro_run not in libretro_c or target_retro_run_end not in libretro_c:
-              print("ERROR: target blocks not found in frontend/libretro.c!")
+          if target_load_game not in libretro_c or target_lighting_block not in libretro_c or not m_retro_run:
+              print(f"ERROR: target blocks not found in frontend/libretro.c! load={target_load_game in libretro_c} light={target_lighting_block in libretro_c} run={bool(m_retro_run)}")
               sys.exit(1)
+
+          orig_retro_run = m_retro_run.group(0)
 
           new_load_game = "\n".join([
               "#include <sys/time.h>",
@@ -366,12 +367,16 @@ jobs:
               "static int g_is_sesame = 0;",
               "static FILE *g_tlog = NULL;",
               "static uint32_t g_frame_no = 0;",
+              "static struct timeval g_prev_f_tv = {0, 0};",
+              "static struct timeval g_sec_tv = {0, 0};",
               "bool retro_load_game(const struct retro_game_info *info)",
               "{",
               "   g_is_sesame = (info && info->path && strstr(info->path, \"Sesame Street Sports\") != NULL) ? 1 : 0;",
               "   if (g_tlog) { fclose(g_tlog); g_tlog = NULL; }",
               "   g_tlog = fopen(\"/tmp/pcsx_telemetry.log\", \"w\");",
               "   g_frame_no = 0;",
+              "   g_prev_f_tv.tv_sec = 0; g_prev_f_tv.tv_usec = 0;",
+              "   g_sec_tv.tv_sec = 0; g_sec_tv.tv_usec = 0;",
               "   if (g_tlog) {",
               "      fprintf(g_tlog, \"=== PCSX-ReARMed V38 Telemetry Started ===\\nGame: %s\\n\", (info && info->path) ? info->path : \"unknown\");",
               "      fprintf(g_tlog, \"Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | chd_hunks(last_hunk) xa_sect | spu_div xa_on xa_avail voices unai_light\\n\");",
@@ -393,7 +398,59 @@ jobs:
           ])
 
           new_retro_run = "\n".join([
-              "static void telem_begin_frame(void) {",
+              "static void telem_step_frame(void) {",
+              "   static uint32_t sec_frames = 0, sec_max_us = 0;",
+              "   static uint64_t sum_cpu = 0, sum_gpu = 0, sum_spu = 0, sum_feed = 0, sum_cd = 0;",
+              "   static uint32_t sum_ptot = 0, sum_plight = 0, sum_pblend = 0, sum_ptex = 0, sum_spr = 0, sum_vram = 0, sum_cdr = 0, sum_xas = 0;",
+              "   struct timeval now_tv;",
+              "   gettimeofday(&now_tv, NULL);",
+              "   if (g_prev_f_tv.tv_sec != 0) {",
+              "      g_frame_no++;",
+              "      uint32_t f_us = (now_tv.tv_sec - g_prev_f_tv.tv_sec) * 1000000 + (now_tv.tv_usec - g_prev_f_tv.tv_usec);",
+              "      uint32_t sub_us = g_telem.frame_gpu_us + g_telem.frame_spu_us + g_telem.frame_feed_us + g_telem.frame_cd_us;",
+              "      uint32_t cpu_us = (f_us > sub_us) ? (f_us - sub_us) : 0;",
+              "      sec_frames++;",
+              "      if (f_us > sec_max_us) sec_max_us = f_us;",
+              "      sum_cpu += cpu_us; sum_gpu += g_telem.frame_gpu_us; sum_spu += g_telem.frame_spu_us;",
+              "      sum_feed += g_telem.frame_feed_us; sum_cd += g_telem.frame_cd_us;",
+              "      sum_ptot += g_telem.frame_poly_total; sum_plight += g_telem.frame_poly_light;",
+              "      sum_pblend += g_telem.frame_poly_blend; sum_ptex += g_telem.frame_poly_tex;",
+              "      sum_spr += g_telem.frame_sprites; sum_vram += g_telem.frame_vram_writes;",
+              "      sum_cdr += g_telem.frame_cd_reads; sum_xas += g_telem.frame_xa_sectors;",
+              "      if (g_tlog && f_us > 22500 && g_frame_no > 30) {",
+              "         fprintf(g_tlog, \"  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samples=%u xa=%u(avail:%d) voices=%u res=%dx%d\\n\",",
+              "            g_frame_no, 1000000.0 / (double)f_us, f_us / 1000, (f_us % 1000) / 100,",
+              "            cpu_us, g_telem.frame_gpu_us, g_telem.frame_spu_us, g_telem.frame_feed_us, g_telem.frame_cd_us,",
+              "            g_telem.frame_poly_total, g_telem.frame_poly_light, g_telem.frame_poly_blend, g_telem.frame_poly_tex,",
+              "            g_telem.frame_sprites, g_telem.frame_vram_writes,",
+              "            g_telem.frame_cd_reads, g_telem.last_cd_lba, g_telem.frame_xa_sectors,",
+              "            g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, g_telem.frame_xa_avail, g_telem.frame_spu_Voices, pl_vout_w, pl_vout_h);",
+              "      }",
+              "      long elapsed_us = (now_tv.tv_sec - g_sec_tv.tv_sec) * 1000000L + (now_tv.tv_usec - g_sec_tv.tv_usec);",
+              "      if (elapsed_us >= 1000000L && sec_frames > 0) {",
+              "         if (g_tlog) {",
+              "            double fps = (double)sec_frames * 1000000.0 / (double)elapsed_us;",
+              "            double min_fps = (sec_max_us > 0) ? (1000000.0 / (double)sec_max_us) : 0.0;",
+              "            fprintf(g_tlog, \"[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u xa=%u(av:%d) ch=%u light=%d\\n\",",
+              "               g_frame_no, CdromId[0] ? CdromId : \"none\", fps, min_fps, sec_max_us / 1000, (sec_max_us % 1000) / 100,",
+              "               (uint32_t)(sum_cpu / sec_frames), (uint32_t)(sum_gpu / sec_frames), (uint32_t)(sum_spu / sec_frames),",
+              "               (uint32_t)(sum_feed / sec_frames), (uint32_t)(sum_cd / sec_frames),",
+              "               sum_ptot / sec_frames, sum_plight / sec_frames, sum_pblend / sec_frames, sum_ptex / sec_frames,",
+              "               sum_spr / sec_frames, sum_vram / sec_frames, sum_cdr, g_telem.last_cd_lba, sum_xas,",
+              "               g_telem.frame_spu_div, g_telem.frame_xa_active, g_telem.frame_xa_avail, g_telem.frame_spu_Voices, pl_rearmed_cbs.gpu_unai.lighting);",
+              "            fflush(g_tlog);",
+              "         }",
+              "         g_sec_tv = now_tv; sec_frames = 0; sec_max_us = 0;",
+              "         sum_cpu = sum_gpu = sum_spu = sum_feed = sum_cd = 0;",
+              "         sum_ptot = sum_plight = sum_pblend = sum_ptex = sum_spr = sum_vram = sum_cdr = sum_xas = 0;",
+              "      }",
+              "   } else {",
+              "      g_sec_tv = now_tv;",
+              "      sec_frames = 0; sec_max_us = 0;",
+              "      sum_cpu = sum_gpu = sum_spu = sum_feed = sum_cd = 0;",
+              "      sum_ptot = sum_plight = sum_pblend = sum_ptex = sum_spr = sum_vram = sum_cdr = sum_xas = 0;",
+              "   }",
+              "   g_prev_f_tv = now_tv;",
               "   g_telem.frame_cd_reads = 0;",
               "   g_telem.frame_cd_us = 0;",
               "   g_telem.frame_xa_sectors = 0;",
@@ -407,68 +464,14 @@ jobs:
               "   g_telem.frame_spu_us = 0;",
               "   g_telem.frame_feed_us = 0;",
               "}",
-              "void retro_run(void)",
-              "{",
-              "   static struct timeval sec_tv = {0, 0};",
-              "   static uint32_t sec_frames = 0, sec_max_us = 0;",
-              "   static uint64_t sum_cpu = 0, sum_gpu = 0, sum_spu = 0, sum_feed = 0, sum_cd = 0;",
-              "   static uint32_t sum_ptot = 0, sum_plight = 0, sum_pblend = 0, sum_ptex = 0, sum_spr = 0, sum_vram = 0, sum_cdr = 0, sum_xas = 0;",
-              "   struct timeval f_t0, f_t1;",
-              "   gettimeofday(&f_t0, NULL);",
-              "   if (sec_tv.tv_sec == 0) sec_tv = f_t0;",
-              "   telem_begin_frame();"
-          ])
-
-          new_retro_run_end = "\n".join([
-              "   video_cb(pl_vout_buf, pl_vout_w, pl_vout_h, pl_vout_w << 1);",
-              "   gettimeofday(&f_t1, NULL);",
-              "   g_frame_no++;",
-              "   uint32_t f_us = (f_t1.tv_sec - f_t0.tv_sec) * 1000000 + (f_t1.tv_usec - f_t0.tv_usec);",
-              "   uint32_t sub_us = g_telem.frame_gpu_us + g_telem.frame_spu_us + g_telem.frame_feed_us + g_telem.frame_cd_us;",
-              "   uint32_t cpu_us = (f_us > sub_us) ? (f_us - sub_us) : 0;",
-              "   sec_frames++;",
-              "   if (f_us > sec_max_us) sec_max_us = f_us;",
-              "   sum_cpu += cpu_us; sum_gpu += g_telem.frame_gpu_us; sum_spu += g_telem.frame_spu_us;",
-              "   sum_feed += g_telem.frame_feed_us; sum_cd += g_telem.frame_cd_us;",
-              "   sum_ptot += g_telem.frame_poly_total; sum_plight += g_telem.frame_poly_light;",
-              "   sum_pblend += g_telem.frame_poly_blend; sum_ptex += g_telem.frame_poly_tex;",
-              "   sum_spr += g_telem.frame_sprites; sum_vram += g_telem.frame_vram_writes;",
-              "   sum_cdr += g_telem.frame_cd_reads; sum_xas += g_telem.frame_xa_sectors;",
-              "   if (g_tlog && f_us > 22500 && g_frame_no > 30) {",
-              "      fprintf(g_tlog, \"  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samples=%u xa=%u(avail:%d) voices=%u res=%dx%d\\n\",",
-              "         g_frame_no, 1000000.0 / (double)f_us, f_us / 1000, (f_us % 1000) / 100,",
-              "         cpu_us, g_telem.frame_gpu_us, g_telem.frame_spu_us, g_telem.frame_feed_us, g_telem.frame_cd_us,",
-              "         g_telem.frame_poly_total, g_telem.frame_poly_light, g_telem.frame_poly_blend, g_telem.frame_poly_tex,",
-              "         g_telem.frame_sprites, g_telem.frame_vram_writes,",
-              "         g_telem.frame_cd_reads, g_telem.last_cd_lba, g_telem.frame_xa_sectors,",
-              "         g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, g_telem.frame_xa_avail, g_telem.frame_spu_Voices, pl_vout_w, pl_vout_h);",
-              "   }",
-              "   long elapsed_us = (f_t1.tv_sec - sec_tv.tv_sec) * 1000000L + (f_t1.tv_usec - sec_tv.tv_usec);",
-              "   if (elapsed_us >= 1000000L && sec_frames > 0) {",
-              "      if (g_tlog) {",
-              "         double fps = (double)sec_frames * 1000000.0 / (double)elapsed_us;",
-              "         double min_fps = (sec_max_us > 0) ? (1000000.0 / (double)sec_max_us) : 0.0;",
-              "         fprintf(g_tlog, \"[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u xa=%u(av:%d) ch=%u light=%d\\n\",",
-              "            g_frame_no, CdromId[0] ? CdromId : \"none\", fps, min_fps, sec_max_us / 1000, (sec_max_us % 1000) / 100,",
-              "            (uint32_t)(sum_cpu / sec_frames), (uint32_t)(sum_gpu / sec_frames), (uint32_t)(sum_spu / sec_frames),",
-              "            (uint32_t)(sum_feed / sec_frames), (uint32_t)(sum_cd / sec_frames),",
-              "            sum_ptot / sec_frames, sum_plight / sec_frames, sum_pblend / sec_frames, sum_ptex / sec_frames,",
-              "            sum_spr / sec_frames, sum_vram / sec_frames, sum_cdr, g_telem.last_cd_lba, sum_xas,",
-              "            g_telem.frame_spu_div, g_telem.frame_xa_active, g_telem.frame_xa_avail, g_telem.frame_spu_Voices, pl_rearmed_cbs.gpu_unai.lighting);",
-              "         fflush(g_tlog);",
-              "      }",
-              "      sec_tv = f_t1; sec_frames = 0; sec_max_us = 0;",
-              "      sum_cpu = sum_gpu = sum_spu = sum_feed = sum_cd = 0;",
-              "      sum_ptot = sum_plight = sum_pblend = sum_ptex = sum_spr = sum_vram = sum_cdr = sum_xas = 0;",
-              "   }",
-              "}"
+              orig_retro_run,
+              "   telem_step_frame();"
           ])
 
           libretro_c = (
               libretro_c.replace(target_load_game, new_load_game, 1)
                         .replace(target_lighting_block, new_lighting_block, 1)
-                        .replace(target_retro_run, new_retro_run, 1)
-                        .replace(target_retro_run_end, new_retro_run_end, 1)
+                        .replace(orig_retro_run, new_retro_run, 1)
           )
 
           with open("frontend/libretro.c", "w") as f:
