@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v38
+name: Build PCSX-ReARMed v39 (Exact V27 Audio + Sesame + Safe Telemetry)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout b1226a3a, Clone rtissera/libchdr (Zstd), & Apply V37 + Telemetry Patches
+      - name: Checkout b1226a3a, Clone rtissera/libchdr (Zstd), & Apply V39 Patches
         run: |
           set -eo pipefail
           git clone https://github.com/libretro/pcsx_rearmed.git src
@@ -26,7 +26,7 @@ jobs:
           # 2. Add scph5502.bin to BIOS list
           sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
 
-          cat << 'EOF' > patch_v38.py
+          cat << 'EOF' > patch_v39.py
           import sys
           import os
           import re
@@ -115,8 +115,6 @@ jobs:
               "    uint32_t frame_spu_samples;",
               "    uint32_t frame_spu_div;",
               "    uint32_t frame_xa_active;",
-              "    int32_t  frame_xa_avail;",
-              "    uint32_t frame_spu_Voices;",
               "};",
               "",
               "extern struct pcsx_telem_s g_telem;",
@@ -127,7 +125,7 @@ jobs:
               f.write(telemetry_h)
           print("SUCCESS 1A: Created include/pcsx_telemetry.h!")
 
-          # --- 2. PATCH plugins/dfsound/spu.c: EXACT V27/V37 AUDIO + SPU/XA TELEMETRY COUNTERS ---
+          # --- 2. PATCH plugins/dfsound/spu.c: EXACT V27 AUDIO + SAFE SPU/XA TELEMETRY ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
 
@@ -185,12 +183,6 @@ jobs:
               "  g_telem.frame_spu_samples = bytes_to_feed >> 2;",
               "  g_telem.frame_spu_div = g_spu_div;",
               "  g_telem.frame_xa_active = (spu.XAPlay != spu.XAFeed) ? 1 : 0;",
-              "  int xa_av = spu.XAFeed - spu.XAPlay;",
-              "  if (xa_av < 0) xa_av += (spu.XABufferEnd - spu.XABuffer);",
-              "  g_telem.frame_xa_avail = xa_av;",
-              "  int v_cnt = 0, v_i;",
-              "  for (v_i = 0; v_i < 24; v_i++) { if (spu.s_chan[v_i].bOn) v_cnt++; }",
-              "  g_telem.frame_spu_Voices = v_cnt;",
               "  out_current->feed(spu.pSpuBuffer, bytes_to_feed);",
               "  spu.pS = (short *)spu.pSpuBuffer;",
               "  gettimeofday(&after_feed_tv, NULL);",
@@ -378,8 +370,8 @@ jobs:
               "   g_prev_f_tv.tv_sec = 0; g_prev_f_tv.tv_usec = 0;",
               "   g_sec_tv.tv_sec = 0; g_sec_tv.tv_usec = 0;",
               "   if (g_tlog) {",
-              "      fprintf(g_tlog, \"=== PCSX-ReARMed V38 Telemetry Started ===\\nGame: %s\\n\", (info && info->path) ? info->path : \"unknown\");",
-              "      fprintf(g_tlog, \"Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | chd_hunks(last_hunk) xa_sect | spu_div xa_on xa_avail voices unai_light\\n\");",
+              "      fprintf(g_tlog, \"=== PCSX-ReARMed V39 Telemetry Started ===\\nGame: %s\\n\", (info && info->path) ? info->path : \"unknown\");",
+              "      fprintf(g_tlog, \"Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | chd_hunks(last_hunk) xa_sect | spu_div xa_on unai_light\\n\");",
               "      fflush(g_tlog);",
               "   }"
           ])
@@ -418,26 +410,26 @@ jobs:
               "      sum_spr += g_telem.frame_sprites; sum_vram += g_telem.frame_vram_writes;",
               "      sum_cdr += g_telem.frame_cd_reads; sum_xas += g_telem.frame_xa_sectors;",
               "      if (g_tlog && f_us > 22500 && g_frame_no > 30) {",
-              "         fprintf(g_tlog, \"  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samples=%u xa=%u(avail:%d) voices=%u res=%dx%d\\n\",",
+              "         fprintf(g_tlog, \"  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samples=%u xa=%u res=%dx%d\\n\",",
               "            g_frame_no, 1000000.0 / (double)f_us, f_us / 1000, (f_us % 1000) / 100,",
               "            cpu_us, g_telem.frame_gpu_us, g_telem.frame_spu_us, g_telem.frame_feed_us, g_telem.frame_cd_us,",
               "            g_telem.frame_poly_total, g_telem.frame_poly_light, g_telem.frame_poly_blend, g_telem.frame_poly_tex,",
               "            g_telem.frame_sprites, g_telem.frame_vram_writes,",
               "            g_telem.frame_cd_reads, g_telem.last_cd_lba, g_telem.frame_xa_sectors,",
-              "            g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, g_telem.frame_xa_avail, g_telem.frame_spu_Voices, pl_vout_w, pl_vout_h);",
+              "            g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, pl_vout_w, pl_vout_h);",
               "      }",
               "      long elapsed_us = (now_tv.tv_sec - g_sec_tv.tv_sec) * 1000000L + (now_tv.tv_usec - g_sec_tv.tv_usec);",
               "      if (elapsed_us >= 1000000L && sec_frames > 0) {",
               "         if (g_tlog) {",
               "            double fps = (double)sec_frames * 1000000.0 / (double)elapsed_us;",
               "            double min_fps = (sec_max_us > 0) ? (1000000.0 / (double)sec_max_us) : 0.0;",
-              "            fprintf(g_tlog, \"[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u xa=%u(av:%d) ch=%u light=%d\\n\",",
+              "            fprintf(g_tlog, \"[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u xa=%u light=%d\\n\",",
               "               g_frame_no, CdromId[0] ? CdromId : \"none\", fps, min_fps, sec_max_us / 1000, (sec_max_us % 1000) / 100,",
               "               (uint32_t)(sum_cpu / sec_frames), (uint32_t)(sum_gpu / sec_frames), (uint32_t)(sum_spu / sec_frames),",
               "               (uint32_t)(sum_feed / sec_frames), (uint32_t)(sum_cd / sec_frames),",
               "               sum_ptot / sec_frames, sum_plight / sec_frames, sum_pblend / sec_frames, sum_ptex / sec_frames,",
               "               sum_spr / sec_frames, sum_vram / sec_frames, sum_cdr, g_telem.last_cd_lba, sum_xas,",
-              "               g_telem.frame_spu_div, g_telem.frame_xa_active, g_telem.frame_xa_avail, g_telem.frame_spu_Voices, pl_rearmed_cbs.gpu_unai.lighting);",
+              "               g_telem.frame_spu_div, g_telem.frame_xa_active, pl_rearmed_cbs.gpu_unai.lighting);",
               "            fflush(g_tlog);",
               "         }",
               "         g_sec_tv = now_tv; sec_frames = 0; sec_max_us = 0;",
@@ -479,8 +471,8 @@ jobs:
           print("SUCCESS 5: Patched frontend/libretro.c with /tmp/pcsx_telemetry.log writer!")
           EOF
 
-          python3 patch_v38.py | tee ../build_v38_report.txt
-          rm -f patch_v38.py
+          python3 patch_v39.py | tee ../build_v39_report.txt
+          rm -f patch_v39.py
 
           # Optimize Makefiles (Exact V27/V37 flags)
           sed -i 's/-O2/-O3/g' Makefile.libretro
@@ -488,8 +480,8 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
-          echo "=== VERIFIED GIT DIFF FOR V38 ===" >> ../build_v38_report.txt
-          git diff Makefile frontend/libretro.c libpcsxcore/cdrom.c libpcsxcore/cdriso.c plugins/dfsound/spu.c plugins/gpu_unai/gpulib_if.cpp >> ../build_v38_report.txt
+          echo "=== VERIFIED GIT DIFF FOR V39 ===" >> ../build_v39_report.txt
+          git diff Makefile frontend/libretro.c libpcsxcore/cdrom.c libpcsxcore/cdriso.c plugins/dfsound/spu.c plugins/gpu_unai/gpulib_if.cpp >> ../build_v39_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
@@ -513,20 +505,20 @@ jobs:
               CC="arm-linux-gnueabi-gcc $A9_V27_FLAGS" \
               CXX="arm-linux-gnueabi-g++ $A9_V27_FLAGS -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v38.log
+              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v39.log
 
             arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v38_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v39_report.txt
           '
-          cat build_v38_report.txt
+          cat build_v39_report.txt
 
-      - name: Upload v38 .so File & Report
+      - name: Upload v39 .so File & Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v38-telemetry
+          name: pcsx-rearmed-v39-telemetry
           path: |
             pcsx_rearmed_libretro.so
-            build_v38_report.txt
-            build_v38.log
+            build_v39_report.txt
+            build_v39.log
