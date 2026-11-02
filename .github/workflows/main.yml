@@ -1,5 +1,4 @@
-name: Build PCSX-ReARMed v38 (Exact V37 + Deep /tmp/pcsx_telemetry.log Profiler)
-
+name: Build PCSX-ReARMed v38
 on:
   workflow_dispatch:
   push:
