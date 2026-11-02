@@ -29,6 +29,7 @@ jobs:
           cat << 'EOF' > patch_v38.py
           import sys
           import os
+          import re
           import glob
 
           # --- 0. PATCH Makefile TO BUILD rtissera/libchdr WITH FAST ARMv7 UNALIGNED ZSTD (cdzs) ---
@@ -90,36 +91,38 @@ jobs:
           print(f"SUCCESS 0: Configured Makefile with {len(all_chd_c)} CHD/Zstd files + hardware -munaligned-access!")
 
           # --- 1. CREATE include/pcsx_telemetry.h SHARED TELEMETRY STRUCT ---
-          telemetry_h = """#ifndef PCSX_TELEMETRY_H
-          #define PCSX_TELEMETRY_H
-          #include <stdint.h>
-
-          struct pcsx_telem_s {
-              uint32_t frame_cd_reads;
-              uint32_t frame_cd_us;
-              uint32_t last_cd_lba;
-              uint32_t frame_xa_sectors;
-
-              uint32_t frame_gpu_us;
-              uint32_t frame_poly_total;
-              uint32_t frame_poly_light;
-              uint32_t frame_poly_blend;
-              uint32_t frame_poly_tex;
-              uint32_t frame_sprites;
-              uint32_t frame_vram_writes;
-
-              uint32_t frame_spu_us;
-              uint32_t frame_feed_us;
-              uint32_t frame_spu_samples;
-              uint32_t frame_spu_div;
-              uint32_t frame_xa_active;
-              int32_t  frame_xa_avail;
-              uint32_t frame_spu_Voices;
-          };
-
-          extern struct pcsx_telem_s g_telem;
-          #endif
-          """
+          telemetry_h = "\n".join([
+              "#ifndef PCSX_TELEMETRY_H",
+              "#define PCSX_TELEMETRY_H",
+              "#include <stdint.h>",
+              "",
+              "struct pcsx_telem_s {",
+              "    uint32_t frame_cd_reads;",
+              "    uint32_t frame_cd_us;",
+              "    uint32_t last_cd_lba;",
+              "    uint32_t frame_xa_sectors;",
+              "",
+              "    uint32_t frame_gpu_us;",
+              "    uint32_t frame_poly_total;",
+              "    uint32_t frame_poly_light;",
+              "    uint32_t frame_poly_blend;",
+              "    uint32_t frame_poly_tex;",
+              "    uint32_t frame_sprites;",
+              "    uint32_t frame_vram_writes;",
+              "",
+              "    uint32_t frame_spu_us;",
+              "    uint32_t frame_feed_us;",
+              "    uint32_t frame_spu_samples;",
+              "    uint32_t frame_spu_div;",
+              "    uint32_t frame_xa_active;",
+              "    int32_t  frame_xa_avail;",
+              "    uint32_t frame_spu_Voices;",
+              "};",
+              "",
+              "extern struct pcsx_telem_s g_telem;",
+              "#endif",
+              ""
+          ])
           with open("include/pcsx_telemetry.h", "w") as f:
               f.write(telemetry_h)
           print("SUCCESS 1A: Created include/pcsx_telemetry.h!")
@@ -246,76 +249,86 @@ jobs:
           with open("libpcsxcore/cdriso.c", "r") as f:
               cdriso = f.read()
 
-          cdriso_hdr = "#include <sys/time.h>\n#include \"pcsx_telemetry.h\"\n"
-          old_chd_read = "static int handle_chd_read(const unsigned char *time, void *buf)"
-          if old_chd_read in cdriso:
-              # Instrument cdread_chd if present
-              pass
-          target_iso_read = "int ISOreadTrack(unsigned char *time, int mode)"
-          if target_iso_read in cdriso:
-              cdriso = cdriso_hdr + cdriso.replace(
-                  target_iso_read + " {",
-                  target_iso_read + " {\n\tstruct timeval t_cd0, t_cd1;\n\tgettimeofday(&t_cd0, NULL);\n\tg_telem.frame_cd_reads++;\n\tg_telem.last_cd_lba = MSF2SECT(btoi(time[0]), btoi(time[1]), btoi(time[2]));",
-                  1
-              ).replace(
-                  "\treturn CDR_read_ret;\n}",
-                  "\tgettimeofday(&t_cd1, NULL);\n\tg_telem.frame_cd_us += (t_cd1.tv_sec - t_cd0.tv_sec) * 1000000 + (t_cd1.tv_usec - t_cd0.tv_usec);\n\treturn CDR_read_ret;\n}",
-                  1
+          cdriso_hdr = (
+              "#include <sys/time.h>\n"
+              "#include \"pcsx_telemetry.h\"\n"
+          )
+
+          # Wrap chd_read() calls in cdriso.c to measure exact Zstd/LZMA CHD decompression time
+          if "chd_read(" in cdriso:
+              cdriso_hdr += (
+                  "#include <libchdr/chd.h>\n"
+                  "static inline chd_error telem_chd_read(chd_file *file, UINT32 hunknum, void *buffer) {\n"
+                  "    struct timeval t0, t1;\n"
+                  "    gettimeofday(&t0, NULL);\n"
+                  "    g_telem.frame_cd_reads++;\n"
+                  "    g_telem.last_cd_lba = hunknum;\n"
+                  "    chd_error err = chd_read(file, hunknum, buffer);\n"
+                  "    gettimeofday(&t1, NULL);\n"
+                  "    g_telem.frame_cd_us += (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_usec - t0.tv_usec);\n"
+                  "    return err;\n"
+                  "}\n"
               )
-              print("SUCCESS 3: Patched libpcsxcore/cdrom.c & cdriso.c with CHD read latency telemetry!")
+              cdriso = cdriso_hdr + cdriso.replace("chd_read(", "telem_chd_read(")
+              with open("libpcsxcore/cdriso.c", "w") as f:
+                  f.write(cdriso)
+              print("SUCCESS 3: Patched libpcsxcore/cdrom.c & wrapped chd_read() in cdriso.c for Zstd timing!")
           else:
-              print("WARNING: ISOreadTrack not matched in cdriso.c, skipping cdriso telemetry")
-          with open("libpcsxcore/cdriso.c", "w") as f:
-              f.write(cdriso)
+              print("ERROR: chd_read( not found in cdriso.c!")
+              sys.exit(1)
 
           # --- 4. PATCH plugins/gpu_unai/gpulib_if.cpp: GPU UNAI PRIMITIVE & LIGHTING TELEMETRY ---
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
               gpulib_if = f.read()
 
           gpu_hdr = '#include <sys/time.h>\nextern "C" {\n#include "pcsx_telemetry.h"\n}\n'
-          target_cmd_start = "int do_cmd_list(uint32_t *list, int list_len,\n int *cycles_sum_out, int *cycles_last, int *last_cmd)\n{"
-          target_switch = "  switch (cmd)\n  {"
-          target_cmd_end = " *cycles_sum_out += cycles_sum;\n *cycles_last = cycles;\n *last_cmd = cmd;\n return pos;\n}"
 
-          if target_cmd_start not in gpulib_if or target_switch not in gpulib_if or target_cmd_end not in gpulib_if:
-              print("ERROR: target blocks not found in plugins/gpu_unai/gpulib_if.cpp!")
+          m_start = re.search(r"int\s+do_cmd_list\s*\([^)]*\)\s*\{", gpulib_if)
+          m_switch = re.search(r"switch\s*\(\s*cmd\s*\)\s*\{", gpulib_if)
+          m_end = re.search(r"\*cycles_sum_out\s*\+=\s*cycles_sum;[\s\S]*?return\s+pos;\s*\}", gpulib_if)
+
+          if not m_start or not m_switch or not m_end:
+              print(f"ERROR: Regex match failed in gpulib_if.cpp! start={bool(m_start)} switch={bool(m_switch)} end={bool(m_end)}")
               sys.exit(1)
 
+          orig_start = m_start.group(0)
+          orig_switch = m_switch.group(0)
+          orig_end = m_end.group(0)
+
           new_cmd_start = (
-              target_cmd_start + "\n"
-              " struct timeval t_gpu0, t_gpu1;\n"
-              " gettimeofday(&t_gpu0, NULL);\n"
+              orig_start + "\n"
+              "\tstruct timeval t_gpu0, t_gpu1;\n"
+              "\tgettimeofday(&t_gpu0, NULL);\n"
           )
           new_switch = (
-              "  if (cmd >= 0x20 && cmd < 0x40) {\n"
-              "   g_telem.frame_poly_total++;\n"
-              "   if (cmd & 0x02) g_telem.frame_poly_blend++;\n"
-              "   if (cmd & 0x04) {\n"
-              "    g_telem.frame_poly_tex++;\n"
-              "    if (!(cmd & 0x01)) g_telem.frame_poly_light++;\n"
-              "   } else if (cmd & 0x10) {\n"
-              "    g_telem.frame_poly_light++;\n"
-              "   }\n"
-              "  } else if (cmd >= 0x60 && cmd < 0x80) {\n"
-              "   g_telem.frame_sprites++;\n"
-              "   if (cmd & 0x02) g_telem.frame_poly_blend++;\n"
-              "   if ((cmd & 0x04) && !(cmd & 0x01)) g_telem.frame_poly_light++;\n"
-              "  } else if (cmd >= 0x80 && cmd < 0xC0) {\n"
-              "   g_telem.frame_vram_writes++;\n"
-              "  }\n"
-              "  switch (cmd)\n  {"
+              "if (cmd >= 0x20 && cmd < 0x40) {\n"
+              "\t\tg_telem.frame_poly_total++;\n"
+              "\t\tif (cmd & 0x02) g_telem.frame_poly_blend++;\n"
+              "\t\tif (cmd & 0x04) {\n"
+              "\t\t\tg_telem.frame_poly_tex++;\n"
+              "\t\t\tif (!(cmd & 0x01)) g_telem.frame_poly_light++;\n"
+              "\t\t} else if (cmd & 0x10) {\n"
+              "\t\t\tg_telem.frame_poly_light++;\n"
+              "\t\t}\n"
+              "\t} else if (cmd >= 0x60 && cmd < 0x80) {\n"
+              "\t\tg_telem.frame_sprites++;\n"
+              "\t\tif (cmd & 0x02) g_telem.frame_poly_blend++;\n"
+              "\t\tif ((cmd & 0x04) && !(cmd & 0x01)) g_telem.frame_poly_light++;\n"
+              "\t} else if (cmd >= 0x80 && cmd < 0xC0) {\n"
+              "\t\tg_telem.frame_vram_writes++;\n"
+              "\t}\n\t" + orig_switch
           )
           new_cmd_end = (
-              " gettimeofday(&t_gpu1, NULL);\n"
-              " g_telem.frame_gpu_us += (t_gpu1.tv_sec - t_gpu0.tv_sec) * 1000000 + (t_gpu1.tv_usec - t_gpu0.tv_usec);\n"
-              + target_cmd_end
+              "\tgettimeofday(&t_gpu1, NULL);\n"
+              "\tg_telem.frame_gpu_us += (t_gpu1.tv_sec - t_gpu0.tv_sec) * 1000000 + (t_gpu1.tv_usec - t_gpu0.tv_usec);\n"
+              + orig_end
           )
 
           gpulib_if = (
               gpu_hdr + gpulib_if
-              .replace(target_cmd_start, new_cmd_start, 1)
-              .replace(target_switch, new_switch, 1)
-              .replace(target_cmd_end, new_cmd_end, 1)
+              .replace(orig_start, new_cmd_start, 1)
+              .replace(orig_switch, new_switch, 1)
+              .replace(orig_end, new_cmd_end, 1)
           )
           with open("plugins/gpu_unai/gpulib_if.cpp", "w") as f:
               f.write(gpulib_if)
@@ -339,8 +352,9 @@ jobs:
               '   }'
           )
           target_retro_run = "void retro_run(void)\n{"
+          target_retro_run_end = "   video_cb(pl_vout_buf, pl_vout_w, pl_vout_h, pl_vout_w << 1);\n}"
 
-          if target_load_game not in libretro_c or target_lighting_block not in libretro_c or target_retro_run not in libretro_c:
+          if target_load_game not in libretro_c or target_lighting_block not in libretro_c or target_retro_run not in libretro_c or target_retro_run_end not in libretro_c:
               print("ERROR: target blocks not found in frontend/libretro.c!")
               sys.exit(1)
 
@@ -358,7 +372,7 @@ jobs:
               "   g_frame_no = 0;",
               "   if (g_tlog) {",
               "      fprintf(g_tlog, \"=== PCSX-ReARMed V38 Telemetry Started ===\\nGame: %s\\n\", (info && info->path) ? info->path : \"unknown\");",
-              "      fprintf(g_tlog, \"Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | cd_reads(last_lba) xa_sect | spu_div xa_on xa_avail voices unai_light\\n\");",
+              "      fprintf(g_tlog, \"Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | chd_hunks(last_hunk) xa_sect | spu_div xa_on xa_avail voices unai_light\\n\");",
               "      fflush(g_tlog);",
               "   }"
           ])
@@ -403,7 +417,6 @@ jobs:
               "   telem_begin_frame();"
           ])
 
-          target_retro_run_end = "   video_cb(pl_vout_buf, pl_vout_w, pl_vout_h, pl_vout_w << 1);\n}"
           new_retro_run_end = "\n".join([
               "   video_cb(pl_vout_buf, pl_vout_w, pl_vout_h, pl_vout_w << 1);",
               "   gettimeofday(&f_t1, NULL);",
@@ -420,7 +433,7 @@ jobs:
               "   sum_spr += g_telem.frame_sprites; sum_vram += g_telem.frame_vram_writes;",
               "   sum_cdr += g_telem.frame_cd_reads; sum_xas += g_telem.frame_xa_sectors;",
               "   if (g_tlog && f_us > 22500 && g_frame_no > 30) {",
-              "      fprintf(g_tlog, \"  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | cd_rd=%u(LBA:%u) xa_s=%u | div=%u samples=%u xa=%u(avail:%d) voices=%u res=%dx%d\\n\",",
+              "      fprintf(g_tlog, \"  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samples=%u xa=%u(avail:%d) voices=%u res=%dx%d\\n\",",
               "         g_frame_no, 1000000.0 / (double)f_us, f_us / 1000, (f_us % 1000) / 100,",
               "         cpu_us, g_telem.frame_gpu_us, g_telem.frame_spu_us, g_telem.frame_feed_us, g_telem.frame_cd_us,",
               "         g_telem.frame_poly_total, g_telem.frame_poly_light, g_telem.frame_poly_blend, g_telem.frame_poly_tex,",
@@ -433,7 +446,7 @@ jobs:
               "      if (g_tlog) {",
               "         double fps = (double)sec_frames * 1000000.0 / (double)elapsed_us;",
               "         double min_fps = (sec_max_us > 0) ? (1000000.0 / (double)sec_max_us) : 0.0;",
-              "         fprintf(g_tlog, \"[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | cd_rd=%u(LBA:%u) xa_s=%u | div=%u xa=%u(av:%d) ch=%u light=%d\\n\",",
+              "         fprintf(g_tlog, \"[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u xa=%u(av:%d) ch=%u light=%d\\n\",",
               "            g_frame_no, CdromId[0] ? CdromId : \"none\", fps, min_fps, sec_max_us / 1000, (sec_max_us % 1000) / 100,",
               "            (uint32_t)(sum_cpu / sec_frames), (uint32_t)(sum_gpu / sec_frames), (uint32_t)(sum_spu / sec_frames),",
               "            (uint32_t)(sum_feed / sec_frames), (uint32_t)(sum_cd / sec_frames),",
@@ -448,10 +461,6 @@ jobs:
               "   }",
               "}"
           ])
-
-          if target_retro_run_end not in libretro_c:
-              print("ERROR: target_retro_run_end not found in frontend/libretro.c!")
-              sys.exit(1)
 
           libretro_c = (
               libretro_c.replace(target_load_game, new_load_game, 1)
