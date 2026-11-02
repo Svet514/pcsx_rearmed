@@ -1,4 +1,5 @@
 name: Build PCSX-ReARMed v38
+
 on:
   workflow_dispatch:
   push:
@@ -503,7 +504,7 @@ jobs:
             A9_V27_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
 
-            export CFLAGS="$A9_V27_FLAGS"[0m
+            export CFLAGS="$A9_V27_FLAGS"
             export CXXFLAGS="$A9_V27_FLAGS"
             export ASFLAGS="$ASM_FLAGS"
 
