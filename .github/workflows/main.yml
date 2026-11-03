@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed v39 (Exact V27 Audio + Sesame + Safe Telemetry)
+name: Build PCSX-ReARMed v39
 
 on:
   workflow_dispatch:
@@ -273,16 +273,17 @@ jobs:
               gpulib_if = f.read()
 
           gpu_hdr = "\n".join([
+              '#include <stddef.h>',
               '#include <sys/time.h>',
               'extern "C" {',
               '#include "pcsx_telemetry.h"',
               '}',
               'struct gpu_telem_scope_timer {',
               '    struct timeval t0;',
-              '    gpu_telem_scope_timer() { gettimeofday(&t0, NULL); }',
+              '    gpu_telem_scope_timer() { gettimeofday(&t0, 0); }',
               '    ~gpu_telem_scope_timer() {',
               '        struct timeval t1;',
-              '        gettimeofday(&t1, NULL);',
+              '        gettimeofday(&t1, 0);',
               '        g_telem.frame_gpu_us += (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_usec - t0.tv_usec);',
               '    }',
               '};',
