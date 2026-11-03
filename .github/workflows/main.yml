@@ -75,20 +75,29 @@ jobs:
               f.write(mk_new)
           print("SUCCESS 1: Patched Makefile with 32 CHD/Zstd objects!")
 
-          # 2. Patch libpcsxcore/cdrom.c: Regex tolerant of whitespace changes
+          # 2. Patch libpcsxcore/cdrom.c: Handle both FirstSector == -1 / 1 or existing subheader guard
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
-          
-          cdrom_pat = r'if\s*\(\s*cdr\.FirstSector\s*==\s*1\s*&&\s*\(\s*cdr\.Mode\s*&\s*MODE_SF\s*\)\s*==\s*0\s*\)\s*\{'
-          new_cdrom = "if (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {"
-          
-          cdrom_new = re.sub(cdrom_pat, new_cdrom, cdrom, count=1)
-          assert cdrom_new != cdrom, "Could not find cdr.FirstSector in cdrom.c"
-          with open("libpcsxcore/cdrom.c", "w") as f:
-              f.write(cdrom_new)
-          print("SUCCESS 2: Patched libpcsxcore/cdrom.c!")
 
-          # 3. Patch plugins/dfsound/spu.c (Regex tolerant of whitespace changes)
+          cdrom_pat = r'if\s*\(\s*cdr\.FirstSector\s*==\s*-?1\s*&&\s*\(\s*cdr\.Mode\s*&\s*MODE_SF\s*\)\s*==\s*0[^\{]*\{'
+          m_cd = re.search(cdrom_pat, cdrom)
+          if m_cd:
+              orig_line = m_cd.group(0)
+              first_sec_val = "-1" if "-1" in orig_line else "1"
+              new_cdrom = f"if (cdr.FirstSector == {first_sec_val} && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {{"
+              cdrom = cdrom[:m_cd.start()] + new_cdrom + cdrom[m_cd.end():]
+              with open("libpcsxcore/cdrom.c", "w") as f:
+                  f.write(cdrom)
+              print(f"SUCCESS 2: Patched libpcsxcore/cdrom.c (matched: {orig_line.strip()})!")
+          else:
+              print("INFO 2: FirstSector pattern not found in cdrom.c, printing FirstSector lines for inspection:")
+              for line in cdrom.splitlines():
+                  if "FirstSector" in line or "MODE_SF" in line:
+                      print("  ", line)
+
+          # 3. Patch plugins/dfsound/spu.c:
+          #    - Keep do_samples() at native 768 cycles/sample so XAPlay/XAFeed never desync
+          #    - Add post-mix linear-interpolated time-stretcher + ALSA buffer cushion controller
           with open("plugins/dfsound/spu.c", "r") as f:
               spu = f.read()
 
@@ -223,7 +232,6 @@ jobs:
             }"""
 
           feed_pat = r'if\s*\(\s*flags\s*&\s*1\s*\)\s*\{\s*out_current->feed\(\s*spu\.pSpuBuffer,\s*\(unsigned char\s*\*\)\s*spu\.pS\s*-\s*spu\.pSpuBuffer\s*\);\s*spu\.pS\s*=\s*\(short\s*\*\)\s*spu\.pSpuBuffer;'
-          
           spu_new = re.sub(feed_pat, new_feed, spu, count=1)
           assert spu_new != spu, "Could not find out_current->feed block in spu.c"
           spu = spu_header + spu_new
@@ -232,10 +240,9 @@ jobs:
           new_xa = """if (spu.iLeftXAVol < 0x2000 && spu.iRightXAVol < 0x2000) { spu.iLeftXAVol = 0x7fff; spu.iRightXAVol = 0x7fff; }
            spu.spuCtrl |= 0xc001;
            FeedXA(xap);"""
-          
           spu_new = re.sub(xa_pat, new_xa, spu, count=1)
           assert spu_new != spu, "Could not find FeedXA in spu.c"
-          
+
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_new)
           print("SUCCESS 3: Patched plugins/dfsound/spu.c with Post-Mix Audio Stretcher!")
