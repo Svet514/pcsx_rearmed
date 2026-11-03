@@ -1,487 +1,268 @@
-name: Build PCSX-ReARMed v40
+name: Build PCSX-ReARMed V41 (Zero-Frameskip Post-Mix Audio Cushion)
 
 on:
   workflow_dispatch:
   push:
-    paths:
-      - '.github/workflows/**'
+    branches: [ main, master ]
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
-      - name: Checkout b1226a3a, Clone rtissera/libchdr (Zstd), & Apply V40 Patches
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install ARM32 Cross-Compiler
         run: |
-          set -eo pipefail
-          git clone https://github.com/libretro/pcsx_rearmed.git src
-          cd src
-          git checkout b1226a3ab49a2e82e55a7123eb68fded56091044
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi make git python3
 
-          # 1. Preserve zlib-1.2.11 from b1226a3a, clone latest rtissera/libchdr (with Zstd/cdzs), and restore zlib-1.2.11
-          cp -r deps/libchdr/deps/zlib-1.2.11 /tmp/zlib-1.2.11
-          rm -rf deps/libchdr
-          git clone --depth 1 https://github.com/rtissera/libchdr.git deps/libchdr
-          cp -r /tmp/zlib-1.2.11 deps/libchdr/deps/zlib-1.2.11
+      - name: Apply V41 Post-Mix Audio Stretcher & Cushion Patch
+        run: |
+          python3 - << 'EOF'
+          import os, re
 
-          # 2. Add scph5502.bin to BIOS list
-          sed -i 's/"scph5501.bin"/"scph5502.bin", "scph5501.bin"/g' frontend/libretro.c
-
-          cat << 'EOF' > patch_v40.py
-          import sys
-          import os
-          import re
-          import glob
-
-          # --- 0. PATCH Makefile TO BUILD rtissera/libchdr WITH FAST ARMv7 UNALIGNED ZSTD (cdzs) ---
+          # 1. Patch Makefile: -O3 + 32 libchdr/Zstd objects with -munaligned-access
           with open("Makefile", "r") as f:
-              cur_mk = f.read()
+              mk = f.read()
 
-          start_marker = '# libchdr\nifeq "$(HAVE_CHD)" "1"'
-          if start_marker not in cur_mk:
-              print("ERROR: Could not locate HAVE_CHD block in Makefile!")
-              sys.exit(1)
+          mk = mk.replace("CFLAGS += -O2 -DNDEBUG", "CFLAGS += -O3 -DNDEBUG")
 
-          c_start = cur_mk.index(start_marker)
-          c_end = cur_mk.index("endif\n", c_start) + len("endif\n")
+          chd_block = """ifeq "$(HAVE_CHD)" "1"
+          CFLAGS += -Ideps/libchdr/include -Ideps/libchdr/include/libchdr -Ideps/libchdr/src -Ideps/libchdr/deps/lzma-26.02/include -Ideps/libchdr/deps/zstd-1.5.7 -Ideps/libchdr/deps/zlib-1.2.11 -Ideps/libchdr/deps/miniz-3.1.2 -Ideps/libchdr/deps/lzma-26.02/include/real -DHAVE_CHD -D_7ZIP_ST -DCHDR_SYSTEM_ZLIB
+          CHD_OBJS = deps/libchdr/src/libchdr_bitstream.o \\
+          \tdeps/libchdr/src/libchdr_cdrom.o \\
+          \tdeps/libchdr/src/libchdr_chd.o \\
+          \tdeps/libchdr/src/libchdr_codec_avhuff.o \\
+          \tdeps/libchdr/src/libchdr_codec_cdfl.o \\
+          \tdeps/libchdr/src/libchdr_codec_cdlz.o \\
+          \tdeps/libchdr/src/libchdr_codec_cdzl.o \\
+          \tdeps/libchdr/src/libchdr_codec_cdzs.o \\
+          \tdeps/libchdr/src/libchdr_codec_flac.o \\
+          \tdeps/libchdr/src/libchdr_codec_huff.o \\
+          \tdeps/libchdr/src/libchdr_codec_lzma.o \\
+          \tdeps/libchdr/src/libchdr_codec_zlib.o \\
+          \tdeps/libchdr/src/libchdr_codec_zstd.o \\
+          \tdeps/libchdr/src/libchdr_flac.o \\
+          \tdeps/libchdr/src/libchdr_huffman.o \\
+          \tdeps/libchdr/deps/lzma-26.02/src/LzmaDec.o \\
+          \tdeps/libchdr/deps/zstd-1.5.7/zstddeclib.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/adler32.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/compress.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/crc32.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/deflate.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/gzclose.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/gzlib.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/gzread.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/gzwrite.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/infback.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/inffast.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/inflate.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/inftrees.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/trees.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/uncompr.o \\
+          \tdeps/libchdr/deps/zlib-1.2.11/zutil.o
+          $(CHD_OBJS): CFLAGS += -munaligned-access -Wno-unused -Wno-unused-function -Wno-deprecated-declarations
+          OBJS += $(CHD_OBJS)
+          endif"""
 
-          lzma_dirs = sorted(glob.glob("deps/libchdr/deps/lzma-*"))
-          zstd_dirs = sorted(glob.glob("deps/libchdr/deps/zstd-*"))
-          if not lzma_dirs or not zstd_dirs:
-              print("ERROR: Could not find lzma-* or zstd-* inside deps/libchdr/deps/!")
-              sys.exit(1)
-
-          lzma_dir = lzma_dirs[0]
-          zstd_dir = zstd_dirs[0]
-
-          inc_dirs = ["deps/libchdr/include", "deps/libchdr/include/libchdr", "deps/libchdr/src", f"{lzma_dir}/include", zstd_dir, "deps/libchdr/deps/zlib-1.2.11"]
-          for root, dirs, files in os.walk("deps/libchdr/deps"):
-              if any(f.endswith(".h") for f in files) and root not in inc_dirs:
-                  inc_dirs.append(root)
-
-          chd_sources = sorted(glob.glob("deps/libchdr/src/*.c"))
-          zlib_sources = sorted(glob.glob("deps/libchdr/deps/zlib-1.2.11/*.c"))
-          lzma_sources = [f"{lzma_dir}/src/LzmaDec.c"]
-          if os.path.exists(f"{lzma_dir}/src/CpuArch.c"):
-              lzma_sources.append(f"{lzma_dir}/src/CpuArch.c")
-
-          zstd_sources = []
-          if os.path.exists(f"{zstd_dir}/zstddeclib.c"):
-              zstd_sources.append(f"{zstd_dir}/zstddeclib.c")
-          else:
-              zstd_sources.extend(sorted(glob.glob(f"{zstd_dir}/common/*.c")))
-              zstd_sources.extend(sorted(glob.glob(f"{zstd_dir}/decompress/*.c")))
-
-          all_chd_c = chd_sources + lzma_sources + zstd_sources + zlib_sources
-          inc_flags = " ".join(f"-I{d}" for d in inc_dirs)
-          obj_list = " \\\n\t".join(src[:-2] + ".o" for src in all_chd_c)
-
-          new_chd_block = (
-              '# libchdr\n'
-              'ifeq "$(HAVE_CHD)" "1"\n'
-              f'CFLAGS += {inc_flags} -DHAVE_CHD -D_7ZIP_ST -DCHDR_SYSTEM_ZLIB\n'
-              f'CHD_OBJS = {obj_list}\n'
-              '$(CHD_OBJS): CFLAGS += -munaligned-access -Wno-unused -Wno-unused-function -Wno-deprecated-declarations\n'
-              'OBJS += $(CHD_OBJS)\n'
-              'endif\n'
-          )
-
-          cur_mk = cur_mk[:c_start] + new_chd_block + cur_mk[c_end:]
+          mk_new = re.sub(r'ifeq "\$\(HAVE_CHD\)" "1".*?endif', chd_block, mk, flags=re.DOTALL)
+          assert mk_new != mk, "Failed to patch HAVE_CHD in Makefile"
           with open("Makefile", "w") as f:
-              f.write(cur_mk)
-          print(f"SUCCESS 0: Configured Makefile with {len(all_chd_c)} CHD/Zstd files + hardware -munaligned-access!")
+              f.write(mk_new)
+          print("SUCCESS 1: Patched Makefile with 32 CHD/Zstd objects!")
 
-          # --- 1. CREATE include/pcsx_telemetry.h SHARED TELEMETRY STRUCT ---
-          telemetry_h = "\n".join([
-              "#ifndef PCSX_TELEMETRY_H",
-              "#define PCSX_TELEMETRY_H",
-              "#include <stdint.h>",
-              "",
-              "struct pcsx_telem_s {",
-              "    uint32_t frame_cd_reads;",
-              "    uint32_t frame_cd_us;",
-              "    uint32_t last_cd_lba;",
-              "    uint32_t frame_xa_sectors;",
-              "",
-              "    uint32_t frame_gpu_us;",
-              "    uint32_t frame_gpu_words;",
-              "    uint32_t frame_gpu_calls;",
-              "",
-              "    uint32_t frame_spu_us;",
-              "    uint32_t frame_feed_us;",
-              "    uint32_t frame_spu_samples;",
-              "    uint32_t frame_spu_div;",
-              "    uint32_t frame_xa_active;",
-              "};",
-              "",
-              "extern struct pcsx_telem_s g_telem;",
-              "#endif",
-              ""
-          ])
-          with open("include/pcsx_telemetry.h", "w") as f:
-              f.write(telemetry_h)
-          print("SUCCESS 1A: Created include/pcsx_telemetry.h!")
-
-          # --- 2. PATCH plugins/dfsound/spu.c: EXACT V27/V37 AUDIO + SAFE SPU/XA TELEMETRY ---
-          with open("plugins/dfsound/spu.c", "r") as f:
-              spu_c = f.read()
-
-          spu_header = (
-              "#include <sys/time.h>\n"
-              "#include \"pcsx_telemetry.h\"\n"
-              "struct pcsx_telem_s g_telem;\n"
-              "static int g_spu_div = 768;\n"
-          )
-
-          old_ns_calc = (
-              " if (cycle_diff < 2 * 768)\n"
-              "  return;\n"
-              "\n"
-              " ns_to = (cycle_diff / 768 + 1) & ~1;"
-          )
-          new_ns_calc = (
-              " if (cycle_diff < 2 * g_spu_div)\n"
-              "  return;\n"
-              "\n"
-              " ns_to = (cycle_diff / g_spu_div + 1) & ~1;"
-          )
-
-          old_played_adv = "  spu.cycles_played += ns_to * 768;"
-          new_played_adv = "  spu.cycles_played += ns_to * g_spu_div;"
-
-          old_async_start = "void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)\n{"
-          new_async_start = (
-              "void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)\n{\n"
-              " struct timeval t_spu0, t_spu1;\n"
-              " gettimeofday(&t_spu0, NULL);"
-          )
-
-          old_async_feed = (
-              " if (flags & 1) {\n"
-              "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);\n"
-              "  spu.pS = (short *)spu.pSpuBuffer;"
-          )
-          new_async_feed = "\n".join([
-              " gettimeofday(&t_spu1, NULL);",
-              " g_telem.frame_spu_us += (t_spu1.tv_sec - t_spu0.tv_sec) * 1000000 + (t_spu1.tv_usec - t_spu0.tv_usec);",
-              " if (flags & 1) {",
-              "  static struct timeval after_feed_tv = {0, 0};",
-              "  struct timeval before_feed_tv;",
-              "  gettimeofday(&before_feed_tv, NULL);",
-              "  if (spu.XAPlay != spu.XAFeed) {",
-              "   g_spu_div = 768;",
-              "  } else if (after_feed_tv.tv_sec != 0) {",
-              "   long emu_us = (before_feed_tv.tv_sec - after_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - after_feed_tv.tv_usec);",
-              "   if (emu_us > 21200) g_spu_div = 748;",
-              "   else if (emu_us > 19600) g_spu_div = 784;",
-              "   else g_spu_div = 824;",
-              "  }",
-              "  int bytes_to_feed = (unsigned char *)spu.pS - spu.pSpuBuffer;",
-              "  g_telem.frame_spu_samples = bytes_to_feed >> 2;",
-              "  g_telem.frame_spu_div = g_spu_div;",
-              "  g_telem.frame_xa_active = (spu.XAPlay != spu.XAFeed) ? 1 : 0;",
-              "  out_current->feed(spu.pSpuBuffer, bytes_to_feed);",
-              "  spu.pS = (short *)spu.pSpuBuffer;",
-              "  gettimeofday(&after_feed_tv, NULL);",
-              "  g_telem.frame_feed_us += (after_feed_tv.tv_sec - before_feed_tv.tv_sec) * 1000000 + (after_feed_tv.tv_usec - before_feed_tv.tv_usec);"
-          ])
-
-          old_feed_xa = " FeedXA(xap);"
-          new_feed_xa = "\n".join([
-              " g_telem.frame_xa_sectors++;",
-              " if (spu.iLeftXAVol < 0x2000 && spu.iRightXAVol < 0x2000) { spu.iLeftXAVol = 0x7fff; spu.iRightXAVol = 0x7fff; }",
-              " spu.spuCtrl |= 0xc001;",
-              " FeedXA(xap);"
-          ])
-
-          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_start not in spu_c or old_async_feed not in spu_c or old_feed_xa not in spu_c:
-              print("ERROR: target blocks not found in spu.c!")
-              sys.exit(1)
-
-          spu_c = (
-              spu_header + spu_c
-              .replace(old_ns_calc, new_ns_calc, 1)
-              .replace(old_played_adv, new_played_adv, 1)
-              .replace(old_async_start, new_async_start, 1)
-              .replace(old_async_feed, new_async_feed, 1)
-              .replace(old_feed_xa, new_feed_xa, 1)
-          )
-          with open("plugins/dfsound/spu.c", "w") as f:
-              f.write(spu_c)
-          print("SUCCESS 2: Cleanly patched plugins/dfsound/spu.c (Exact V27 logic + telemetry)!")
-
-          # --- 3. PATCH libpcsxcore/cdrom.c & cdriso.c: CDROM FIX + SAFE CHD READ TIMING ---
+          # 2. Patch libpcsxcore/cdrom.c: Subheader guard for multi-XA files
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
-
-          old_lock = (
-              "\t\tif( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {\n"
-              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
-              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
-              "\t\t}"
-          )
-          new_lock = (
-              "\t\tif (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {\n"
-              "\t\t\tcdr.File = cdr.Transfer[4 + 0];\n"
-              "\t\t\tcdr.Channel = cdr.Transfer[4 + 1];\n"
-              "\t\t}"
-          )
-
-          if old_lock not in cdrom:
-              print("ERROR: old_lock not found in cdrom.c!")
-              sys.exit(1)
-
-          cdrom = cdrom.replace(old_lock, new_lock, 1)
+          old_cdrom = "if( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {"
+          new_cdrom = "if (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {"
+          assert old_cdrom in cdrom, "Could not find cdr.FirstSector in cdrom.c"
+          cdrom = cdrom.replace(old_cdrom, new_cdrom, 1)
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
+          print("SUCCESS 2: Patched libpcsxcore/cdrom.c!")
 
-          with open("libpcsxcore/cdriso.c", "r") as f:
-              cdriso = f.read()
+          # 3. Patch plugins/dfsound/spu.c:
+          #    - Keep do_samples() at native 768 cycles/sample so XAPlay/XAFeed never desync
+          #    - Add post-mix linear-interpolated time-stretcher + ALSA buffer cushion controller
+          with open("plugins/dfsound/spu.c", "r") as f:
+              spu = f.read()
 
-          chd_inc_m = re.search(r"#include\s+[<\"].*chd\.h[>\"]", cdriso)
-          if chd_inc_m and "chd_read(" in cdriso:
-              orig_chd_inc = chd_inc_m.group(0)
-              chd_wrapper = "\n".join([
-                  orig_chd_inc,
-                  "#include <sys/time.h>",
-                  "#include \"pcsx_telemetry.h\"",
-                  "static inline chd_error telem_chd_read(chd_file *file, uint32_t hunknum, void *buffer) {",
-                  "    struct timeval t0, t1;",
-                  "    gettimeofday(&t0, NULL);",
-                  "    g_telem.frame_cd_reads++;",
-                  "    g_telem.last_cd_lba = hunknum;",
-                  "    chd_error err = chd_read(file, hunknum, buffer);",
-                  "    gettimeofday(&t1, NULL);",
-                  "    g_telem.frame_cd_us += (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_usec - t0.tv_usec);",
-                  "    return err;",
-                  "}"
-              ])
-              cdriso = cdriso.replace("chd_read(", "telem_chd_read(")
-              cdriso = cdriso.replace(orig_chd_inc, chd_wrapper, 1)
-              with open("libpcsxcore/cdriso.c", "w") as f:
-                  f.write(cdriso)
-              print("SUCCESS 3: Patched libpcsxcore/cdrom.c & wrapped chd_read() in cdriso.c after chd.h!")
-          else:
-              print("ERROR: chd.h include or chd_read( not found in cdriso.c!")
-              sys.exit(1)
+          spu_header = """#include <sys/time.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          static int16_t g_stretch_buf[2400 * 2];
+          static struct timeval g_before_feed_tv = {0, 0};
+          static struct timeval g_after_feed_tv = {0, 0};
+          static struct timeval g_sec_tv = {0, 0};
+          static uint32_t g_last_feed_us = 0;
+          static uint32_t g_emu_hist[8] = {20000, 20000, 20000, 20000, 20000, 20000, 20000, 20000};
+          static int g_hist_idx = 0;
+          static int g_refill_frames = 20;
+          static FILE *g_tlog = NULL;
+          static uint32_t g_sec_frames = 0, g_sec_in_samples = 0, g_sec_out_samples = 0;
+          static uint64_t g_sec_emu_us = 0, g_sec_feed_us = 0;
+          """
 
-          # --- 4. PATCH plugins/gpu_unai/gpulib_if.cpp: SAFE FUNCTION ENTRY TIMER ONLY (NO LOOP/SWITCH TOUCHING!) ---
-          with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
-              gpulib_if = f.read()
+          old_feed = """ if (flags & 1) {
+            out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);
+            spu.pS = (short *)spu.pSpuBuffer;"""
 
-          gpu_hdr = "\n".join([
-              '#include <stddef.h>',
-              '#include <sys/time.h>',
-              'extern "C" {',
-              '#include "pcsx_telemetry.h"',
-              '}',
-              'struct gpu_telem_scope_timer {',
-              '    struct timeval t0;',
-              '    gpu_telem_scope_timer(int words) {',
-              '        gettimeofday(&t0, 0);',
-              '        g_telem.frame_gpu_words += (uint32_t)words;',
-              '        g_telem.frame_gpu_calls++;',
-              '    }',
-              '    ~gpu_telem_scope_timer() {',
-              '        struct timeval t1;',
-              '        gettimeofday(&t1, 0);',
-              '        g_telem.frame_gpu_us += (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_usec - t0.tv_usec);',
-              '    }',
-              '};',
-              ''
-          ])
+          new_feed = """ if (flags & 1) {
+            int bytes_to_feed = (unsigned char *)spu.pS - spu.pSpuBuffer;
+            int n_in = bytes_to_feed >> 2;
+            spu.pS = (short *)spu.pSpuBuffer;
+            if (n_in > 0) {
+             struct timeval now_tv;
+             gettimeofday(&now_tv, NULL);
+             uint32_t nom_us = ((uint32_t)n_in * 1000000U) / 44100U;
+             uint32_t emu_us = nom_us;
+             if (g_after_feed_tv.tv_sec != 0) {
+              long d_us = (now_tv.tv_sec - g_after_feed_tv.tv_sec) * 1000000L + (now_tv.tv_usec - g_after_feed_tv.tv_usec);
+              if (d_us > 0) emu_us = (uint32_t)d_us;
+             } else {
+              for (int k = 0; k < 8; k++) g_emu_hist[k] = nom_us;
+              g_refill_frames = 20;
+              g_sec_tv = now_tv;
+              if (!g_tlog) {
+               g_tlog = fopen("/tmp/pcsx_telemetry.log", "w");
+               if (g_tlog) {
+                fprintf(g_tlog, "=== PCSX-ReARMed V41 Audio Cushion Telemetry ===\\n");
+                fflush(g_tlog);
+               }
+              }
+             }
+             g_before_feed_tv = now_tv;
 
-          m_start = re.search(r"int\s+do_cmd_list\s*\([^)]*\)\s*\{", gpulib_if)
-          if not m_start:
-              print("ERROR: do_cmd_list not found in gpulib_if.cpp!")
-              sys.exit(1)
+             if (emu_us > 80000U) {
+              /* Recovering from a level-load stall: refill ALSA cushion immediately */
+              g_refill_frames = 22;
+              for (int k = 0; k < 8; k++) g_emu_hist[k] = nom_us + 3500U;
+             } else {
+              uint32_t cl_emu = (emu_us > 52000U) ? 52000U : emu_us;
+              g_emu_hist[g_hist_idx] = cl_emu;
+              g_hist_idx = (g_hist_idx + 1) & 7;
+             }
 
-          orig_start = m_start.group(0)
-          new_cmd_start = orig_start + "\n\tgpu_telem_scope_timer _gpu_timer(list_len);\n"
+             uint32_t sum_emu = 0;
+             for (int k = 0; k < 8; k++) sum_emu += g_emu_hist[k];
+             uint32_t avg_emu_us = sum_emu >> 3;
 
-          gpulib_if = gpu_hdr + gpulib_if.replace(orig_start, new_cmd_start, 1)
-          with open("plugins/gpu_unai/gpulib_if.cpp", "w") as f:
-              f.write(gpulib_if)
-          print("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp at function entry only (zero loop/switch changes)!")
+             int n_out = n_in;
+             if (avg_emu_us > nom_us - 600U || emu_us > nom_us + 1500U || g_last_feed_us < 1600U || g_refill_frames > 0) {
+              uint32_t cl_cur = (emu_us > 52000U) ? 52000U : emu_us;
+              uint32_t eff_us = avg_emu_us;
+              if (cl_cur > avg_emu_us) {
+               eff_us = (avg_emu_us * 5U + cl_cur * 3U) >> 3;
+              }
+              if (eff_us < nom_us) eff_us = nom_us;
+              n_out = (int)(((uint64_t)eff_us * 44100ULL) / 1000000ULL);
 
-          # --- 5. PATCH frontend/libretro.c: SESAME LIGHTING + /tmp/pcsx_telemetry.log LOGGER ---
-          with open("frontend/libretro.c", "r") as f:
-              libretro_c = f.read()
+              if (g_refill_frames > 0) {
+               n_out += 88;
+               g_refill_frames--;
+              } else if (g_last_feed_us < 600U) {
+               n_out += 64;
+              } else if (g_last_feed_us < 1600U) {
+               n_out += 28;
+              }
+              if (n_out < n_in) n_out = n_in;
+              if (n_out > 2300) n_out = 2300;
+             }
 
-          target_load_game = "bool retro_load_game(const struct retro_game_info *info)\n{"
-          target_lighting_block = (
-              '   var.key = "pcsx_rearmed_gpu_unai_lighting";\n'
-              '   var.value = NULL;\n'
-              '\n'
-              '   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)\n'
-              '   {\n'
-              '      if (strcmp(var.value, "disabled") == 0)\n'
-              '         pl_rearmed_cbs.gpu_unai.lighting = 0;\n'
-              '      else if (strcmp(var.value, "enabled") == 0)\n'
-              '         pl_rearmed_cbs.gpu_unai.lighting = 1;\n'
-              '   }'
-          )
-          m_retro_run = re.search(r"void\s+retro_run\s*\(\s*void\s*\)\s*\{", libretro_c)
+             if (n_out == n_in) {
+              out_current->feed(spu.pSpuBuffer, bytes_to_feed);
+             } else {
+              const int16_t *src = (const int16_t *)spu.pSpuBuffer;
+              if (n_in == 1) {
+               for (int i = 0; i < n_out; i++) {
+                g_stretch_buf[i * 2]     = src[0];
+                g_stretch_buf[i * 2 + 1] = src[1];
+               }
+              } else {
+               uint32_t step = ((uint32_t)(n_in - 1) << 16) / (uint32_t)(n_out - 1);
+               uint32_t pos = 0;
+               for (int i = 0; i < n_out - 1; i++) {
+                uint32_t idx = pos >> 16;
+                uint32_t frac = pos & 0xffffU;
+                int32_t l0 = src[idx * 2],     r0 = src[idx * 2 + 1];
+                int32_t l1 = src[idx * 2 + 2], r1 = src[idx * 2 + 3];
+                g_stretch_buf[i * 2]     = (int16_t)(l0 + (((l1 - l0) * (int32_t)frac) >> 16));
+                g_stretch_buf[i * 2 + 1] = (int16_t)(r0 + (((r1 - r0) * (int32_t)frac) >> 16));
+                pos += step;
+               }
+               g_stretch_buf[(n_out - 1) * 2]     = src[(n_in - 1) * 2];
+               g_stretch_buf[(n_out - 1) * 2 + 1] = src[(n_in - 1) * 2 + 1];
+              }
+              out_current->feed(g_stretch_buf, n_out << 2);
+             }
 
-          if target_load_game not in libretro_c or target_lighting_block not in libretro_c or not m_retro_run:
-              print("ERROR: target blocks not found in frontend/libretro.c!")
-              sys.exit(1)
+             gettimeofday(&g_after_feed_tv, NULL);
+             long f_us = (g_after_feed_tv.tv_sec - g_before_feed_tv.tv_sec) * 1000000L + (g_after_feed_tv.tv_usec - g_before_feed_tv.tv_usec);
+             g_last_feed_us = (f_us > 0) ? (uint32_t)f_us : 0;
 
-          orig_retro_run = m_retro_run.group(0)
+             g_sec_frames++;
+             g_sec_in_samples += (uint32_t)n_in;
+             g_sec_out_samples += (uint32_t)n_out;
+             g_sec_emu_us += emu_us;
+             g_sec_feed_us += g_last_feed_us;
+             long sec_el = (g_after_feed_tv.tv_sec - g_sec_tv.tv_sec) * 1000000L + (g_after_feed_tv.tv_usec - g_sec_tv.tv_usec);
+             if (sec_el >= 1000000L && g_sec_frames > 0) {
+              if (g_tlog) {
+               double fps = (double)g_sec_frames * 1000000.0 / (double)sec_el;
+               fprintf(g_tlog, "[1S] %.1f fps | avg_emu=%u us avg_feed=%u us | samples/f: %u -> %u (total_out=%u/s) | xa=%d\\n",
+                fps, (uint32_t)(g_sec_emu_us / g_sec_frames), (uint32_t)(g_sec_feed_us / g_sec_frames),
+                g_sec_in_samples / g_sec_frames, g_sec_out_samples / g_sec_frames, g_sec_out_samples,
+                (spu.XAPlay != spu.XAFeed) ? 1 : 0);
+               fflush(g_tlog);
+              }
+              g_sec_tv = g_after_feed_tv;
+              g_sec_frames = g_sec_in_samples = g_sec_out_samples = 0;
+              g_sec_emu_us = g_sec_feed_us = 0;
+             }
+            }"""
 
-          new_load_game = "\n".join([
-              "#include <sys/time.h>",
-              "#include \"pcsx_telemetry.h\"",
-              "static int g_is_sesame = 0;",
-              "static FILE *g_tlog = NULL;",
-              "static uint32_t g_frame_no = 0;",
-              "static struct timeval g_prev_f_tv = {0, 0};",
-              "static struct timeval g_sec_tv = {0, 0};",
-              "bool retro_load_game(const struct retro_game_info *info)",
-              "{",
-              "   g_is_sesame = (info && info->path && strstr(info->path, \"Sesame Street Sports\") != NULL) ? 1 : 0;",
-              "   if (g_tlog) { fclose(g_tlog); g_tlog = NULL; }",
-              "   g_tlog = fopen(\"/tmp/pcsx_telemetry.log\", \"w\");",
-              "   g_frame_no = 0;",
-              "   g_prev_f_tv.tv_sec = 0; g_prev_f_tv.tv_usec = 0;",
-              "   g_sec_tv.tv_sec = 0; g_sec_tv.tv_usec = 0;",
-              "   if (g_tlog) {",
-              "      fprintf(g_tlog, \"=== PCSX-ReARMed V40 Telemetry Started ===\\nGame: %s\\n\", (info && info->path) ? info->path : \"unknown\");",
-              "      fprintf(g_tlog, \"Columns: [1S] fps | min_fps(max_ms) | avg_us: cpu gpu spu feed cd | gpu_words(calls) | chd_reads(last_hunk) xa_sect | spu_div samples xa_on light\\n\");",
-              "      fflush(g_tlog);",
-              "   }"
-          ])
+          assert old_feed in spu, "Could not find out_current->feed block in spu.c"
+          spu = spu_header + spu.replace(old_feed, new_feed, 1)
 
-          new_lighting_block = "\n".join([
-              '   var.key = "pcsx_rearmed_gpu_unai_lighting";',
-              '   var.value = NULL;',
-              '',
-              '   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)',
-              '   {',
-              '      if (strcmp(var.value, "disabled") == 0 || g_is_sesame || strncasecmp(CdromId, "sles03180", 9) == 0 || strncasecmp(CdromId, "slus01180", 9) == 0)',
-              '         pl_rearmed_cbs.gpu_unai.lighting = 0;',
-              '      else if (strcmp(var.value, "enabled") == 0)',
-              '         pl_rearmed_cbs.gpu_unai.lighting = 1;',
-              '   }'
-          ])
+          old_xa = "FeedXA(xap);"
+          new_xa = """if (spu.iLeftXAVol < 0x2000 && spu.iRightXAVol < 0x2000) { spu.iLeftXAVol = 0x7fff; spu.iRightXAVol = 0x7fff; }
+           spu.spuCtrl |= 0xc001;
+           FeedXA(xap);"""
+          assert old_xa in spu, "Could not find FeedXA in spu.c"
+          spu = spu.replace(old_xa, new_xa, 1)
 
-          new_retro_run = "\n".join([
-              "static void telem_step_frame(void) {",
-              "   static uint32_t sec_frames = 0, sec_max_us = 0;",
-              "   static uint32_t sum_cpu = 0, sum_gpu = 0, sum_spu = 0, sum_feed = 0, sum_cd = 0;",
-              "   static uint32_t sum_gwords = 0, sum_gcalls = 0, sum_cdr = 0, sum_xas = 0;",
-              "   struct timeval now_tv;",
-              "   gettimeofday(&now_tv, NULL);",
-              "   if (g_prev_f_tv.tv_sec != 0) {",
-              "      g_frame_no++;",
-              "      uint32_t f_us = (uint32_t)((now_tv.tv_sec - g_prev_f_tv.tv_sec) * 1000000L + (now_tv.tv_usec - g_prev_f_tv.tv_usec));",
-              "      uint32_t sub_us = g_telem.frame_gpu_us + g_telem.frame_spu_us + g_telem.frame_feed_us + g_telem.frame_cd_us;",
-              "      uint32_t cpu_us = (f_us > sub_us) ? (f_us - sub_us) : 0;",
-              "      sec_frames++;",
-              "      if (f_us > sec_max_us) sec_max_us = f_us;",
-              "      sum_cpu += cpu_us; sum_gpu += g_telem.frame_gpu_us; sum_spu += g_telem.frame_spu_us;",
-              "      sum_feed += g_telem.frame_feed_us; sum_cd += g_telem.frame_cd_us;",
-              "      sum_gwords += g_telem.frame_gpu_words; sum_gcalls += g_telem.frame_gpu_calls;",
-              "      sum_cdr += g_telem.frame_cd_reads; sum_xas += g_telem.frame_xa_sectors;",
-              "      if (g_tlog && (g_frame_no == 1 || (f_us > 22500 && g_frame_no > 30))) {",
-              "         uint32_t fps_x10 = (f_us > 0) ? (10000000U / f_us) : 0;",
-              "         fprintf(g_tlog, \"  [FRAME #%u] %u.%u fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | gpu_w=%u(c:%u) | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samp=%u xa=%u light=%d\\n\",",
-              "            g_frame_no, fps_x10 / 10, fps_x10 % 10, f_us / 1000, (f_us % 1000) / 100,",
-              "            cpu_us, g_telem.frame_gpu_us, g_telem.frame_spu_us, g_telem.frame_feed_us, g_telem.frame_cd_us,",
-              "            g_telem.frame_gpu_words, g_telem.frame_gpu_calls,",
-              "            g_telem.frame_cd_reads, g_telem.last_cd_lba, g_telem.frame_xa_sectors,",
-              "            g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, pl_rearmed_cbs.gpu_unai.lighting);",
-              "         fflush(g_tlog);",
-              "      }",
-              "      long elapsed_us = (now_tv.tv_sec - g_sec_tv.tv_sec) * 1000000L + (now_tv.tv_usec - g_sec_tv.tv_usec);",
-              "      if (elapsed_us >= 1000000L && sec_frames > 0) {",
-              "         if (g_tlog) {",
-              "            uint32_t fps_x10 = (uint32_t)((sec_frames * 10000000ULL) / (uint32_t)elapsed_us);",
-              "            uint32_t min_x10 = (sec_max_us > 0) ? (10000000U / sec_max_us) : 0;",
-              "            fprintf(g_tlog, \"[1S f=%u ID=%s] %u.%u fps | min %u.%u fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | gpu_w=%u(c:%u) | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samp=%u xa=%u light=%d\\n\",",
-              "               g_frame_no, CdromId[0] ? CdromId : \"none\", fps_x10 / 10, fps_x10 % 10, min_x10 / 10, min_x10 % 10, sec_max_us / 1000, (sec_max_us % 1000) / 100,",
-              "               sum_cpu / sec_frames, sum_gpu / sec_frames, sum_spu / sec_frames, sum_feed / sec_frames, sum_cd / sec_frames,",
-              "               sum_gwords / sec_frames, sum_gcalls / sec_frames, sum_cdr, g_telem.last_cd_lba, sum_xas,",
-              "               g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, pl_rearmed_cbs.gpu_unai.lighting);",
-              "            fflush(g_tlog);",
-              "         }",
-              "         g_sec_tv = now_tv; sec_frames = 0; sec_max_us = 0;",
-              "         sum_cpu = sum_gpu = sum_spu = sum_feed = sum_cd = 0;",
-              "         sum_gwords = sum_gcalls = sum_cdr = sum_xas = 0;",
-              "      }",
-              "   } else {",
-              "      g_sec_tv = now_tv;",
-              "      sec_frames = 0; sec_max_us = 0;",
-              "      sum_cpu = sum_gpu = sum_spu = sum_feed = sum_cd = 0;",
-              "      sum_gwords = sum_gcalls = sum_cdr = sum_xas = 0;",
-              "   }",
-              "   g_prev_f_tv = now_tv;",
-              "   g_telem.frame_cd_reads = 0; g_telem.frame_cd_us = 0; g_telem.frame_xa_sectors = 0;",
-              "   g_telem.frame_gpu_us = 0; g_telem.frame_gpu_words = 0; g_telem.frame_gpu_calls = 0;",
-              "   g_telem.frame_spu_us = 0; g_telem.frame_feed_us = 0;",
-              "}",
-              orig_retro_run,
-              "   telem_step_frame();"
-          ])
-
-          libretro_c = (
-              libretro_c.replace(target_load_game, new_load_game, 1)
-                        .replace(target_lighting_block, new_lighting_block, 1)
-                        .replace(orig_retro_run, new_retro_run, 1)
-          )
-
-          with open("frontend/libretro.c", "w") as f:
-              f.write(libretro_c)
-          print("SUCCESS 5: Patched frontend/libretro.c with /tmp/pcsx_telemetry.log writer!")
+          with open("plugins/dfsound/spu.c", "w") as f:
+              f.write(spu)
+          print("SUCCESS 3: Patched plugins/dfsound/spu.c with Post-Mix Audio Stretcher!")
           EOF
 
-          python3 patch_v40.py | tee ../build_v40_report.txt
-          rm -f patch_v40.py
-
-          # Optimize Makefiles (Exact V27/V37 flags)
-          sed -i 's/-O2/-O3/g' Makefile.libretro
-          sed -i 's/-O2/-O3/g' Makefile
-          sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile.libretro
-          sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
-
-          echo "=== VERIFIED GIT DIFF FOR V40 ===" >> ../build_v40_report.txt
-          git diff Makefile frontend/libretro.c libpcsxcore/cdrom.c libpcsxcore/cdriso.c plugins/dfsound/spu.c plugins/gpu_unai/gpulib_if.cpp >> ../build_v40_report.txt
-
-      - name: Compile Inside Ubuntu 18.04 Container
+      - name: Compile PCSX-ReARMed V41 Core
         run: |
-          docker run --rm -v "$PWD:/work" -w /work ubuntu:18.04 bash -e -c '
-            apt-get update
-            apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi make binutils
+          OPT_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -munaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+          make -f Makefile.libretro \
+            platform=unix \
+            ARCH=arm \
+            CC=arm-linux-gnueabi-gcc \
+            CXX=arm-linux-gnueabi-g++ \
+            AS=arm-linux-gnueabi-as \
+            DYNAREC=ari64 \
+            GPU=unai \
+            HAVE_CHD=1 \
+            HAVE_NEON=0 \
+            HAVE_NEON_ASM=0 \
+            CFLAGS="$OPT_FLAGS" \
+            CXXFLAGS="$OPT_FLAGS -static-libstdc++ -static-libgcc" \
+            LDFLAGS="-static-libstdc++ -static-libgcc -Wl,-Bsymbolic -Wl,-Bsymbolic-functions" \
+            -j$(nproc)
+          ls -lh pcsx_rearmed_libretro.so
 
-            cd /work/src
-            find . -name "*.o" -delete
-            rm -f pcsx_rearmed_libretro.so
-
-            A9_V27_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
-            ASM_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp"
-
-            export CFLAGS="$A9_V27_FLAGS"
-            export CXXFLAGS="$A9_V27_FLAGS"
-            export ASFLAGS="$ASM_FLAGS"
-
-            make -f Makefile.libretro \
-              platform=unix ARCH=arm DYNAREC=ari64 HAVE_NEON=0 HAVE_VFP=1 HAVE_CHD=1 THREAD_RENDERING=0 BUILTIN_GPU=unai \
-              CC="arm-linux-gnueabi-gcc $A9_V27_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $A9_V27_FLAGS -static-libstdc++ -static-libgcc" \
-              AS="arm-linux-gnueabi-as $ASM_FLAGS" \
-              AR=arm-linux-gnueabi-ar -j2 2>&1 | tee ../build_v40.log
-
-            arm-linux-gnueabi-strip --strip-unneeded pcsx_rearmed_libretro.so
-            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v40_report.txt
-          '
-          cat build_v40_report.txt
-
-      - name: Upload v40 .so File & Report
-        if: always()
+      - name: Upload V41 Core Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx-rearmed-v40-telemetry
-          path: |
-            pcsx_rearmed_libretro.so
-            build_v40_report.txt
-            build_v40.log
+          name: pcsx_rearmed_libretro_v41
+          path: pcsx_rearmed_libretro.so
