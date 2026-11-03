@@ -75,20 +75,20 @@ jobs:
               f.write(mk_new)
           print("SUCCESS 1: Patched Makefile with 32 CHD/Zstd objects!")
 
-          # 2. Patch libpcsxcore/cdrom.c: Subheader guard for multi-XA files
+          # 2. Patch libpcsxcore/cdrom.c: Regex tolerant of whitespace changes
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
-          old_cdrom = "if( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {"
+          
+          cdrom_pat = r'if\s*\(\s*cdr\.FirstSector\s*==\s*1\s*&&\s*\(\s*cdr\.Mode\s*&\s*MODE_SF\s*\)\s*==\s*0\s*\)\s*\{'
           new_cdrom = "if (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {"
-          assert old_cdrom in cdrom, "Could not find cdr.FirstSector in cdrom.c"
-          cdrom = cdrom.replace(old_cdrom, new_cdrom, 1)
+          
+          cdrom_new = re.sub(cdrom_pat, new_cdrom, cdrom, count=1)
+          assert cdrom_new != cdrom, "Could not find cdr.FirstSector in cdrom.c"
           with open("libpcsxcore/cdrom.c", "w") as f:
-              f.write(cdrom)
+              f.write(cdrom_new)
           print("SUCCESS 2: Patched libpcsxcore/cdrom.c!")
 
-          # 3. Patch plugins/dfsound/spu.c:
-          #    - Keep do_samples() at native 768 cycles/sample so XAPlay/XAFeed never desync
-          #    - Add post-mix linear-interpolated time-stretcher + ALSA buffer cushion controller
+          # 3. Patch plugins/dfsound/spu.c (Regex tolerant of whitespace changes)
           with open("plugins/dfsound/spu.c", "r") as f:
               spu = f.read()
 
@@ -107,10 +107,6 @@ jobs:
           static uint32_t g_sec_frames = 0, g_sec_in_samples = 0, g_sec_out_samples = 0;
           static uint64_t g_sec_emu_us = 0, g_sec_feed_us = 0;
           """
-
-          old_feed = """ if (flags & 1) {
-            out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);
-            spu.pS = (short *)spu.pSpuBuffer;"""
 
           new_feed = """ if (flags & 1) {
             int bytes_to_feed = (unsigned char *)spu.pS - spu.pSpuBuffer;
@@ -226,18 +222,22 @@ jobs:
              }
             }"""
 
-          assert old_feed in spu, "Could not find out_current->feed block in spu.c"
-          spu = spu_header + spu.replace(old_feed, new_feed, 1)
+          feed_pat = r'if\s*\(\s*flags\s*&\s*1\s*\)\s*\{\s*out_current->feed\(\s*spu\.pSpuBuffer,\s*\(unsigned char\s*\*\)\s*spu\.pS\s*-\s*spu\.pSpuBuffer\s*\);\s*spu\.pS\s*=\s*\(short\s*\*\)\s*spu\.pSpuBuffer;'
+          
+          spu_new = re.sub(feed_pat, new_feed, spu, count=1)
+          assert spu_new != spu, "Could not find out_current->feed block in spu.c"
+          spu = spu_header + spu_new
 
-          old_xa = "FeedXA(xap);"
+          xa_pat = r'FeedXA\(\s*xap\s*\);'
           new_xa = """if (spu.iLeftXAVol < 0x2000 && spu.iRightXAVol < 0x2000) { spu.iLeftXAVol = 0x7fff; spu.iRightXAVol = 0x7fff; }
            spu.spuCtrl |= 0xc001;
            FeedXA(xap);"""
-          assert old_xa in spu, "Could not find FeedXA in spu.c"
-          spu = spu.replace(old_xa, new_xa, 1)
-
+          
+          spu_new = re.sub(xa_pat, new_xa, spu, count=1)
+          assert spu_new != spu, "Could not find FeedXA in spu.c"
+          
           with open("plugins/dfsound/spu.c", "w") as f:
-              f.write(spu)
+              f.write(spu_new)
           print("SUCCESS 3: Patched plugins/dfsound/spu.c with Post-Mix Audio Stretcher!")
           EOF
 
