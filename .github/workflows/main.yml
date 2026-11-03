@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout b1226a3a, Clone rtissera/libchdr (Zstd), & Apply V40 Safe Telemetry Patches
+      - name: Checkout b1226a3a, Clone rtissera/libchdr (Zstd), & Apply V40 Patches
         run: |
           set -eo pipefail
           git clone https://github.com/libretro/pcsx_rearmed.git src
@@ -103,7 +103,7 @@ jobs:
               "    uint32_t frame_xa_sectors;",
               "",
               "    uint32_t frame_gpu_us;",
-              "    uint32_t frame_gpu_Verify_words;",
+              "    uint32_t frame_gpu_words;",
               "    uint32_t frame_gpu_calls;",
               "",
               "    uint32_t frame_spu_us;",
@@ -121,7 +121,7 @@ jobs:
               f.write(telemetry_h)
           print("SUCCESS 1A: Created include/pcsx_telemetry.h!")
 
-          # --- 2. PATCH plugins/dfsound/spu.c: EXACT V37 PATCH POINTS ONLY ---
+          # --- 2. PATCH plugins/dfsound/spu.c: EXACT V27/V37 AUDIO + SAFE SPU/XA TELEMETRY ---
           with open("plugins/dfsound/spu.c", "r") as f:
               spu_c = f.read()
 
@@ -148,12 +148,21 @@ jobs:
           old_played_adv = "  spu.cycles_played += ns_to * 768;"
           new_played_adv = "  spu.cycles_played += ns_to * g_spu_div;"
 
+          old_async_start = "void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)\n{"
+          new_async_start = (
+              "void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)\n{\n"
+              " struct timeval t_spu0, t_spu1;\n"
+              " gettimeofday(&t_spu0, NULL);"
+          )
+
           old_async_feed = (
               " if (flags & 1) {\n"
               "  out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);\n"
               "  spu.pS = (short *)spu.pSpuBuffer;"
           )
           new_async_feed = "\n".join([
+              " gettimeofday(&t_spu1, NULL);",
+              " g_telem.frame_spu_us += (t_spu1.tv_sec - t_spu0.tv_sec) * 1000000 + (t_spu1.tv_usec - t_spu0.tv_usec);",
               " if (flags & 1) {",
               "  static struct timeval after_feed_tv = {0, 0};",
               "  struct timeval before_feed_tv;",
@@ -184,7 +193,7 @@ jobs:
               " FeedXA(xap);"
           ])
 
-          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_feed not in spu_c or old_feed_xa not in spu_c:
+          if old_ns_calc not in spu_c or old_played_adv not in spu_c or old_async_start not in spu_c or old_async_feed not in spu_c or old_feed_xa not in spu_c:
               print("ERROR: target blocks not found in spu.c!")
               sys.exit(1)
 
@@ -192,12 +201,13 @@ jobs:
               spu_header + spu_c
               .replace(old_ns_calc, new_ns_calc, 1)
               .replace(old_played_adv, new_played_adv, 1)
+              .replace(old_async_start, new_async_start, 1)
               .replace(old_async_feed, new_async_feed, 1)
               .replace(old_feed_xa, new_feed_xa, 1)
           )
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu_c)
-          print("SUCCESS 2: Cleanly patched plugins/dfsound/spu.c (Exact V37 patch points)!")
+          print("SUCCESS 2: Cleanly patched plugins/dfsound/spu.c (Exact V27 logic + telemetry)!")
 
           # --- 3. PATCH libpcsxcore/cdrom.c & cdriso.c: CDROM FIX + SAFE CHD READ TIMING ---
           with open("libpcsxcore/cdrom.c", "r") as f:
@@ -227,7 +237,6 @@ jobs:
           with open("libpcsxcore/cdriso.c", "r") as f:
               cdriso = f.read()
 
-          # Insert telem_chd_read AFTER #include <libchdr/chd.h> so all system headers and _FILE_OFFSET_BITS are untouched
           chd_inc_m = re.search(r"#include\s+[<\"].*chd\.h[>\"]", cdriso)
           if chd_inc_m and "chd_read(" in cdriso:
               orig_chd_inc = chd_inc_m.group(0)
@@ -255,37 +264,46 @@ jobs:
               print("ERROR: chd.h include or chd_read( not found in cdriso.c!")
               sys.exit(1)
 
-          # --- 4. PATCH plugins/gpulib/gpu.c: PURE C WRAPPER AROUND do_cmd_list() ---
-          with open("plugins/gpulib/gpu.c", "r") as f:
-              gpulib_c = f.read()
+          # --- 4. PATCH plugins/gpu_unai/gpulib_if.cpp: SAFE FUNCTION ENTRY TIMER ONLY (NO LOOP/SWITCH TOUCHING!) ---
+          with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
+              gpulib_if = f.read()
 
-          target_do_cmd = "ret = do_cmd_list(list, count, &cycles_sum, &cycles_last, &cmd);"
-          if target_do_cmd not in gpulib_c:
-              print("ERROR: target_do_cmd not found in plugins/gpulib/gpu.c!")
-              sys.exit(1)
-
-          gpu_c_hdr = (
-              "#include <sys/time.h>\n"
-              "#include \"pcsx_telemetry.h\"\n"
-          )
-          new_do_cmd = "\n".join([
-              "{",
-              "  struct timeval t_g0, t_g1;",
-              "  gettimeofday(&t_g0, NULL);",
-              "  ret = do_cmd_list(list, count, &cycles_sum, &cycles_last, &cmd);",
-              "  gettimeofday(&t_g1, NULL);",
-              "  g_telem.frame_gpu_us += (t_g1.tv_sec - t_g0.tv_sec) * 1000000 + (t_g1.tv_usec - t_g0.tv_usec);",
-              "  g_telem.frame_gpu_Verify_words += (uint32_t)ret;",
-              "  g_telem.frame_gpu_calls++;",
-              "}"
+          gpu_hdr = "\n".join([
+              '#include <stddef.h>',
+              '#include <sys/time.h>',
+              'extern "C" {',
+              '#include "pcsx_telemetry.h"',
+              '}',
+              'struct gpu_telem_scope_timer {',
+              '    struct timeval t0;',
+              '    gpu_telem_scope_timer(int words) {',
+              '        gettimeofday(&t0, 0);',
+              '        g_telem.frame_gpu_words += (uint32_t)words;',
+              '        g_telem.frame_gpu_calls++;',
+              '    }',
+              '    ~gpu_telem_scope_timer() {',
+              '        struct timeval t1;',
+              '        gettimeofday(&t1, 0);',
+              '        g_telem.frame_gpu_us += (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_usec - t0.tv_usec);',
+              '    }',
+              '};',
+              ''
           ])
 
-          gpulib_c = gpu_c_hdr + gpulib_c.replace(target_do_cmd, new_do_cmd, 1)
-          with open("plugins/gpulib/gpu.c", "w") as f:
-              f.write(gpulib_c)
-          print("SUCCESS 4: Patched plugins/gpulib/gpu.c with pure C do_cmd_list() timer!")
+          m_start = re.search(r"int\s+do_cmd_list\s*\([^)]*\)\s*\{", gpulib_if)
+          if not m_start:
+              print("ERROR: do_cmd_list not found in gpulib_if.cpp!")
+              sys.exit(1)
 
-          # --- 5. PATCH frontend/libretro.c: EXACT V37 SESAME + SAFE PER-FRAME TELEMETRY ---
+          orig_start = m_start.group(0)
+          new_cmd_start = orig_start + "\n\tgpu_telem_scope_timer _gpu_timer(list_len);\n"
+
+          gpulib_if = gpu_hdr + gpulib_if.replace(orig_start, new_cmd_start, 1)
+          with open("plugins/gpu_unai/gpulib_if.cpp", "w") as f:
+              f.write(gpulib_if)
+          print("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp at function entry only (zero loop/switch changes)!")
+
+          # --- 5. PATCH frontend/libretro.c: SESAME LIGHTING + /tmp/pcsx_telemetry.log LOGGER ---
           with open("frontend/libretro.c", "r") as f:
               libretro_c = f.read()
 
@@ -302,17 +320,13 @@ jobs:
               '         pl_rearmed_cbs.gpu_unai.lighting = 1;\n'
               '   }'
           )
-          target_emu_slice = "   pl_emu_cbs.fskip_advice = 0;\n   psxCpu->ExecuteBlock(EXEC_CALLER_OTHER);"
+          m_retro_run = re.search(r"void\s+retro_run\s*\(\s*void\s*\)\s*\{", libretro_c)
 
-          if target_load_game not in libretro_c or target_lighting_block not in libretro_c:
+          if target_load_game not in libretro_c or target_lighting_block not in libretro_c or not m_retro_run:
               print("ERROR: target blocks not found in frontend/libretro.c!")
               sys.exit(1)
 
-          m_exec_slice = re.search(r"psxCpu->Execute\s*\(\s*\)\s*;", libretro_c)
-          if not m_exec_slice:
-              print("ERROR: psxCpu->Execute() not found in frontend/libretro.c!")
-              sys.exit(1)
-          orig_exec = m_exec_slice.group(0)
+          orig_retro_run = m_retro_run.group(0)
 
           new_load_game = "\n".join([
               "#include <sys/time.h>",
@@ -320,22 +334,19 @@ jobs:
               "static int g_is_sesame = 0;",
               "static FILE *g_tlog = NULL;",
               "static uint32_t g_frame_no = 0;",
-              "static uint32_t g_sec_frames = 0, g_sec_max_us = 0;",
-              "static uint32_t g_sum_cpu = 0, g_sum_gpu = 0, g_sum_feed = 0, g_sum_cd = 0;",
-              "static uint32_t g_sum_gwords = 0, g_sum_gcalls = 0, g_sum_cdr = 0, g_sum_xas = 0;",
+              "static struct timeval g_prev_f_tv = {0, 0};",
               "static struct timeval g_sec_tv = {0, 0};",
               "bool retro_load_game(const struct retro_game_info *info)",
               "{",
               "   g_is_sesame = (info && info->path && strstr(info->path, \"Sesame Street Sports\") != NULL) ? 1 : 0;",
               "   if (g_tlog) { fclose(g_tlog); g_tlog = NULL; }",
               "   g_tlog = fopen(\"/tmp/pcsx_telemetry.log\", \"w\");",
-              "   g_frame_no = 0; g_sec_frames = 0; g_sec_max_us = 0;",
-              "   g_sum_cpu = g_sum_gpu = g_sum_feed = g_sum_cd = 0;",
-              "   g_sum_gwords = g_sum_gcalls = g_sum_cdr = g_sum_xas = 0;",
+              "   g_frame_no = 0;",
+              "   g_prev_f_tv.tv_sec = 0; g_prev_f_tv.tv_usec = 0;",
               "   g_sec_tv.tv_sec = 0; g_sec_tv.tv_usec = 0;",
               "   if (g_tlog) {",
               "      fprintf(g_tlog, \"=== PCSX-ReARMed V40 Telemetry Started ===\\nGame: %s\\n\", (info && info->path) ? info->path : \"unknown\");",
-              "      fprintf(g_tlog, \"Columns: [1S] fps | min_fps(max_ms) | avg_us: cpu gpu feed cd | gpu_words(calls) | chd_reads(last_hunk) xa_sect | spu_div samples xa_on light\\n\");",
+              "      fprintf(g_tlog, \"Columns: [1S] fps | min_fps(max_ms) | avg_us: cpu gpu spu feed cd | gpu_words(calls) | chd_reads(last_hunk) xa_sect | spu_div samples xa_on light\\n\");",
               "      fflush(g_tlog);",
               "   }"
           ])
@@ -353,64 +364,74 @@ jobs:
               '   }'
           ])
 
-          new_exec = "\n".join([
-              "{",
-              "   struct timeval f_t0, f_t1;",
-              "   gettimeofday(&f_t0, NULL);",
-              "   if (g_sec_tv.tv_sec == 0) g_sec_tv = f_t0;",
-              "   g_telem.frame_cd_reads = 0; g_telem.frame_cd_us = 0; g_telem.frame_xa_sectors = 0;",
-              "   g_telem.frame_gpu_us = 0; g_telem.frame_gpu_Verify_words = 0; g_telem.frame_gpu_calls = 0;",
-              "   g_telem.frame_spu_us = 0; g_telem.frame_feed_us = 0;",
-              "   " + orig_exec,
-              "   gettimeofday(&f_t1, NULL);",
-              "   g_frame_no++;",
-              "   uint32_t f_us = (uint32_t)((f_t1.tv_sec - f_t0.tv_sec) * 1000000L + (f_t1.tv_usec - f_t0.tv_usec));",
-              "   uint32_t sub_us = g_telem.frame_gpu_us + g_telem.frame_feed_us + g_telem.frame_cd_us;",
-              "   uint32_t cpu_us = (f_us > sub_us) ? (f_us - sub_us) : 0;",
-              "   g_sec_frames++;",
-              "   if (f_us > g_sec_max_us) g_sec_max_us = f_us;",
-              "   g_sum_cpu += cpu_us; g_sum_gpu += g_telem.frame_gpu_us;",
-              "   g_sum_feed += g_telem.frame_feed_us; g_sum_cd += g_telem.frame_cd_us;",
-              "   g_sum_gwords += g_telem.frame_gpu_Verify_words; g_sum_gcalls += g_telem.frame_gpu_calls;",
-              "   g_sum_cdr += g_telem.frame_cd_reads; g_sum_xas += g_telem.frame_xa_sectors;",
-              "   if (g_tlog && f_us > 22500 && g_frame_no > 30) {",
-              "      uint32_t fps_x10 = (f_us > 0) ? (10000000U / f_us) : 0;",
-              "      fprintf(g_tlog, \"  [SLOW_FRAME #%u] %u.%u fps (%u.%u ms) | cpu=%u gpu=%u feed=%u cd=%u us | gpu_w=%u(c:%u) | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samp=%u xa=%u light=%d\\n\",",
-              "         g_frame_no, fps_x10 / 10, fps_x10 % 10, f_us / 1000, (f_us % 1000) / 100,",
-              "         cpu_us, g_telem.frame_gpu_us, g_telem.frame_feed_us, g_telem.frame_cd_us,",
-              "         g_telem.frame_gpu_Verify_words, g_telem.frame_gpu_calls,",
-              "         g_telem.frame_cd_reads, g_telem.last_cd_lba, g_telem.frame_xa_sectors,",
-              "         g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, pl_rearmed_cbs.gpu_unai.lighting);",
-              "      fflush(g_tlog);",
-              "   }",
-              "   long elapsed_us = (f_t1.tv_sec - g_sec_tv.tv_sec) * 1000000L + (f_t1.tv_usec - g_sec_tv.tv_usec);",
-              "   if (elapsed_us >= 1000000L && g_sec_frames > 0) {",
-              "      if (g_tlog) {",
-              "         uint32_t fps_x10 = (uint32_t)((g_sec_frames * 10000000ULL) / (uint32_t)elapsed_us);",
-              "         uint32_t min_x10 = (g_sec_max_us > 0) ? (10000000U / g_sec_max_us) : 0;",
-              "         fprintf(g_tlog, \"[1S f=%u ID=%s] %u.%u fps | min %u.%u fps (%u.%u ms) | avg_us: cpu=%u gpu=%u feed=%u cd=%u | gpu_w=%u(c:%u) | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samp=%u xa=%u light=%d\\n\",",
-              "            g_frame_no, CdromId[0] ? CdromId : \"none\", fps_x10 / 10, fps_x10 % 10, min_x10 / 10, min_x10 % 10, g_sec_max_us / 1000, (g_sec_max_us % 1000) / 100,",
-              "            g_sum_cpu / g_sec_frames, g_sum_gpu / g_sec_frames, g_sum_feed / g_sec_frames, g_sum_cd / g_sec_frames,",
-              "            g_sum_gwords / g_sec_frames, g_sum_gcalls / g_sec_frames, g_sum_cdr, g_telem.last_cd_lba, g_sum_xas,",
+          new_retro_run = "\n".join([
+              "static void telem_step_frame(void) {",
+              "   static uint32_t sec_frames = 0, sec_max_us = 0;",
+              "   static uint32_t sum_cpu = 0, sum_gpu = 0, sum_spu = 0, sum_feed = 0, sum_cd = 0;",
+              "   static uint32_t sum_gwords = 0, sum_gcalls = 0, sum_cdr = 0, sum_xas = 0;",
+              "   struct timeval now_tv;",
+              "   gettimeofday(&now_tv, NULL);",
+              "   if (g_prev_f_tv.tv_sec != 0) {",
+              "      g_frame_no++;",
+              "      uint32_t f_us = (uint32_t)((now_tv.tv_sec - g_prev_f_tv.tv_sec) * 1000000L + (now_tv.tv_usec - g_prev_f_tv.tv_usec));",
+              "      uint32_t sub_us = g_telem.frame_gpu_us + g_telem.frame_spu_us + g_telem.frame_feed_us + g_telem.frame_cd_us;",
+              "      uint32_t cpu_us = (f_us > sub_us) ? (f_us - sub_us) : 0;",
+              "      sec_frames++;",
+              "      if (f_us > sec_max_us) sec_max_us = f_us;",
+              "      sum_cpu += cpu_us; sum_gpu += g_telem.frame_gpu_us; sum_spu += g_telem.frame_spu_us;",
+              "      sum_feed += g_telem.frame_feed_us; sum_cd += g_telem.frame_cd_us;",
+              "      sum_gwords += g_telem.frame_gpu_words; sum_gcalls += g_telem.frame_gpu_calls;",
+              "      sum_cdr += g_telem.frame_cd_reads; sum_xas += g_telem.frame_xa_sectors;",
+              "      if (g_tlog && (g_frame_no == 1 || (f_us > 22500 && g_frame_no > 30))) {",
+              "         uint32_t fps_x10 = (f_us > 0) ? (10000000U / f_us) : 0;",
+              "         fprintf(g_tlog, \"  [FRAME #%u] %u.%u fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | gpu_w=%u(c:%u) | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samp=%u xa=%u light=%d\\n\",",
+              "            g_frame_no, fps_x10 / 10, fps_x10 % 10, f_us / 1000, (f_us % 1000) / 100,",
+              "            cpu_us, g_telem.frame_gpu_us, g_telem.frame_spu_us, g_telem.frame_feed_us, g_telem.frame_cd_us,",
+              "            g_telem.frame_gpu_words, g_telem.frame_gpu_calls,",
+              "            g_telem.frame_cd_reads, g_telem.last_cd_lba, g_telem.frame_xa_sectors,",
               "            g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, pl_rearmed_cbs.gpu_unai.lighting);",
               "         fflush(g_tlog);",
               "      }",
-              "      g_sec_tv = f_t1; g_sec_frames = 0; g_sec_max_us = 0;",
-              "      g_sum_cpu = g_sum_gpu = g_sum_feed = g_sum_cd = 0;",
-              "      g_sum_gwords = g_sum_gcalls = g_sum_cdr = g_sum_xas = 0;",
+              "      long elapsed_us = (now_tv.tv_sec - g_sec_tv.tv_sec) * 1000000L + (now_tv.tv_usec - g_sec_tv.tv_usec);",
+              "      if (elapsed_us >= 1000000L && sec_frames > 0) {",
+              "         if (g_tlog) {",
+              "            uint32_t fps_x10 = (uint32_t)((sec_frames * 10000000ULL) / (uint32_t)elapsed_us);",
+              "            uint32_t min_x10 = (sec_max_us > 0) ? (10000000U / sec_max_us) : 0;",
+              "            fprintf(g_tlog, \"[1S f=%u ID=%s] %u.%u fps | min %u.%u fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | gpu_w=%u(c:%u) | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samp=%u xa=%u light=%d\\n\",",
+              "               g_frame_no, CdromId[0] ? CdromId : \"none\", fps_x10 / 10, fps_x10 % 10, min_x10 / 10, min_x10 % 10, sec_max_us / 1000, (sec_max_us % 1000) / 100,",
+              "               sum_cpu / sec_frames, sum_gpu / sec_frames, sum_spu / sec_frames, sum_feed / sec_frames, sum_cd / sec_frames,",
+              "               sum_gwords / sec_frames, sum_gcalls / sec_frames, sum_cdr, g_telem.last_cd_lba, sum_xas,",
+              "               g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, pl_rearmed_cbs.gpu_unai.lighting);",
+              "            fflush(g_tlog);",
+              "         }",
+              "         g_sec_tv = now_tv; sec_frames = 0; sec_max_us = 0;",
+              "         sum_cpu = sum_gpu = sum_spu = sum_feed = sum_cd = 0;",
+              "         sum_gwords = sum_gcalls = sum_cdr = sum_xas = 0;",
+              "      }",
+              "   } else {",
+              "      g_sec_tv = now_tv;",
+              "      sec_frames = 0; sec_max_us = 0;",
+              "      sum_cpu = sum_gpu = sum_spu = sum_feed = sum_cd = 0;",
+              "      sum_gwords = sum_gcalls = sum_cdr = sum_xas = 0;",
               "   }",
-              "}"
+              "   g_prev_f_tv = now_tv;",
+              "   g_telem.frame_cd_reads = 0; g_telem.frame_cd_us = 0; g_telem.frame_xa_sectors = 0;",
+              "   g_telem.frame_gpu_us = 0; g_telem.frame_gpu_words = 0; g_telem.frame_gpu_calls = 0;",
+              "   g_telem.frame_spu_us = 0; g_telem.frame_feed_us = 0;",
+              "}",
+              orig_retro_run,
+              "   telem_step_frame();"
           ])
 
           libretro_c = (
               libretro_c.replace(target_load_game, new_load_game, 1)
                         .replace(target_lighting_block, new_lighting_block, 1)
-                        .replace(orig_exec, new_exec, 1)
+                        .replace(orig_retro_run, new_retro_run, 1)
           )
 
           with open("frontend/libretro.c", "w") as f:
               f.write(libretro_c)
-          print("SUCCESS 5: Patched frontend/libretro.c with pure integer /tmp/pcsx_telemetry.log writer!")
+          print("SUCCESS 5: Patched frontend/libretro.c with /tmp/pcsx_telemetry.log writer!")
           EOF
 
           python3 patch_v40.py | tee ../build_v40_report.txt
@@ -423,7 +444,7 @@ jobs:
           sed -i 's/-shared/-shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc/g' Makefile
 
           echo "=== VERIFIED GIT DIFF FOR V40 ===" >> ../build_v40_report.txt
-          git diff Makefile frontend/libretro.c libpcsxcore/cdrom.c libpcsxcore/cdriso.c plugins/dfsound/spu.c plugins/gpulib/gpu.c >> ../build_v40_report.txt
+          git diff Makefile frontend/libretro.c libpcsxcore/cdrom.c libpcsxcore/cdriso.c plugins/dfsound/spu.c plugins/gpu_unai/gpulib_if.cpp >> ../build_v40_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container
         run: |
