@@ -10,45 +10,33 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Clone Exact V39 Base Commit & libchdr
+      - name: Clone Exact V39 Base Commit & Merge libchdr
         run: |
-          rm -rf pcsx_src
+          rm -rf pcsx_src /tmp/zlib-1.2.11
           git clone https://github.com/libretro/pcsx_rearmed.git pcsx_src
           cd pcsx_src
 
-          python3 - << 'EOF'
-          import subprocess
+          git checkout -f 6087d7e75519f00764da18aebd2335d45a266944
 
-          commits = subprocess.check_output(
-              ["git", "log", "--all", "--format=%H", "--",
-               "Makefile", "frontend/libretro.c", "libpcsxcore/cdriso.c",
-               "libpcsxcore/cdrom.c", "plugins/dfsound/spu.c", "plugins/gpu_unai/gpulib_if.cpp"]
-          ).decode().splitlines()
+          # Preserve zlib-1.2.11 from 6087d7e7 before checking out newer libchdr
+          cp -r deps/libchdr/deps/zlib-1.2.11 /tmp/zlib-1.2.11
 
-          target = None
-          for c in commits:
-              try:
-                  mk = subprocess.check_output(["git", "rev-parse", f"{c}:Makefile"], stderr=subprocess.DEVNULL).decode().strip()
-                  if not mk.startswith("80d129ec"):
-                      continue
-                  lr = subprocess.check_output(["git", "rev-parse", f"{c}:frontend/libretro.c"], stderr=subprocess.DEVNULL).decode().strip()
-                  sp = subprocess.check_output(["git", "rev-parse", f"{c}:plugins/dfsound/spu.c"], stderr=subprocess.DEVNULL).decode().strip()
-                  if lr.startswith("33f2a42d") and sp.startswith("e1b8a40c"):
-                      target = c
-                      break
-              except Exception:
-                  pass
-
-          assert target, "Could not locate V39 base commit"
-          print(f"Found exact V39 base commit: {target}")
-          subprocess.check_call(["git", "checkout", "-f", target])
-          EOF
-
-          git submodule update --init --recursive
           rm -rf deps/libchdr
           git clone https://github.com/rtissera/libchdr.git deps/libchdr
           cd deps/libchdr
           git checkout -f 9ccd3a78e239246ee6e1166e1be82ab0ff0dcddb
+          cd ../..
+
+          # Restore zlib-1.2.11 and create lzma real include dir to match V39 layout
+          cp -r /tmp/zlib-1.2.11 deps/libchdr/deps/zlib-1.2.11
+          mkdir -p deps/libchdr/deps/lzma-26.02/include/real
+
+          # Verify key CHD/Zstd/LZMA/Zlib source files exist before patching
+          test -f deps/libchdr/deps/zlib-1.2.11/adler32.c
+          test -f deps/libchdr/deps/lzma-26.02/src/LzmaDec.c
+          test -f deps/libchdr/deps/zstd-1.5.7/zstddeclib.c
+          test -f deps/libchdr/src/libchdr_chd.c
+          echo "Verified all libchdr, Zstd, LZMA, and Zlib source files!"
 
       - name: Apply V39 Patches + V41 Audio Cushion Stretcher
         run: |
@@ -163,7 +151,7 @@ jobs:
               f.write(telem_h)
           log_msg("SUCCESS 1A: Created include/pcsx_telemetry.h!")
 
-          # 2. Patch plugins/dfsound/spu.c (V39 base + V41 Post-Mix Audio Cushion Stretcher)
+          # 2. Patch plugins/dfsound/spu.c (V39 telemetry + V41 Post-Mix Audio Cushion Stretcher)
           with open("plugins/dfsound/spu.c", "r") as f:
               spu = f.read()
 
@@ -218,7 +206,7 @@ jobs:
 
             int n_out = n_in;
             if (n_in > 0) {
-             uint32_t nom_us = ((uint32_t)n_in * 1000000U) / 44100U;
+             uint32_t nom_us = ((uint32_t)n_in * 10000U) / 441U;
              uint32_t emu_us = nom_us;
              if (after_feed_tv.tv_sec != 0) {
               long d_us = (before_feed_tv.tv_sec - after_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - after_feed_tv.tv_usec);
@@ -248,7 +236,7 @@ jobs:
                eff_us = (avg_emu_us * 5U + cl_cur * 3U) >> 3;
               }
               if (eff_us < nom_us) eff_us = nom_us;
-              n_out = (int)(((uint64_t)eff_us * 44100ULL) / 1000000ULL);
+              n_out = (int)((eff_us * 441U) / 10000U);
 
               if (g_refill_frames > 0) {
                n_out += 88;
@@ -523,12 +511,17 @@ jobs:
 
           git diff >> ../build_v41_report.txt
 
-      - name: Compile Inside Ubuntu 18.04 Container (Exact V39 Toolchain & Flags)
+      - name: Compile Inside Ubuntu 18.04 Container (Exact V39 Toolchain & Exported Flags)
         run: |
           docker run --rm -v "$PWD:/work" -w /work/pcsx_src ubuntu:18.04 bash -c '
-            apt-get update &&
-            apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi make &&
-            OPT_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG" &&
+            set -e
+            set -o pipefail
+            apt-get update
+            apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi make
+            OPT_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -funroll-loops -fpeel-loops -ftracer -fno-tree-vectorize -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fstrict-aliasing -fgcse-sm -fgcse-las -fipa-pta -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
+            export CFLAGS="$OPT_FLAGS"
+            export CXXFLAGS="$OPT_FLAGS"
+            export LDFLAGS="-Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc"
             make -f Makefile.libretro \
               platform=unix \
               ARCH=arm \
@@ -540,11 +533,8 @@ jobs:
               HAVE_CHD=1 \
               HAVE_NEON=0 \
               HAVE_NEON_ASM=0 \
-              CFLAGS="$OPT_FLAGS" \
-              CXXFLAGS="$OPT_FLAGS" \
-              LDFLAGS="-Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc" \
-              -j$(nproc) > ../build_v41.log 2>&1 &&
-            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so &&
+              -j$(nproc) 2>&1 | tee ../build_v41.log
+            cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
             ls -lh ../pcsx_rearmed_libretro.so >> ../build_v41_report.txt
           '
           ls -lh pcsx_rearmed_libretro.so build_v41.log build_v41_report.txt
