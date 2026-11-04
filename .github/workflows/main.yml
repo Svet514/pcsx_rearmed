@@ -36,6 +36,7 @@ jobs:
           cd pcsx_src
           python3 - << 'EOF'
           import os
+          import re
 
           report_lines = []
           def log_msg(msg):
@@ -323,8 +324,8 @@ jobs:
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
-          assert "info->timing.sample_rate = 44100.0;" in lr, "Could not find info->timing.sample_rate in libretro.c"
-          lr = lr.replace("info->timing.sample_rate = 44100.0;", "info->timing.sample_rate = 47255.0;", 1)
+          lr, sr_count = re.subn(r'(sample_rate\s*=\s*)44100(\.0)?', r'\g<1>47255.0', lr)
+          assert sr_count >= 1, "Could not find sample_rate = 44100 in frontend/libretro.c"
 
           old_load = """static void update_variables(bool in_flight);
           bool retro_load_game(const struct retro_game_info *info)
@@ -442,7 +443,7 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 5: Patched frontend/libretro.c (sample_rate=47255.0 for 50FPS I2S sync + Dora/102 menu lighting)!")
+          log_msg(f"SUCCESS 5: Patched frontend/libretro.c ({sr_count} sample_rate occurrence(s) set to 47255.0 + Dora/102 menu lighting)!")
 
           with open("../build_v46_report.txt", "w") as rf:
               for line in report_lines:
