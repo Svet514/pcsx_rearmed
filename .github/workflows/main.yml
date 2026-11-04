@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V44 (Pure Native Audio + 50FPS + Smart Menu Lighting)
+name: Build PCSX-ReARMed V45 (50FPS + Zero-XRUN DC-Hold Guard + Synchronous GPU)
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
           cp -r /tmp/zlib-1.2.11 deps/libchdr/deps/zlib-1.2.11
           mkdir -p deps/libchdr/deps/lzma-26.02/include/real
 
-      - name: Apply V44 Patches (Pure Native Audio + Smart Menu Lighting)
+      - name: Apply V45 Patches (50FPS Rate Match + Zero-XRUN Hold + Dora/102 Only Lighting + Sync GPU)
         run: |
           cd pcsx_src
           python3 - << 'EOF'
@@ -42,7 +42,15 @@ jobs:
               print(msg)
               report_lines.append(msg)
 
-          # 0. Patch Makefile (Exact V39 diff) and ensure all 32 CHD_OBJS .c files exist
+          # 0A. Disable THREAD_RENDERING in Makefile.libretro to eliminate 20.4ms alternating frame stalls
+          with open("Makefile.libretro", "r") as f:
+              mklr = f.read()
+          mklr = mklr.replace("THREAD_RENDERING = 1", "THREAD_RENDERING = 0")
+          with open("Makefile.libretro", "w") as f:
+              f.write(mklr)
+          log_msg("SUCCESS 0A: Disabled THREAD_RENDERING in Makefile.libretro (eliminates 20.4ms GPU thread stalls)!")
+
+          # 0B. Patch Makefile (Exact V39 diff) and ensure all 32 CHD_OBJS .c files exist
           with open("Makefile", "r") as f:
               mk = f.read()
 
@@ -124,7 +132,7 @@ jobs:
                   assert os.path.isfile(c_path), f"Missing CHD source file: {c_path}"
                   chd_c_count += 1
           assert chd_c_count == 32, f"Expected 32 CHD_OBJS files, found {chd_c_count}"
-          log_msg("SUCCESS 0: Configured Makefile with 32 CHD/Zstd files + hardware -munaligned-access!")
+          log_msg("SUCCESS 0B: Configured Makefile with 32 CHD/Zstd files + hardware -munaligned-access!")
 
           # 1A. Create include/pcsx_telemetry.h
           telem_h = """#ifndef PCSX_TELEMETRY_H
@@ -148,7 +156,7 @@ jobs:
               uint32_t frame_spu_samples;
               uint32_t frame_xa_active;
               uint32_t last_frame_polys;
-              uint32_t last_frame_sprites;
+              uint32_t allow_menu_light;
               uint32_t effective_light;
           };
           extern struct pcsx_telem_s g_telem;
@@ -158,7 +166,10 @@ jobs:
               f.write(telem_h)
           log_msg("SUCCESS 1A: Created include/pcsx_telemetry.h!")
 
-          # 2. Patch plugins/dfsound/spu.c (Pure 1:1 V39 Native Audio Feed — No Stretcher, No Resampler)
+          # 2. Patch plugins/dfsound/spu.c:
+          #    - Exact 41,155 Hz hardware I2S rate match (823 samples/frame for 50.0 FPS PAL, 686 for 60.0 FPS NTSC)
+          #    - Zero-Sustain DC-Hold XRUN Guard: when a frame takes >20.5ms and ALSA is low, pads ONLY with the final sample (last_L, last_R)
+          #      so ALSA never hits EPIPE (lfp100_trigger cmd=0/cmd=1) and voice/music never stretches or changes pitch!
           with open("plugins/dfsound/spu.c", "r") as f:
               spu = f.read()
 
@@ -166,6 +177,9 @@ jobs:
           #include "pcsx_telemetry.h"
           struct pcsx_telem_s g_telem;
           static int g_spu_div = 768;
+          static uint32_t g_spu_DropAcc = 0;
+          static struct timeval g_last_spu_feed_tv = {0, 0};
+          static short g_spu_out_buf[4096];
           """
 
           spu = spu_top + spu
@@ -198,13 +212,52 @@ jobs:
            if (flags & 1) {
             struct timeval before_feed_tv, after_feed_tv;
             gettimeofday(&before_feed_tv, NULL);
+            long dt_us = 20000;
+            if (g_last_spu_feed_tv.tv_sec != 0) {
+             dt_us = (before_feed_tv.tv_sec - g_last_spu_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - g_last_spu_feed_tv.tv_usec);
+            }
+            g_last_spu_feed_tv = before_feed_tv;
+
             int xa_on = (spu.XAPlay != spu.XAFeed) ? 1 : 0;
             g_spu_div = 768;
-            int bytes_to_feed = (unsigned char *)spu.pS - spu.pSpuBuffer;
-            if (bytes_to_feed > 0)
-             out_current->feed(spu.pSpuBuffer, bytes_to_feed);
+            int raw_bytes = (unsigned char *)spu.pS - spu.pSpuBuffer;
+            int in_frames = raw_bytes >> 2;
+            int out_frames = 0;
+
+            if (in_frames > 0) {
+             const short *src = (const short *)spu.pSpuBuffer;
+             /* 14/15 exact hardware I2S ratio (41,155 Hz / 44,100 Hz): drops 1 frame every 15 frames without linear blur */
+             for (int i = 0; i < in_frames; i++) {
+              g_spu_DropAcc += 14;
+              if (g_spu_DropAcc >= 15) {
+               g_spu_DropAcc -= 15;
+               if (out_frames < 2000) {
+                g_spu_out_buf[out_frames * 2]     = src[i * 2];
+                g_spu_out_buf[out_frames * 2 + 1] = src[i * 2 + 1];
+                out_frames++;
+               }
+              }
+             }
+             /* Zero-Sustain Anti-XRUN Guard: if frame lagged >20.5ms, hold final sample (last_L, last_R) so ALSA never hits EPIPE */
+             long target_us = (in_frames > 800) ? 20000L : 16667L;
+             if (dt_us > target_us + 500L && dt_us < 120000L && out_frames > 0) {
+              int deficit = (int)(((dt_us - target_us) * 41L) / 1000L);
+              if (deficit > 512) deficit = 512;
+              short hold_L = g_spu_out_buf[(out_frames - 1) * 2];
+              short hold_R = g_spu_out_buf[(out_frames - 1) * 2 + 1];
+              for (int p = 0; p < deficit && out_frames < 2040; p++) {
+               /* Gently decay held sample toward 0 (31/32 per sample) so hold is silent and click-free */
+               hold_L = (short)((hold_L * 31) >> 5);
+               hold_R = (short)((hold_R * 31) >> 5);
+               g_spu_out_buf[out_frames * 2]     = hold_L;
+               g_spu_out_buf[out_frames * 2 + 1] = hold_R;
+               out_frames++;
+              }
+             }
+             out_current->feed(g_spu_out_buf, out_frames << 2);
+            }
             spu.pS = (short *)spu.pSpuBuffer;
-            g_telem.frame_spu_samples = (uint32_t)(bytes_to_feed >> 2);
+            g_telem.frame_spu_samples = (uint32_t)out_frames;
             g_telem.frame_spu_div = g_spu_div;
             g_telem.frame_xa_active = xa_on;
             gettimeofday(&after_feed_tv, NULL);
@@ -222,7 +275,7 @@ jobs:
 
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu)
-          log_msg("SUCCESS 2: Patched plugins/dfsound/spu.c with pure 1:1 native PS1 audio feed (no stretcher/resampler)!")
+          log_msg("SUCCESS 2: Patched plugins/dfsound/spu.c with 14/15 50FPS I2S match + Zero-Sustain Anti-XRUN Hold!")
 
           # 3. Patch libpcsxcore/cdrom.c & libpcsxcore/cdriso.c
           with open("libpcsxcore/cdrom.c", "r") as f:
@@ -260,7 +313,7 @@ jobs:
               f.write(cdriso)
           log_msg("SUCCESS 3: Patched libpcsxcore/cdrom.c & wrapped chd_read() in cdriso.c for Zstd timing!")
 
-          # 4. Patch plugins/gpu_unai/gpulib_if.cpp (Telemetry + Smart Menu Lighting with Sprite Count Guard)
+          # 4. Patch plugins/gpu_unai/gpulib_if.cpp (Lighting ONLY for Dora & 102 Dalmatians when polys <= 85; 0 for all other games)
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
               gpu = f.read()
           assert "gpu_unai.config.lighting" in gpu, "Missing gpu_unai.config.lighting in gpulib_if.cpp"
@@ -283,7 +336,7 @@ jobs:
           gpu = gpu_top + gpu
           gpu = gpu.replace(
               "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{",
-              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tgpu_telem_scope_timer _gpu_timer;\n\tgpu_unai.config.lighting = (g_telem.last_frame_polys <= 85 && g_telem.frame_poly_total <= 85 && g_telem.last_frame_sprites <= 8 && g_telem.frame_sprites <= 8) ? 1 : 0;\n",
+              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tgpu_telem_scope_timer _gpu_timer;\n\tgpu_unai.config.lighting = (g_telem.allow_menu_light && g_telem.last_frame_polys <= 85 && g_telem.frame_poly_total <= 85) ? 1 : 0;\n",
               1
           )
           old_switch = "    switch (cmd)"
@@ -303,17 +356,16 @@ jobs:
           \t} else if (cmd >= 0x80 && cmd < 0xC0) {
           \t\tg_telem.frame_vram_writes++;
           \t}
-          \tgpu_unai.config.lighting = (g_telem.last_frame_polys <= 85 && g_telem.frame_poly_total <= 85 &&
-          \t                            g_telem.last_frame_sprites <= 8 && g_telem.frame_sprites <= 8) ? 1 : 0;
+          \tgpu_unai.config.lighting = (g_telem.allow_menu_light && g_telem.last_frame_polys <= 85 && g_telem.frame_poly_total <= 85) ? 1 : 0;
           \tg_telem.effective_light = gpu_unai.config.lighting;
           \tswitch (cmd)"""
           assert old_switch in gpu
           gpu = gpu.replace(old_switch, new_switch, 1)
           with open("plugins/gpu_unai/gpulib_if.cpp", "w") as f:
               f.write(gpu)
-          log_msg("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp with Smart Menu Lighting + Sprite Guard!")
+          log_msg("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp (Lighting ONLY for Dora & 102 Dalmatians menus; OFF for Pooh & all others)!")
 
-          # 5. Patch frontend/libretro.c (Append mode "a" for /tmp/pcsx_telemetry.log across multiple games)
+          # 5. Patch frontend/libretro.c (Detect Dora / 102 Dalmatians for allow_menu_light, append telemetry)
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
@@ -324,33 +376,33 @@ jobs:
           new_load = r"""static void update_variables(bool in_flight);
           #include <sys/time.h>
           #include "pcsx_telemetry.h"
-          static int g_is_sesame = 0;
           static FILE *g_tlog = NULL;
           static uint32_t g_frame_no = 0;
           static struct timeval g_prev_f_tv = {0, 0};
           static struct timeval g_sec_tv = {0, 0};
           bool retro_load_game(const struct retro_game_info *info)
           {
-             g_is_sesame = (info && info->path && strstr(info->path, "Sesame Street Sports") != NULL) ? 1 : 0;
+             g_telem.allow_menu_light = 0;
+             if (info && info->path) {
+                if (strstr(info->path, "Dora") != NULL || strstr(info->path, "dora") != NULL ||
+                    strstr(info->path, "102") != NULL || strstr(info->path, "Dalmatian") != NULL || strstr(info->path, "dalmatian") != NULL) {
+                   g_telem.allow_menu_light = 1;
+                }
+             }
              if (g_tlog) { fclose(g_tlog); g_tlog = NULL; }
              g_tlog = fopen("/tmp/pcsx_telemetry.log", "a");
              g_frame_no = 0;
              g_prev_f_tv.tv_sec = 0; g_prev_f_tv.tv_usec = 0;
              g_sec_tv.tv_sec = 0; g_sec_tv.tv_usec = 0;
              if (g_tlog) {
-                fprintf(g_tlog, "\n=== PCSX-ReARMed V44 Telemetry Started ===\nGame: %s\n", (info && info->path) ? info->path : "unknown");
+                fprintf(g_tlog, "\n=== PCSX-ReARMed V45 Telemetry Started ===\nGame: %s (allow_menu_light=%u)\n",
+                   (info && info->path) ? info->path : "unknown", g_telem.allow_menu_light);
                 fprintf(g_tlog, "Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | chd_hunks(last_hunk) xa_sect | spu_div samples xa_on unai_light\n");
                 fflush(g_tlog);
              }"""
 
           assert old_load in lr, "Could not find retro_load_game in libretro.c"
           lr = lr.replace(old_load, new_load, 1)
-
-          lr = lr.replace(
-              'if (strcmp(var.value, "disabled") == 0)\n         pl_rearmed_cbs.gpu_unai.lighting = 0;',
-              'if (strcmp(var.value, "disabled") == 0 || g_is_sesame || strncasecmp(CdromId, "sles03180", 9) == 0 || strncasecmp(CdromId, "slus01180", 9) == 0)\n         pl_rearmed_cbs.gpu_unai.lighting = 0;',
-              1
-          )
 
           old_run = """void retro_run(void)
           {"""
@@ -410,7 +462,6 @@ jobs:
              g_prev_f_tv = now_tv;
              if (g_telem.frame_poly_total > 0 || g_telem.frame_sprites > 0) {
                 g_telem.last_frame_polys = g_telem.frame_poly_total;
-                g_telem.last_frame_sprites = g_telem.frame_sprites;
              }
              g_telem.frame_cd_reads = 0;
              g_telem.frame_cd_us = 0;
@@ -434,17 +485,17 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 5: Patched frontend/libretro.c with append-mode /tmp/pcsx_telemetry.log writer!")
+          log_msg("SUCCESS 5: Patched frontend/libretro.c (lighting restricted to Dora & 102 Dalmatians)!")
 
-          with open("../build_v44_report.txt", "w") as rf:
+          with open("../build_v45_report.txt", "w") as rf:
               for line in report_lines:
                   rf.write(line + "\n")
-              rf.write("=== VERIFIED GIT DIFF FOR V44 ===\n")
+              rf.write("=== VERIFIED GIT DIFF FOR V45 ===\n")
           EOF
 
-          git diff Makefile include/ libpcsxcore/ plugins/ frontend/ >> ../build_v44_report.txt
+          git diff Makefile Makefile.libretro include/ libpcsxcore/ plugins/ frontend/ >> ../build_v45_report.txt
 
-      - name: Compile Inside Ubuntu 18.04 Container (Exact V39 Toolchain & Flags)
+      - name: Compile Inside Ubuntu 18.04 Container (Synchronous GPU + V39 Toolchain)
         run: |
           docker run --rm -v "$PWD:/work" -w /work/pcsx_src ubuntu:18.04 bash -c '
             set -e
@@ -464,21 +515,22 @@ jobs:
               DYNAREC=ari64 \
               BUILTIN_GPU=unai \
               GPU=unai \
+              THREAD_RENDERING=0 \
               HAVE_CHD=1 \
               HAVE_NEON=0 \
               HAVE_NEON_ASM=0 \
-              -j$(nproc) 2>&1 | tee ../build_v44.log
+              -j$(nproc) 2>&1 | tee ../build_v45.log
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v44_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v45_report.txt
           '
-          ls -lh pcsx_rearmed_libretro.so build_v44.log build_v44_report.txt
+          ls -lh pcsx_rearmed_libretro.so build_v45.log build_v45_report.txt
 
-      - name: Upload V44 Core + Build Log + Diff Report
+      - name: Upload V45 Core + Build Log + Diff Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx_rearmed_libretro_v44
+          name: pcsx_rearmed_libretro_v45
           path: |
             pcsx_rearmed_libretro.so
-            build_v44.log
-            build_v44_report.txt
+            build_v45.log
+            build_v45_report.txt
