@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V41 (V39 Base + Post-Mix Audio Stretcher)
+name: Build PCSX-ReARMed V42 (Native Audio + 50FPS + Smart Menu Lighting)
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
           cp -r /tmp/zlib-1.2.11 deps/libchdr/deps/zlib-1.2.11
           mkdir -p deps/libchdr/deps/lzma-26.02/include/real
 
-      - name: Apply V39 Patches + V41 Audio Cushion Stretcher
+      - name: Apply V42 Patches (V39 Audio Restored + Smart Menu Lighting)
         run: |
           cd pcsx_src
           python3 - << 'EOF'
@@ -114,7 +114,6 @@ jobs:
           with open("Makefile", "w") as f:
               f.write(mk)
 
-          # Ensure all 32 .c files in CHD_OBJS exist on disk (create stub .c for inlined codecs)
           chd_c_count = 0
           for tok in new_chd_mk.split():
               if tok.endswith(".o"):
@@ -127,7 +126,7 @@ jobs:
           assert chd_c_count == 32, f"Expected 32 CHD_OBJS files, found {chd_c_count}"
           log_msg("SUCCESS 0: Configured Makefile with 32 CHD/Zstd files + hardware -munaligned-access!")
 
-          # 1A. Create include/pcsx_telemetry.h
+          # 1A. Create include/pcsx_telemetry.h (with last_frame_polys & effective_light for menu lighting)
           telem_h = """#ifndef PCSX_TELEMETRY_H
           #define PCSX_TELEMETRY_H
           #include <stdint.h>
@@ -148,6 +147,8 @@ jobs:
               uint32_t frame_spu_div;
               uint32_t frame_spu_samples;
               uint32_t frame_xa_active;
+              uint32_t last_frame_polys;
+              uint32_t effective_light;
           };
           extern struct pcsx_telem_s g_telem;
           #endif
@@ -156,7 +157,7 @@ jobs:
               f.write(telem_h)
           log_msg("SUCCESS 1A: Created include/pcsx_telemetry.h!")
 
-          # 2. Patch plugins/dfsound/spu.c (V39 telemetry + V41 Post-Mix Audio Cushion Stretcher)
+          # 2. Patch plugins/dfsound/spu.c (Exact V39 unstretched native audio feed + telemetry)
           with open("plugins/dfsound/spu.c", "r") as f:
               spu = f.read()
 
@@ -164,11 +165,6 @@ jobs:
           #include "pcsx_telemetry.h"
           struct pcsx_telem_s g_telem;
           static int g_spu_div = 768;
-          static int16_t g_stretch_buf[2400 * 2];
-          static uint32_t g_emu_hist[8] = {20000, 20000, 20000, 20000, 20000, 20000, 20000, 20000};
-          static int g_hist_idx = 0;
-          static uint32_t g_last_feed_us = 0;
-          static int g_refill_frames = 20;
           """
 
           spu = spu_top + spu
@@ -199,96 +195,19 @@ jobs:
            gettimeofday(&t_spu1, NULL);
            g_telem.frame_spu_us += (t_spu1.tv_sec - t_spu0.tv_sec) * 1000000 + (t_spu1.tv_usec - t_spu0.tv_usec);
            if (flags & 1) {
-            static struct timeval after_feed_tv = {0, 0};
-            struct timeval before_feed_tv;
+            struct timeval before_feed_tv, after_feed_tv;
             gettimeofday(&before_feed_tv, NULL);
             int xa_on = (spu.XAPlay != spu.XAFeed) ? 1 : 0;
             g_spu_div = 768;
-
             int bytes_to_feed = (unsigned char *)spu.pS - spu.pSpuBuffer;
-            int n_in = bytes_to_feed >> 2;
+            out_current->feed(spu.pSpuBuffer, bytes_to_feed);
             spu.pS = (short *)spu.pSpuBuffer;
-
-            int n_out = n_in;
-            if (n_in > 0) {
-             uint32_t nom_us = ((uint32_t)n_in * 10000U) / 441U;
-             uint32_t emu_us = nom_us;
-             if (after_feed_tv.tv_sec != 0) {
-              long d_us = (before_feed_tv.tv_sec - after_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - after_feed_tv.tv_usec);
-              if (d_us > 0) emu_us = (uint32_t)d_us;
-             } else {
-              for (int k = 0; k < 8; k++) g_emu_hist[k] = nom_us;
-              g_refill_frames = 20;
-             }
-
-             if (emu_us > 80000U) {
-              g_refill_frames = 22;
-              for (int k = 0; k < 8; k++) g_emu_hist[k] = nom_us + 3500U;
-             } else {
-              uint32_t cl_emu = (emu_us > 52000U) ? 52000U : emu_us;
-              g_emu_hist[g_hist_idx] = cl_emu;
-              g_hist_idx = (g_hist_idx + 1) & 7;
-             }
-
-             uint32_t sum_emu = 0;
-             for (int k = 0; k < 8; k++) sum_emu += g_emu_hist[k];
-             uint32_t avg_emu_us = sum_emu >> 3;
-
-             if (avg_emu_us > nom_us - 600U || emu_us > nom_us + 1500U || g_last_feed_us < 1600U || g_refill_frames > 0) {
-              uint32_t cl_cur = (emu_us > 52000U) ? 52000U : emu_us;
-              uint32_t eff_us = avg_emu_us;
-              if (cl_cur > avg_emu_us) {
-               eff_us = (avg_emu_us * 5U + cl_cur * 3U) >> 3;
-              }
-              if (eff_us < nom_us) eff_us = nom_us;
-              n_out = (int)((eff_us * 441U) / 10000U);
-
-              if (g_refill_frames > 0) {
-               n_out += 88;
-               g_refill_frames--;
-              } else if (g_last_feed_us < 600U) {
-               n_out += 64;
-              } else if (g_last_feed_us < 1600U) {
-               n_out += 28;
-              }
-              if (n_out < n_in) n_out = n_in;
-              if (n_out > 2300) n_out = 2300;
-             }
-
-             if (n_out == n_in) {
-              out_current->feed(spu.pSpuBuffer, bytes_to_feed);
-             } else {
-              const int16_t *src = (const int16_t *)spu.pSpuBuffer;
-              if (n_in == 1) {
-               for (int i = 0; i < n_out; i++) {
-                g_stretch_buf[i * 2]     = src[0];
-                g_stretch_buf[i * 2 + 1] = src[1];
-               }
-              } else {
-               uint32_t step = ((uint32_t)(n_in - 1) << 16) / (uint32_t)(n_out - 1);
-               uint32_t pos = 0;
-               for (int i = 0; i < n_out - 1; i++) {
-                uint32_t idx = pos >> 16;
-                uint32_t frac = pos & 0xffffU;
-                int32_t l0 = src[idx * 2],     r0 = src[idx * 2 + 1];
-                int32_t l1 = src[idx * 2 + 2], r1 = src[idx * 2 + 3];
-                g_stretch_buf[i * 2]     = (int16_t)(l0 + (((l1 - l0) * (int32_t)frac) >> 16));
-                g_stretch_buf[i * 2 + 1] = (int16_t)(r0 + (((r1 - r0) * (int32_t)frac) >> 16));
-                pos += step;
-               }
-               g_stretch_buf[(n_out - 1) * 2]     = src[(n_in - 1) * 2];
-               g_stretch_buf[(n_out - 1) * 2 + 1] = src[(n_in - 1) * 2 + 1];
-              }
-              out_current->feed(g_stretch_buf, n_out << 2);
-             }
-            }
-            g_telem.frame_spu_samples = n_out;
+            g_telem.frame_spu_samples = bytes_to_feed >> 2;
             g_telem.frame_spu_div = g_spu_div;
             g_telem.frame_xa_active = xa_on;
             gettimeofday(&after_feed_tv, NULL);
             long f_us = (after_feed_tv.tv_sec - before_feed_tv.tv_sec) * 1000000L + (after_feed_tv.tv_usec - before_feed_tv.tv_usec);
-            g_last_feed_us = (f_us > 0) ? (uint32_t)f_us : 0;
-            g_telem.frame_feed_us += g_last_feed_us;"""
+            if (f_us > 0) g_telem.frame_feed_us += (uint32_t)f_us;"""
 
           assert old_spu_async in spu, "Could not find SPUasync block in spu.c"
           spu = spu.replace(old_spu_async, new_spu_async, 1)
@@ -303,7 +222,7 @@ jobs:
 
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu)
-          log_msg("SUCCESS 2: Cleanly patched plugins/dfsound/spu.c (V39 telemetry + V41 Post-Mix Audio Stretcher)!")
+          log_msg("SUCCESS 2: Restored native unstretched SPUasync audio feed in plugins/dfsound/spu.c!")
 
           # 3. Patch libpcsxcore/cdrom.c & libpcsxcore/cdriso.c
           with open("libpcsxcore/cdrom.c", "r") as f:
@@ -341,9 +260,12 @@ jobs:
               f.write(cdriso)
           log_msg("SUCCESS 3: Patched libpcsxcore/cdrom.c & wrapped chd_read() in cdriso.c for Zstd timing!")
 
-          # 4. Patch plugins/gpu_unai/gpulib_if.cpp
+          # 4. Patch plugins/gpu_unai/gpulib_if.cpp (Telemetry + Smart Menu/Sprite Lighting Override)
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
               gpu = f.read()
+          assert "bool lighting = gpu_unai.config.lighting;" in gpu, "Missing lighting var in gpulib_if.cpp"
+          assert "bool FastLighting = gpu_unai.config.fast_lighting;" in gpu, "Missing FastLighting var in gpulib_if.cpp"
+
           gpu_top = """#include <stddef.h>
           #include <sys/time.h>
           extern "C" {
@@ -382,14 +304,20 @@ jobs:
           \t} else if (cmd >= 0x80 && cmd < 0xC0) {
           \t\tg_telem.frame_vram_writes++;
           \t}
+          \tif (!gpu_unai.config.lighting) {
+          \t\tlighting = (cmd >= 0x60 && cmd < 0x80) ||
+          \t\t           (g_telem.last_frame_polys <= 85 && g_telem.frame_poly_total <= 85);
+          \t\tif (lighting) FastLighting = true;
+          \t}
+          \tg_telem.effective_light = lighting ? 1 : 0;
           \tswitch (cmd)"""
           assert old_switch in gpu
           gpu = gpu.replace(old_switch, new_switch, 1)
           with open("plugins/gpu_unai/gpulib_if.cpp", "w") as f:
               f.write(gpu)
-          log_msg("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp with RAII scope timer & polygon/lighting/blending/sprite telemetry!")
+          log_msg("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp with Smart Menu/Sprite Lighting Override!")
 
-          # 5. Patch frontend/libretro.c (Exact V39 /tmp/pcsx_telemetry.log writer)
+          # 5. Patch frontend/libretro.c (V42 /tmp/pcsx_telemetry.log writer + last_frame_polys tracker)
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
@@ -414,7 +342,7 @@ jobs:
              g_prev_f_tv.tv_sec = 0; g_prev_f_tv.tv_usec = 0;
              g_sec_tv.tv_sec = 0; g_sec_tv.tv_usec = 0;
              if (g_tlog) {
-                fprintf(g_tlog, "=== PCSX-ReARMed V41 Telemetry Started ===\nGame: %s\n", (info && info->path) ? info->path : "unknown");
+                fprintf(g_tlog, "=== PCSX-ReARMed V42 Telemetry Started ===\nGame: %s\n", (info && info->path) ? info->path : "unknown");
                 fprintf(g_tlog, "Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | chd_hunks(last_hunk) xa_sect | spu_div xa_on unai_light\n");
                 fflush(g_tlog);
              }"""
@@ -451,26 +379,26 @@ jobs:
                 sum_spr += g_telem.frame_sprites; sum_vram += g_telem.frame_vram_writes;
                 sum_cdr += g_telem.frame_cd_reads; sum_xas += g_telem.frame_xa_sectors;
                 if (g_tlog && f_us > 22500 && g_frame_no > 30) {
-                   fprintf(g_tlog, "  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samples=%u xa=%u light=%d\n",
+                   fprintf(g_tlog, "  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samples=%u xa=%u light=%u\n",
                       g_frame_no, 1000000.0 / (double)f_us, f_us / 1000, (f_us % 1000) / 100,
                       cpu_us, g_telem.frame_gpu_us, g_telem.frame_spu_us, g_telem.frame_feed_us, g_telem.frame_cd_us,
                       g_telem.frame_poly_total, g_telem.frame_poly_light, g_telem.frame_poly_blend, g_telem.frame_poly_tex,
                       g_telem.frame_sprites, g_telem.frame_vram_writes,
                       g_telem.frame_cd_reads, g_telem.last_cd_lba, g_telem.frame_xa_sectors,
-                      g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, pl_rearmed_cbs.gpu_unai.lighting);
+                      g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, g_telem.effective_light);
                 }
                 long elapsed_us = (now_tv.tv_sec - g_sec_tv.tv_sec) * 1000000L + (now_tv.tv_usec - g_sec_tv.tv_usec);
                 if (elapsed_us >= 1000000L && sec_frames > 0) {
                    if (g_tlog) {
                       double fps = (double)sec_frames * 1000000.0 / (double)elapsed_us;
                       double min_fps = (sec_max_us > 0) ? (1000000.0 / (double)sec_max_us) : 0.0;
-                      fprintf(g_tlog, "[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samples=%u xa=%u light=%d\n",
+                      fprintf(g_tlog, "[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | div=%u samples=%u xa=%u light=%u\n",
                          g_frame_no, CdromId[0] ? CdromId : "none", fps, min_fps, sec_max_us / 1000, (sec_max_us % 1000) / 100,
                          (uint32_t)(sum_cpu / sec_frames), (uint32_t)(sum_gpu / sec_frames), (uint32_t)(sum_spu / sec_frames),
                          (uint32_t)(sum_feed / sec_frames), (uint32_t)(sum_cd / sec_frames),
                          sum_ptot / sec_frames, sum_plight / sec_frames, sum_pblend / sec_frames, sum_ptex / sec_frames,
                          sum_spr / sec_frames, sum_vram / sec_frames, sum_cdr, g_telem.last_cd_lba, sum_xas,
-                         g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, pl_rearmed_cbs.gpu_unai.lighting);
+                         g_telem.frame_spu_div, g_telem.frame_spu_samples, g_telem.frame_xa_active, g_telem.effective_light);
                       fflush(g_tlog);
                    }
                    g_sec_tv = now_tv; sec_frames = 0; sec_max_us = 0;
@@ -484,6 +412,7 @@ jobs:
                 sum_ptot = sum_plight = sum_pblend = sum_ptex = sum_spr = sum_vram = sum_cdr = sum_xas = 0;
              }
              g_prev_f_tv = now_tv;
+             g_telem.last_frame_polys = g_telem.frame_poly_total;
              g_telem.frame_cd_reads = 0;
              g_telem.frame_cd_us = 0;
              g_telem.frame_xa_sectors = 0;
@@ -508,13 +437,13 @@ jobs:
               f.write(lr)
           log_msg("SUCCESS 5: Patched frontend/libretro.c with /tmp/pcsx_telemetry.log writer!")
 
-          with open("../build_v41_report.txt", "w") as rf:
+          with open("../build_v42_report.txt", "w") as rf:
               for line in report_lines:
                   rf.write(line + "\n")
-              rf.write("=== VERIFIED GIT DIFF FOR V41 ===\n")
+              rf.write("=== VERIFIED GIT DIFF FOR V42 ===\n")
           EOF
 
-          git diff >> ../build_v41_report.txt
+          git diff >> ../build_v42_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container (Exact V39 Toolchain & Flags)
         run: |
@@ -539,18 +468,18 @@ jobs:
               HAVE_CHD=1 \
               HAVE_NEON=0 \
               HAVE_NEON_ASM=0 \
-              -j$(nproc) 2>&1 | tee ../build_v41.log
+              -j$(nproc) 2>&1 | tee ../build_v42.log
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v41_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v42_report.txt
           '
-          ls -lh pcsx_rearmed_libretro.so build_v41.log build_v41_report.txt
+          ls -lh pcsx_rearmed_libretro.so build_v42.log build_v42_report.txt
 
-      - name: Upload V41 Core + Build Log + Diff Report
+      - name: Upload V42 Core + Build Log + Diff Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx_rearmed_libretro_v41
+          name: pcsx_rearmed_libretro_v42
           path: |
             pcsx_rearmed_libretro.so
-            build_v41.log
-            build_v41_report.txt
+            build_v42.log
+            build_v42_report.txt
