@@ -1,4 +1,8 @@
-name: Build PCSX-ReARMed V43 (Native Audio fixed + 50FPS + Smart Menu Lighting)
+Root-Cause Analysis from Your 5 Attached Files1. Why Max FPS Was Locked to 46.6 FPS (Issue #2) & Why audio_out_rate = "44100" Behaved Like 32000 (Issue #5)Your messages_6.log and pcsx_telemetry_7.log reveal a hardware clock mismatch in the LeapsterGS kernel driver (sound/soc/nexell/nexell-i2s.c):What messages_6.log shows:The NXP3200 audio PLL runs at 147,500,000 Hz (147.5 MHz).   When retroarch.cfg requests audio_out_rate = "44100", the kernel I2S driver logs:   Plaintextlfp100_hw_params: lfp100-hifi rate=44100:1
+nx_i2s_ops_hw_params: rate 32000 changed to 44100:1
+nx_i2s_ops_hw_params: clkdiv=13, clkinv=1
+   Because clkdiv=13 sets a hardware divider of 14 (256fs MCLK), the physical I2S DAC on the LeapsterGS cannot run at 44,100 Hz—it actually runs at:$$\text{True Hardware DAC Rate} = \frac{147,500,000\text{ Hz}}{14 \times 256} = \mathbf{41,155.13\text{ Hz}}$$How pcsx_telemetry_7.log proves this:At 41,155.13 Hz, one 1024-sample ALSA DMA period takes 24.881 ms ($1024 / 41155.13 = 0.024881\text{ s}$, which is 40.2 fps).In pcsx_telemetry_7.log (frames 330–550, when cpu=1.2 ms and gpu=0 ms), every single blocking frame waits in feed for 24.8 ms (40.2 fps).   Because pcsx_rearmed was feeding 882 samples per PAL frame ($44100 / 50$) into a hardware DAC that only consumes 41,155.13 samples/sec (823.1 samples per PAL frame), tinyalsa blocked the emulator for 14–23 ms every frame and mathematically locked the maximum possible framerate to:$$\text{Max Possible PAL FPS} = \frac{41,155.13\text{ samples/sec}}{882\text{ samples/frame}} = \mathbf{46.66\text{ FPS}}$$2. Why Cutscenes & Gameplay Dropped to 38–42 FPS and Crackled in Winnie the Pooh, 102 Dalmatians, and Sesame Street Sports (Issues #3, #4, #5)Two separate things caused the FPS drops and crackling in those three games:ALSA Buffer Jamming During FMV Cutscenes (feed sleeping 10–14 ms on 15–20 ms frames):In pcsx_telemetry_7.log during the Sesame Street Sports intro cutscene (frames 740–1317), actual emulator work (cpu + gpu + spu + cd) was only 6.8 ms to 11.6 ms per frame (capable of 85+ FPS), yet feed slept in tinyalsa for 11.5 ms to 14.8 ms per frame waiting for the 41,155 Hz DAC to drain the extra 882 - 823 = 59 samples/frame.   Whenever an MDEC video frame took 20.7 ms of CPU time (e.g., SLOW_FRAME #902: cpu=20775 us), feed still blocked for another 10,062 us waiting for the 24.88 ms ALSA period boundary, turning a 20.7 ms (48 FPS) frame into a 31.0 ms (32.2 FPS) frame.   264 Hardware ALSA Underruns (lfp100_trigger: cmd=0) During 3D Scenes (messages_6.log):In messages_6.log, the kernel logged lfp100_trigger: lfp100-hifi, cmd=0 -> lfp100_dai_mute -> lfp100_trigger: cmd=1 264 times during your test session. Each cmd=0 stops I2S DMA, writes I2C mute/unmute registers on the LFP100 chip, and restarts DMA—producing an audible pop/crackle.   Why did the buffer underrun during 3D scenes? In Sesame Street Sports (f=1397..3300), the 3D cutscene renders 1,853 polygons on 1 frame (gpu=27.8 ms, cpu=13 ms = 41 ms), followed by 2 empty VBlank frames (poly=0, 3 ms each). Right before that cutscene (f=1372..1374), a 420 ms loading screen drained the ALSA buffer to 0 samples. With 0 cushion in ALSA, every 41 ms 3D render frame drained the buffer completely dry before the two 3 ms frames could refill it.   What V43 Fixes (No Config Changes Needed in retroarch.cfg)You can keep audio_out_rate = "44100" in retroarch.cfg. V43 fixes the rate mismatch and XRUNs directly inside the core:   Exact 44,100 Hz -> 41,155 Hz Hardware Clock Matching (882 -> 823 samples/frame in spu.c):do_samples() continues running at native g_spu_div = 768 (44,100 Hz) so SPU voices and CD-ROM XA audio (FeedXA) decode in 1:1 lockstep.Right before out_current->feed(), V43 resamples the 882 PAL samples (44,100 Hz) to 823 samples (41,155.13 Hz, matching clkdiv=13 on the LeapsterGS 147.5 MHz PLL).Result: 50.0 FPS * 823.1 samples/frame = 41,155 samples/sec—unlocking 50.0 FPS (removing the 46.6 FPS cap), eliminating the 10–14 ms feed stalls during FMV cutscenes, and playing audio at true 1.00x PS1 pitch.Post-Load Cushion Refill + 4-Frame Cycle-Averaged Anti-XRUN Guard (spu.c):Whenever a loading frame exceeds 65 ms (which drains ALSA to 0), V43 gently injects a ~27 ms cushion over the next 20 non-blocking frames (g_last_feed_us < 1200 us) so the buffer has enough reserve to survive a 45 ms 3D render frame without triggering lfp100_trigger: cmd=0.During sustained heavy 3D scenes, V43 averages frame time over a 4-frame rolling window (spanning the [42ms, 3ms, 3ms] render cycle so pitch never wobbles between frames) and only adds anti-XRUN samples when g_last_feed_us < 1200 us (buffer not full). The instant tinyalsa blocks (g_last_feed_us >= 1200 us), it clamps immediately back to 823 samples so it can never cap or slow down FPS.Smart Menu Lighting (Kept from V42) + Ultra-Heavy Scene Assist (> 450 polys) + Multi-Game Telemetry Append ("a"):Keeps the V42 menu lighting logic that worked in Dora and 102 Dalmatians, and opens /tmp/pcsx_telemetry.log in append mode ("a") so all games you test in a session are saved in the log.Complete .github/workflows/build_pcsx.yml (V43)YAMLname: Build PCSX-ReARMed V43 (41155Hz DAC Match + 50FPS Unlock + Smart Lighting)
+
 on:
   workflow_dispatch:
   push:
@@ -9,7 +13,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Clone Exact V43 Base Commit & Merge libchdr
+      - name: Clone Exact V39 Base Commit & Merge libchdr
         run: |
           rm -rf pcsx_src /tmp/zlib-1.2.11
           git clone https://github.com/libretro/pcsx_rearmed.git pcsx_src
@@ -545,7 +549,7 @@ jobs:
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
             ls -lh ../pcsx_rearmed_libretro.so >> ../build_v42_report.txt
           '
-          ls -lh pcsx_rearmed_libretro.so build_v43.log build_v42_report.txt
+          ls -lh pcsx_rearmed_libretro.so build_v42.log build_v42_report.txt
 
       - name: Upload V42 Core + Build Log + Diff Report
         if: always()
@@ -554,5 +558,5 @@ jobs:
           name: pcsx_rearmed_libretro_v42
           path: |
             pcsx_rearmed_libretro.so
-            build_v43.log
-            build_v43_report.txt
+            build_v42.log
+            build_v42_report.txt
