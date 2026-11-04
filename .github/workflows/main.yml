@@ -263,8 +263,7 @@ jobs:
           # 4. Patch plugins/gpu_unai/gpulib_if.cpp (Telemetry + Smart Menu/Sprite Lighting Override)
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
               gpu = f.read()
-          assert "bool lighting = gpu_unai.config.lighting;" in gpu, "Missing lighting var in gpulib_if.cpp"
-          assert "bool FastLighting = gpu_unai.config.fast_lighting;" in gpu, "Missing FastLighting var in gpulib_if.cpp"
+          assert "gpu_unai.config.lighting" in gpu, "Missing gpu_unai.config.lighting in gpulib_if.cpp"
 
           gpu_top = """#include <stddef.h>
           #include <sys/time.h>
@@ -284,7 +283,7 @@ jobs:
           gpu = gpu_top + gpu
           gpu = gpu.replace(
               "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{",
-              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tgpu_telem_scope_timer _gpu_timer;\n",
+              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tgpu_telem_scope_timer _gpu_timer;\n\tgpu_unai.config.lighting = (g_telem.last_frame_polys <= 85 && g_telem.frame_poly_total <= 85) ? 1 : 0;\n",
               1
           )
           old_switch = "    switch (cmd)"
@@ -304,12 +303,9 @@ jobs:
           \t} else if (cmd >= 0x80 && cmd < 0xC0) {
           \t\tg_telem.frame_vram_writes++;
           \t}
-          \tif (!gpu_unai.config.lighting) {
-          \t\tlighting = (cmd >= 0x60 && cmd < 0x80) ||
-          \t\t           (g_telem.last_frame_polys <= 85 && g_telem.frame_poly_total <= 85);
-          \t\tif (lighting) FastLighting = true;
-          \t}
-          \tg_telem.effective_light = lighting ? 1 : 0;
+          \tgpu_unai.config.lighting = ((cmd >= 0x60 && cmd < 0x80) ||
+          \t                            (g_telem.last_frame_polys <= 85 && g_telem.frame_poly_total <= 85)) ? 1 : 0;
+          \tg_telem.effective_light = gpu_unai.config.lighting;
           \tswitch (cmd)"""
           assert old_switch in gpu
           gpu = gpu.replace(old_switch, new_switch, 1)
@@ -412,7 +408,8 @@ jobs:
                 sum_ptot = sum_plight = sum_pblend = sum_ptex = sum_spr = sum_vram = sum_cdr = sum_xas = 0;
              }
              g_prev_f_tv = now_tv;
-             g_telem.last_frame_polys = g_telem.frame_poly_total;
+             if (g_telem.frame_poly_total > 0 || g_telem.frame_sprites > 0)
+                g_telem.last_frame_polys = g_telem.frame_poly_total;
              g_telem.frame_cd_reads = 0;
              g_telem.frame_cd_us = 0;
              g_telem.frame_xa_sectors = 0;
@@ -443,7 +440,7 @@ jobs:
               rf.write("=== VERIFIED GIT DIFF FOR V42 ===\n")
           EOF
 
-          git diff >> ../build_v42_report.txt
+          git diff Makefile include/ libpcsxcore/ plugins/ frontend/ >> ../build_v42_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container (Exact V39 Toolchain & Flags)
         run: |
