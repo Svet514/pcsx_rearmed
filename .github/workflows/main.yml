@@ -36,6 +36,7 @@ jobs:
           cd pcsx_src
           python3 - << 'EOF'
           import os
+          import re
 
           report_lines = []
           def log_msg(msg):
@@ -315,24 +316,30 @@ jobs:
               f.write(gpu)
           log_msg("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp (100% pure V48 GPU + intact water blending)!")
 
-          # 5A. Lock CYCLE_MULT_DEFAULT = 265 in libpcsxcore/new_dynarec/new_dynarec.h
-          with open("libpcsxcore/new_dynarec/new_dynarec.h", "r") as f:
-              ndh = f.read()
-          assert "#define CYCLE_MULT_DEFAULT 175" in ndh, "Could not find CYCLE_MULT_DEFAULT in new_dynarec.h"
-          ndh = ndh.replace("#define CYCLE_MULT_DEFAULT 175", "#define CYCLE_MULT_DEFAULT 265", 1)
-          with open("libpcsxcore/new_dynarec/new_dynarec.h", "w") as f:
-              f.write(ndh)
-          log_msg("SUCCESS 5A: Locked CYCLE_MULT_DEFAULT = 265 in libpcsxcore/new_dynarec/new_dynarec.h!")
+          # 5A. Regex-update CYCLE_MULT_DEFAULT across all headers/sources in libpcsxcore/ and frontend/
+          patched_cm_files = []
+          for root_dir in ["libpcsxcore", "frontend", "include"]:
+              for dirpath, _, filenames in os.walk(root_dir):
+                  for fn in filenames:
+                      if fn.endswith((".c", ".h")):
+                          fpath = os.path.join(dirpath, fn)
+                          with open(fpath, "r", errors="ignore") as f:
+                              txt = f.read()
+                          new_txt = re.sub(r'(#define\s+CYCLE_MULT_DEFAULT\s+)\d+', r'\g<1>265', txt)
+                          if new_txt != txt:
+                              with open(fpath, "w") as f:
+                                  f.write(new_txt)
+                              patched_cm_files.append(fpath)
+          log_msg(f"SUCCESS 5A: Updated CYCLE_MULT_DEFAULT to 265 in {patched_cm_files}!")
 
           # 5B. Patch frontend/libretro.c:
-          #     - Lock cycle_multiplier = 265 inside update_variables() AND retro_run() so dynarec compiles all blocks at 265
+          #     - Replace all cycle_multiplier assignments with 265 so update_variables() and retro_load_game() never reset it to 175
           #     - Keep stock 44100.0 Hz sample_rate
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
-          assert "cycle_multiplier = 10000 /" in lr, "Could not find cycle_multiplier assignment in frontend/libretro.c"
-          lr = lr.replace("cycle_multiplier = 10000 / atoi(var.value);", "cycle_multiplier = 265;", 1)
-          lr = lr.replace("cycle_multiplier = CYCLE_MULT_DEFAULT;", "cycle_multiplier = 265;", 1)
+          lr, n_cm_subs = re.subn(r'\bcycle_multiplier\s*=\s*[^;]+;', 'cycle_multiplier = 265;', lr)
+          assert n_cm_subs > 0, "Could not find any cycle_multiplier assignment in frontend/libretro.c"
 
           old_load = """static void update_variables(bool in_flight);
           bool retro_load_game(const struct retro_game_info *info)
@@ -452,7 +459,7 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 5B: Patched frontend/libretro.c (Locked cycle_multiplier=265 + Stock 44100Hz + V51 Telemetry)!")
+          log_msg(f"SUCCESS 5B: Patched frontend/libretro.c ({n_cm_subs} cycle_multiplier assignments locked to 265 + Stock 44100Hz + V51 Telemetry)!")
 
           with open("../build_v51_report.txt", "w") as rf:
               for line in report_lines:
