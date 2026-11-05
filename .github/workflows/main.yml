@@ -171,17 +171,16 @@ jobs:
               f.write(telem_h)
           log_msg("SUCCESS 1A: Created include/pcsx_telemetry.h!")
 
-          # 2. Patch plugins/dfsound/spu.c:
-          #    - 100% 1:1 native pitch audio (ZERO resampling/pitch-shifting!)
-          #    - Mid-frame SPU flush when >= 320 samples (1280 bytes) are ready so 40ms 3D frames don't starve ALSA
-          #    - Virtual ALSA buffer level tracker (41,155 Hz DAC drain rate)
-          #    - Pitch-preserving crossfaded WSOLA continuation grain ONLY when g_alsa_buf_samples < 800 (imminent hardware XRUN)
+          # 2. Patch plugins/dfsound/spu.c (Copy-paste safe: uses typedefs with zero pointer-cast parens)
           with open("plugins/dfsound/spu.c", "r") as f:
-              spu = f.read()
+              spu_lines = f.readlines()
 
           spu_top = """#include <sys/time.h>
           #include <string.h>
           #include "pcsx_telemetry.h"
+          typedef unsigned char * u8_ptr_t;
+          typedef short * s16_ptr_t;
+          typedef const uint32_t * cu32_ptr_t;
           struct pcsx_telem_s g_telem;
           static struct timeval g_last_feed_tv = {0, 0};
           static int g_alsa_buf = 2646;
@@ -190,20 +189,8 @@ jobs:
           static int g_hist_valid = 0;
           static uint32_t g_out_stage[2048];
           """
-          spu = spu_top + spu
 
-          old_spu_async = """void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
-          {
-           do_samples(cycle, spu_config.iUseFixedUpdates);
-
-           if (spu.spuCtrl & CTRL_IRQ)
-            schedule_next_irq();
-
-           if (flags & 1) {
-            out_current->feed(spu.pSpuBuffer, (unsigned char spu.pS - spu.pSpuBuffer);
-            spu.pS = (short spu.pSpuBuffer;"""
-
-          new_spu_async = """void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
+          new_spu_async_lines = """void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
           {
            struct timeval t_spu0, t_spu1;
            gettimeofday(&t_spu0, NULL);
@@ -214,13 +201,13 @@ jobs:
 
            gettimeofday(&t_spu1, NULL);
            g_telem.frame_spu_us += (t_spu1.tv_sec - t_spu0.tv_sec) * 1000000 + (t_spu1.tv_usec - t_spu0.tv_usec);
-           int pending_bytes = (unsigned char spu.pS - spu.pSpuBuffer;
+           int pending_bytes = (u8_ptr_t)spu.pS - spu.pSpuBuffer;
            if ((flags & 1) || pending_bytes >= 1280) {
             if (pending_bytes > 0) {
              struct timeval before_feed_tv, after_feed_tv;
              gettimeofday(&before_feed_tv, NULL);
              int in_frames = pending_bytes >> 2;
-             const uint32_t *src32 = (const uint32_t spu.pSpuBuffer;
+             cu32_ptr_t src32 = (cu32_ptr_t)spu.pSpuBuffer;
 
              if (g_last_feed_tv.tv_sec != 0) {
               long dt_us = (before_feed_tv.tv_sec - g_last_feed_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - g_last_feed_tv.tv_usec);
@@ -272,7 +259,7 @@ jobs:
              }
              if (g_hist_valid < 512) g_hist_valid += in_frames;
 
-             spu.pS = (short spu.pSpuBuffer;
+             spu.pS = (s16_ptr_t)spu.pSpuBuffer;
              g_telem.frame_xa_active = (spu.XAPlay != spu.XAFeed) ? 1 : 0;
              gettimeofday(&after_feed_tv, NULL);
              long f_us = (after_feed_tv.tv_sec - before_feed_tv.tv_sec) * 1000000L + (after_feed_tv.tv_usec - before_feed_tv.tv_usec);
@@ -283,19 +270,34 @@ jobs:
               g_alsa_buf = 3528;
              }
              g_telem.alsa_buf_samples = (uint32_t)g_alsa_buf;
-            }"""
+            }
+          """
 
-          assert old_spu_async in spu, "Could not find SPUasync block in spu.c"
-          spu = spu.replace(old_spu_async, new_spu_async, 1)
+          out_spu = [spu_top]
+          i = 0
+          patched_async = False
+          patched_xa = False
+          while i < len(spu_lines):
+              line = spu_lines[i]
+              if not patched_async and "void CALLBACK SPUasync(" in line:
+                  # Skip original lines up through "spu.pS = (short *)spu.pSpuBuffer;"
+                  while i < len(spu_lines) and "spu.pS =" not in spu_lines[i]:
+                      i += 1
+                  assert i < len(spu_lines), "Could not find spu.pS = inside SPUasync"
+                  i += 1  # skip the spu.pS = line itself
+                  out_spu.append(new_spu_async_lines)
+                  patched_async = True
+                  continue
+              if not patched_xa and "FeedXA(xap);" in line and "// call main XA feeder" in line:
+                  out_spu.append(" g_telem.frame_xa_sectors++;\n")
+                  patched_xa = True
+              out_spu.append(line)
+              i += 1
 
-          old_xa = " FeedXA(xap);                                          // call main XA feeder"
-          new_xa = """ g_telem.frame_xa_sectors++;
-           FeedXA(xap);                                          // call main XA feeder"""
-          assert old_xa in spu, "Could not find FeedXA in spu.c"
-          spu = spu.replace(old_xa, new_xa, 1)
-
+          assert patched_async, "Failed to patch SPUasync in spu.c"
+          assert patched_xa, "Failed to patch FeedXA in spu.c"
           with open("plugins/dfsound/spu.c", "w") as f:
-              f.write(spu)
+              f.writelines(out_spu)
           log_msg("SUCCESS 2: Patched plugins/dfsound/spu.c with Mid-Frame Flush + Pitch-Preserving Anti-XRUN!")
 
           # 3. Keep libpcsxcore/cdrom.c 100% stock V10 & wrap chd_read() in libpcsxcore/cdriso.c
