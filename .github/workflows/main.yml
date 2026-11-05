@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V50 (ALSA Reservoir Tracker + Mid-Frame Flush + Fast GPU)
+name: Build PCSX-ReARMed V51 (100% Pure Stock Audio & Blending + Locked CycleMult 265)
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
           cp -r /tmp/zlib-1.2.11 deps/libchdr/deps/zlib-1.2.11
           mkdir -p deps/libchdr/deps/lzma-26.02/include/real
 
-      - name: Apply V50 Patches (ALSA Reservoir Tracker + Mid-Frame Flush + Fast GPU)
+      - name: Apply V51 Patches (100% Pure V48 Audio & GPU Blending + Locked CycleMult 265)
         run: |
           cd pcsx_src
           python3 - << 'EOF'
@@ -157,8 +157,6 @@ jobs:
               uint32_t frame_spu_us;
               uint32_t frame_feed_us;
               uint32_t frame_spu_samples;
-              uint32_t frame_padded_samples;
-              uint32_t frame_alsa_buf_ms;
               uint32_t frame_xa_active;
               uint32_t last_frame_polys;
               uint32_t allow_menu_light;
@@ -171,22 +169,13 @@ jobs:
               f.write(telem_h)
           log_msg("SUCCESS 1A: Created include/pcsx_telemetry.h!")
 
-          # 2. Patch plugins/dfsound/spu.c:
-          #    - Continuous ALSA reservoir tracker (g_alsa_buf_us) at 41,155 Hz (24.298 us/sample)
-          #    - Mid-frame flush when >= 128 stereo samples (512 bytes) are ready
-          #    - Smoothed phase-continuous linear interpolation when reservoir < 46 ms
+          # 2. Patch plugins/dfsound/spu.c: 100% UNTOUCHED STOCK V48 AUDIO FEED (Zero resampling, zero mid-frame split, 100% pure pitch)
           with open("plugins/dfsound/spu.c", "r") as f:
               spu = f.read()
 
           spu_top = """#include <sys/time.h>
-          #include <string.h>
           #include "pcsx_telemetry.h"
           struct pcsx_telem_s g_telem;
-          static struct timeval g_spu_last_tv = {0, 0};
-          static long g_alsa_buf_us = 52000;
-          static int g_smooth_pad = 0;
-          static uint32_t g_midframe_samples = 0;
-          static short g_pad_buf[4096];
           """
           spu = spu_top + spu
 
@@ -205,17 +194,6 @@ jobs:
           {
            struct timeval t_spu0, t_spu1;
            gettimeofday(&t_spu0, NULL);
-           if (g_spu_last_tv.tv_sec != 0) {
-            long dt_us = (t_spu0.tv_sec - g_spu_last_tv.tv_sec) * 1000000L + (t_spu0.tv_usec - g_spu_last_tv.tv_usec);
-            if (dt_us > 0 && dt_us < 250000L) {
-             g_alsa_buf_us -= dt_us;
-             if (g_alsa_buf_us < 0) g_alsa_buf_us = 0;
-            } else if (dt_us >= 250000L) {
-             g_alsa_buf_us = 52000L;
-            }
-           }
-           g_spu_last_tv = t_spu0;
-
            do_samples(cycle, spu_config.iUseFixedUpdates);
 
            if (spu.spuCtrl & CTRL_IRQ)
@@ -223,77 +201,17 @@ jobs:
 
            gettimeofday(&t_spu1, NULL);
            g_telem.frame_spu_us += (t_spu1.tv_sec - t_spu0.tv_sec) * 1000000 + (t_spu1.tv_usec - t_spu0.tv_usec);
-
-           int bytes_avail = (unsigned char *)spu.pS - spu.pSpuBuffer;
-           if (!(flags & 1)) {
-            if (bytes_avail >= 512) {
-             struct timeval bf0, bf1;
-             gettimeofday(&bf0, NULL);
-             int mf_frames = bytes_avail >> 2;
-             out_current->feed(spu.pSpuBuffer, bytes_avail);
-             spu.pS = (short *)spu.pSpuBuffer;
-             g_midframe_samples += (uint32_t)mf_frames;
-             gettimeofday(&bf1, NULL);
-             long mf_us = (bf1.tv_sec - bf0.tv_sec) * 1000000L + (bf1.tv_usec - bf0.tv_usec);
-             if (mf_us > 0) g_telem.frame_feed_us += (uint32_t)mf_us;
-             g_alsa_buf_us += ((long)mf_frames * 24298L) / 1000L;
-             if (mf_us > 4500L || g_alsa_buf_us > 60000L) g_alsa_buf_us = 60000L;
-             g_spu_last_tv = bf1;
-            }
-           } else {
+           if (flags & 1) {
             struct timeval before_feed_tv, after_feed_tv;
             gettimeofday(&before_feed_tv, NULL);
-            int rem_frames = bytes_avail >> 2;
-            int total_in_frames = (int)g_midframe_samples + rem_frames;
-            g_midframe_samples = 0;
-
-            long projected_buf_us = g_alsa_buf_us + (((long)rem_frames * 24298L) / 1000L);
-            int target_pad = 0;
-            if (projected_buf_us < 46000L && rem_frames >= 64) {
-             long deficit_us = 48000L - projected_buf_us;
-             int needed = (int)((deficit_us * 41L) / 1000L);
-             int max_pad = rem_frames >> 2;
-             if (max_pad > 110) max_pad = 110;
-             if (needed > max_pad) needed = max_pad;
-             if (needed >= 8) target_pad = needed;
-            }
-            g_smooth_pad = (g_smooth_pad * 3 + target_pad) >> 2;
-            int pad_frames = (g_smooth_pad >= 6 && rem_frames >= 64) ? g_smooth_pad : 0;
-
-            int out_frames = rem_frames + pad_frames;
-            if (pad_frames > 0 && out_frames < 2048) {
-             const short *src = (const short *)spu.pSpuBuffer;
-             uint32_t step = (uint32_t)(((uint64_t)(rem_frames - 1) << 16) / (uint32_t)(out_frames - 1));
-             uint32_t pos = 0;
-             for (int i = 0; i < out_frames; i++) {
-              int idx = (int)(pos >> 16);
-              int frac = (int)((pos >> 8) & 0xFF);
-              if (idx >= rem_frames - 1) {
-               g_pad_buf[i * 2]     = src[(rem_frames - 1) * 2];
-               g_pad_buf[i * 2 + 1] = src[(rem_frames - 1) * 2 + 1];
-              } else {
-               int l0 = src[idx * 2],     l1 = src[(idx + 1) * 2];
-               int r0 = src[idx * 2 + 1], r1 = src[(idx + 1) * 2 + 1];
-               g_pad_buf[i * 2]     = (short)(l0 + (((l1 - l0) * frac) >> 8));
-               g_pad_buf[i * 2 + 1] = (short)(r0 + (((r1 - r0) * frac) >> 8));
-              }
-              pos += step;
-             }
-             out_current->feed(g_pad_buf, out_frames * 4);
-            } else if (bytes_avail > 0) {
-             out_current->feed(spu.pSpuBuffer, bytes_avail);
-            }
+            int bytes_to_feed = (unsigned char *)spu.pS - spu.pSpuBuffer;
+            out_current->feed(spu.pSpuBuffer, bytes_to_feed);
             spu.pS = (short *)spu.pSpuBuffer;
-            g_telem.frame_spu_samples = (uint32_t)(total_in_frames + pad_frames);
-            g_telem.frame_padded_samples = (uint32_t)pad_frames;
+            g_telem.frame_spu_samples = (uint32_t)(bytes_to_feed >> 2);
             g_telem.frame_xa_active = (spu.XAPlay != spu.XAFeed) ? 1 : 0;
             gettimeofday(&after_feed_tv, NULL);
             long f_us = (after_feed_tv.tv_sec - before_feed_tv.tv_sec) * 1000000L + (after_feed_tv.tv_usec - before_feed_tv.tv_usec);
-            if (f_us > 0) g_telem.frame_feed_us += (uint32_t)f_us;
-            g_alsa_buf_us += ((long)out_frames * 24298L) / 1000L;
-            if (f_us > 4500L || g_alsa_buf_us > 60000L) g_alsa_buf_us = 60000L;
-            g_telem.frame_alsa_buf_ms = (uint32_t)(g_alsa_buf_us / 1000L);
-            g_spu_last_tv = after_feed_tv;"""
+            if (f_us > 0) g_telem.frame_feed_us += (uint32_t)f_us;"""
 
           assert old_spu_async in spu, "Could not find SPUasync block in spu.c"
           spu = spu.replace(old_spu_async, new_spu_async, 1)
@@ -306,7 +224,7 @@ jobs:
 
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu)
-          log_msg("SUCCESS 2: Patched plugins/dfsound/spu.c with ALSA Reservoir Tracker + Mid-Frame Flush!")
+          log_msg("SUCCESS 2: Patched plugins/dfsound/spu.c with 100% pure untouched stock V48 audio feed!")
 
           # 3. Keep libpcsxcore/cdrom.c 100% stock V10 & wrap chd_read() in libpcsxcore/cdriso.c
           with open("libpcsxcore/cdriso.c", "r") as f:
@@ -336,7 +254,7 @@ jobs:
           log_msg("SUCCESS 3: Kept libpcsxcore/cdrom.c 100% stock V10 & wrapped chd_read() in cdriso.c!")
 
           # 4. Patch plugins/gpu_unai/gpulib_if.cpp:
-          #    - Force fast_lighting=1, dithering=0, and cap excess semi-transparent sprite overdraw (_gt.p_blend > 16)
+          #    - 100% pure V48 GPU configuration (Keep gpu_unai.config.blending untouched so Sesame Street Sports water is normal!)
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
               gpu = f.read()
           assert "gpu_unai.config.lighting" in gpu, "Missing gpu_unai.config.lighting in gpulib_if.cpp"
@@ -369,16 +287,13 @@ jobs:
           gpu = gpu_top + gpu
           gpu = gpu.replace(
               "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{",
-              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tgpu_telem_scope_timer _gt;\n\tconst uint32_t allow_l = g_telem.allow_menu_light;\n\tconst uint32_t base_p = g_telem.frame_poly_total;\n\tconst uint32_t base_b = g_telem.frame_poly_blend;\n\t_gt.eff_light = (allow_l && g_telem.last_frame_polys <= 85 && base_p <= 85) ? 1 : 0;\n\tgpu_unai.config.lighting = _gt.eff_light;\n\tgpu_unai.config.fast_lighting = 1;\n\tgpu_unai.config.dithering = 0;\n\tgpu_unai.config.blending = (base_b <= 16) ? 1 : 0;\n",
+              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tgpu_telem_scope_timer _gt;\n\tconst uint32_t allow_l = g_telem.allow_menu_light;\n\tconst uint32_t base_p = g_telem.frame_poly_total;\n\t_gt.eff_light = (allow_l && g_telem.last_frame_polys <= 85 && base_p <= 85) ? 1 : 0;\n\tgpu_unai.config.lighting = _gt.eff_light;\n",
               1
           )
           old_switch = "    switch (cmd)"
           new_switch = """    if (cmd >= 0x20 && cmd < 0x40) {
           \t\t_gt.p_tot++;
-          \t\tif (cmd & 0x02) {
-          \t\t\t_gt.p_blend++;
-          \t\t\tif ((base_b + _gt.p_blend) > 16) gpu_unai.config.blending = 0;
-          \t\t}
+          \t\tif (cmd & 0x02) _gt.p_blend++;
           \t\tif (cmd & 0x04) {
           \t\t\t_gt.p_tex++;
           \t\t\tif (!(cmd & 0x01)) _gt.p_light++;
@@ -388,10 +303,7 @@ jobs:
           \t\tif (allow_l && (base_p + _gt.p_tot) > 85) { _gt.eff_light = 0; gpu_unai.config.lighting = 0; }
           \t} else if (cmd >= 0x60 && cmd < 0x80) {
           \t\t_gt.spr++;
-          \t\tif (cmd & 0x02) {
-          \t\t\t_gt.p_blend++;
-          \t\t\tif ((base_b + _gt.p_blend) > 16) gpu_unai.config.blending = 0;
-          \t\t}
+          \t\tif (cmd & 0x02) _gt.p_blend++;
           \t\tif ((cmd & 0x04) && !(cmd & 0x01)) _gt.p_light++;
           \t} else if (cmd >= 0x80 && cmd < 0xC0) {
           \t\t_gt.vram++;
@@ -401,11 +313,26 @@ jobs:
           gpu = gpu.replace(old_switch, new_switch, 1)
           with open("plugins/gpu_unai/gpulib_if.cpp", "w") as f:
               f.write(gpu)
-          log_msg("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp (Fast GPU + Blended Overdraw Cap + Menu Lighting)!")
+          log_msg("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp (100% pure V48 GPU + intact water blending)!")
 
-          # 5. Patch frontend/libretro.c: Keep stock 175 cycle_multiplier & stock 44100.0 Hz sample_rate
+          # 5A. Lock CYCLE_MULT_DEFAULT = 265 in libpcsxcore/new_dynarec/new_dynarec.h
+          with open("libpcsxcore/new_dynarec/new_dynarec.h", "r") as f:
+              ndh = f.read()
+          assert "#define CYCLE_MULT_DEFAULT 175" in ndh, "Could not find CYCLE_MULT_DEFAULT in new_dynarec.h"
+          ndh = ndh.replace("#define CYCLE_MULT_DEFAULT 175", "#define CYCLE_MULT_DEFAULT 265", 1)
+          with open("libpcsxcore/new_dynarec/new_dynarec.h", "w") as f:
+              f.write(ndh)
+          log_msg("SUCCESS 5A: Locked CYCLE_MULT_DEFAULT = 265 in libpcsxcore/new_dynarec/new_dynarec.h!")
+
+          # 5B. Patch frontend/libretro.c:
+          #     - Lock cycle_multiplier = 265 inside update_variables() AND retro_run() so dynarec compiles all blocks at 265
+          #     - Keep stock 44100.0 Hz sample_rate
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
+
+          assert "cycle_multiplier = 10000 /" in lr, "Could not find cycle_multiplier assignment in frontend/libretro.c"
+          lr = lr.replace("cycle_multiplier = 10000 / atoi(var.value);", "cycle_multiplier = 265;", 1)
+          lr = lr.replace("cycle_multiplier = CYCLE_MULT_DEFAULT;", "cycle_multiplier = 265;", 1)
 
           old_load = """static void update_variables(bool in_flight);
           bool retro_load_game(const struct retro_game_info *info)
@@ -420,6 +347,7 @@ jobs:
           static struct timeval g_sec_tv = {0, 0};
           bool retro_load_game(const struct retro_game_info *info)
           {
+             cycle_multiplier = 265;
              g_telem.allow_menu_light = 0;
              if (info && info->path) {
                 if (strstr(info->path, "Dora") != NULL || strstr(info->path, "dora") != NULL ||
@@ -433,9 +361,9 @@ jobs:
              g_prev_f_tv.tv_sec = 0; g_prev_f_tv.tv_usec = 0;
              g_sec_tv.tv_sec = 0; g_sec_tv.tv_usec = 0;
              if (g_tlog) {
-                fprintf(g_tlog, "\n=== PCSX-ReARMed V50 Telemetry Started ===\nGame: %s (allow_menu_light=%u)\n",
-                   (info && info->path) ? info->path : "unknown", g_telem.allow_menu_light);
-                fprintf(g_tlog, "Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | chd_hunks(last_hunk) xa_sect | samples(pad) buf_ms xa_on unai_light\n");
+                fprintf(g_tlog, "\n=== PCSX-ReARMed V51 Telemetry Started ===\nGame: %s (allow_menu_light=%u, cycle_mult=%d)\n",
+                   (info && info->path) ? info->path : "unknown", g_telem.allow_menu_light, cycle_multiplier);
+                fprintf(g_tlog, "Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | chd_hunks(last_hunk) xa_sect | samples xa_on unai_light\n");
                 fflush(g_tlog);
              }"""
 
@@ -448,7 +376,7 @@ jobs:
           new_run = r"""static void telem_step_frame(void) {
              static uint32_t sec_frames = 0, sec_max_us = 0;
              static uint64_t sum_cpu = 0, sum_gpu = 0, sum_spu = 0, sum_feed = 0, sum_cd = 0;
-             static uint32_t sum_ptot = 0, sum_plight = 0, sum_pblend = 0, sum_ptex = 0, sum_spr = 0, sum_vram = 0, sum_cdr = 0, sum_xas = 0, sum_pad = 0;
+             static uint32_t sum_ptot = 0, sum_plight = 0, sum_pblend = 0, sum_ptex = 0, sum_spr = 0, sum_vram = 0, sum_cdr = 0, sum_xas = 0;
              struct timeval now_tv;
              gettimeofday(&now_tv, NULL);
              if (g_prev_f_tv.tv_sec != 0) {
@@ -464,39 +392,38 @@ jobs:
                 sum_pblend += g_telem.frame_poly_blend; sum_ptex += g_telem.frame_poly_tex;
                 sum_spr += g_telem.frame_sprites; sum_vram += g_telem.frame_vram_writes;
                 sum_cdr += g_telem.frame_cd_reads; sum_xas += g_telem.frame_xa_sectors;
-                sum_pad += g_telem.frame_padded_samples;
                 if (g_tlog && f_us > 25500 && g_frame_no > 30) {
-                   fprintf(g_tlog, "  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | samples=%u(pad:%u) buf=%ums xa=%u light=%u\n",
+                   fprintf(g_tlog, "  [SLOW_FRAME #%u] %.1f fps (%u.%u ms) | cpu=%u gpu=%u spu=%u feed=%u cd=%u us | poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | samples=%u xa=%u light=%u\n",
                       g_frame_no, 1000000.0 / (double)f_us, f_us / 1000, (f_us % 1000) / 100,
                       cpu_us, g_telem.frame_gpu_us, g_telem.frame_spu_us, g_telem.frame_feed_us, g_telem.frame_cd_us,
                       g_telem.frame_poly_total, g_telem.frame_poly_light, g_telem.frame_poly_blend, g_telem.frame_poly_tex,
                       g_telem.frame_sprites, g_telem.frame_vram_writes,
                       g_telem.frame_cd_reads, g_telem.last_cd_lba, g_telem.frame_xa_sectors,
-                      g_telem.frame_spu_samples, g_telem.frame_padded_samples, g_telem.frame_alsa_buf_ms, g_telem.frame_xa_active, g_telem.effective_light);
+                      g_telem.frame_spu_samples, g_telem.frame_xa_active, g_telem.effective_light);
                 }
                 long elapsed_us = (now_tv.tv_sec - g_sec_tv.tv_sec) * 1000000L + (now_tv.tv_usec - g_sec_tv.tv_usec);
                 if (elapsed_us >= 1000000L && sec_frames > 0) {
                    if (g_tlog) {
                       double fps = (double)sec_frames * 1000000.0 / (double)elapsed_us;
                       double min_fps = (sec_max_us > 0) ? (1000000.0 / (double)sec_max_us) : 0.0;
-                      fprintf(g_tlog, "[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | samples=%u(pad_sum:%u) buf=%ums xa=%u light=%u\n",
+                      fprintf(g_tlog, "[1S f=%u ID=%s] %.1f fps | min %.1f fps (%u.%u ms) | avg_us: cpu=%u gpu=%u spu=%u feed=%u cd=%u | avg_draw: poly=%u(L:%u B:%u T:%u) spr=%u vram=%u | chd_rd=%u(hunk:%u) xa_s=%u | samples=%u xa=%u light=%u\n",
                          g_frame_no, CdromId[0] ? CdromId : "none", fps, min_fps, sec_max_us / 1000, (sec_max_us % 1000) / 100,
                          (uint32_t)(sum_cpu / sec_frames), (uint32_t)(sum_gpu / sec_frames), (uint32_t)(sum_spu / sec_frames),
                          (uint32_t)(sum_feed / sec_frames), (uint32_t)(sum_cd / sec_frames),
                          sum_ptot / sec_frames, sum_plight / sec_frames, sum_pblend / sec_frames, sum_ptex / sec_frames,
                          sum_spr / sec_frames, sum_vram / sec_frames, sum_cdr, g_telem.last_cd_lba, sum_xas,
-                         g_telem.frame_spu_samples, sum_pad, g_telem.frame_alsa_buf_ms, g_telem.frame_xa_active, g_telem.effective_light);
+                         g_telem.frame_spu_samples, g_telem.frame_xa_active, g_telem.effective_light);
                       fflush(g_tlog);
                    }
                    g_sec_tv = now_tv; sec_frames = 0; sec_max_us = 0;
                    sum_cpu = sum_gpu = sum_spu = sum_feed = sum_cd = 0;
-                   sum_ptot = sum_plight = sum_pblend = sum_ptex = sum_spr = sum_vram = sum_cdr = sum_xas = sum_pad = 0;
+                   sum_ptot = sum_plight = sum_pblend = sum_ptex = sum_spr = sum_vram = sum_cdr = sum_xas = 0;
                 }
              } else {
                 g_sec_tv = now_tv;
                 sec_frames = 0; sec_max_us = 0;
                 sum_cpu = sum_gpu = sum_spu = sum_feed = sum_cd = 0;
-                sum_ptot = sum_plight = sum_pblend = sum_ptex = sum_spr = sum_vram = sum_cdr = sum_xas = sum_pad = 0;
+                sum_ptot = sum_plight = sum_pblend = sum_ptex = sum_spr = sum_vram = sum_cdr = sum_xas = 0;
              }
              g_prev_f_tv = now_tv;
              if (g_telem.frame_poly_total > 0 || g_telem.frame_sprites > 0) {
@@ -514,10 +441,10 @@ jobs:
              g_telem.frame_vram_writes = 0;
              g_telem.frame_spu_us = 0;
              g_telem.frame_feed_us = 0;
-             g_telem.frame_padded_samples = 0;
           }
           void retro_run(void)
           {
+             cycle_multiplier = 265;
              telem_step_frame();"""
 
           assert old_run in lr, "Could not find retro_run in libretro.c"
@@ -525,15 +452,15 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 5: Patched frontend/libretro.c (Stock 175 CycleMult + Stock 44100Hz + V50 Telemetry)!")
+          log_msg("SUCCESS 5B: Patched frontend/libretro.c (Locked cycle_multiplier=265 + Stock 44100Hz + V51 Telemetry)!")
 
-          with open("../build_v50_report.txt", "w") as rf:
+          with open("../build_v51_report.txt", "w") as rf:
               for line in report_lines:
                   rf.write(line + "\n")
-              rf.write("=== VERIFIED GIT DIFF FOR V50 ===\n")
+              rf.write("=== VERIFIED GIT DIFF FOR V51 ===\n")
           EOF
 
-          git diff Makefile Makefile.libretro include/ libpcsxcore/ plugins/ frontend/ >> ../build_v50_report.txt
+          git diff Makefile Makefile.libretro include/ libpcsxcore/ plugins/ frontend/ >> ../build_v51_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container (I-Cache Optimized Cortex-A9 Flags)
         run: |
@@ -559,18 +486,18 @@ jobs:
               HAVE_CHD=1 \
               HAVE_NEON=0 \
               HAVE_NEON_ASM=0 \
-              -j$(nproc) 2>&1 | tee ../build_v50.log
+              -j$(nproc) 2>&1 | tee ../build_v51.log
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v50_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v51_report.txt
           '
-          ls -lh pcsx_rearmed_libretro.so build_v50.log build_v50_report.txt
+          ls -lh pcsx_rearmed_libretro.so build_v51.log build_v51_report.txt
 
-      - name: Upload V50 Core + Build Log + Diff Report
+      - name: Upload V51 Core + Build Log + Diff Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx_rearmed_libretro_v50
+          name: pcsx_rearmed_libretro_v51
           path: |
             pcsx_rearmed_libretro.so
-            build_v50.log
-            build_v50_report.txt
+            build_v51.log
+            build_v51_report.txt
