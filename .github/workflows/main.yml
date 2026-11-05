@@ -271,15 +271,15 @@ jobs:
 
           cdr_wrapper = """static void inner_cdrReadInterrupt(void);
           void cdrReadInterrupt(void) {
-          \tu32 prev_s = psxRegs.intCycle[PSXINT_CDRREAD].sCycle;
-          \tu32 prev_c = psxRegs.intCycle[PSXINT_CDRREAD].cycle;
+          \tu32 prev_s = psxRegs.intCycle[PSXINT_CDREAD].sCycle;
+          \tu32 prev_c = psxRegs.intCycle[PSXINT_CDREAD].cycle;
           \tu32 expected = prev_s + prev_c;
           \ts32 overshoot = (s32)(psxRegs.cycle - expected);
           \tinner_cdrReadInterrupt();
-          \tif ((psxRegs.interrupt & (1 << PSXINT_CDRREAD)) &&
-          \t    psxRegs.intCycle[PSXINT_CDRREAD].sCycle == psxRegs.cycle &&
-          \t    overshoot > 0 && (u32)overshoot < (psxRegs.intCycle[PSXINT_CDRREAD].cycle >> 1)) {
-          \t\tpsxRegs.intCycle[PSXINT_CDRREAD].sCycle = psxRegs.cycle - (u32)overshoot;
+          \tif ((psxRegs.interrupt & (1 << PSXINT_CDREAD)) &&
+          \t    psxRegs.intCycle[PSXINT_CDREAD].sCycle == psxRegs.cycle &&
+          \t    overshoot > 0 && (u32)overshoot < (psxRegs.intCycle[PSXINT_CDREAD].cycle >> 1)) {
+          \t\tpsxRegs.intCycle[PSXINT_CDREAD].sCycle = psxRegs.cycle - (u32)overshoot;
           \t}
           }
           static void inner_cdrReadInterrupt(void) {"""
@@ -357,9 +357,25 @@ jobs:
               f.write(gpu)
           log_msg("SUCCESS 4: Reverted plugins/gpu_unai/gpulib_if.cpp to exact V51!")
 
-          # 5. Patch frontend/libretro.c:
-          #    - Lock cycle_multiplier = 275
-          #    - Auto-truncate /tmp/pcsx_telemetry.log on first game load of process ("w" then "a") + 42.5ms slow-frame filter
+          # 5A. Update CYCLE_MULT_DEFAULT to 275 across libpcsxcore, frontend, and include
+          patched_cm_files = []
+          for root_dir in ["libpcsxcore", "frontend", "include"]:
+              for dirpath, _, filenames in os.walk(root_dir):
+                  for fn in filenames:
+                      if fn.endswith((".c", ".h")):
+                          fpath = os.path.join(dirpath, fn)
+                          with open(fpath, "r", errors="ignore") as f:
+                              txt = f.read()
+                          new_txt = re.sub(r'(CYCLE_MULT_DEFAULT\s+)\d+', r'\g<1>275', txt)
+                          if new_txt != txt:
+                              with open(fpath, "w") as f:
+                                  f.write(new_txt)
+                              patched_cm_files.append(fpath)
+          log_msg(f"SUCCESS 5A: Updated CYCLE_MULT_DEFAULT to 275 in {patched_cm_files}!")
+
+          # 5B. Patch frontend/libretro.c:
+          #     - Lock cycle_multiplier = 275
+          #     - Auto-truncate /tmp/pcsx_telemetry.log on first game load of process ("w" then "a") + 42.5ms slow-frame filter
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
@@ -486,7 +502,7 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg(f"SUCCESS 5: Patched frontend/libretro.c ({n_cm_subs} cycle_multiplier assignments locked to 275 + V53 Telemetry)!")
+          log_msg(f"SUCCESS 5B: Patched frontend/libretro.c ({n_cm_subs} cycle_multiplier assignments locked to 275 + V53 Telemetry)!")
 
           with open("../build_v53_report.txt", "w") as rf:
               for line in report_lines:
