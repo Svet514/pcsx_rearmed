@@ -254,8 +254,8 @@ jobs:
           log_msg("SUCCESS 3: Kept libpcsxcore/cdrom.c 100% stock V10 & wrapped chd_read() in cdriso.c!")
 
           # 4. Patch plugins/gpu_unai/gpulib_if.cpp:
-          #    - Use register-local counters inside do_cmd_list() and flush to g_telem only on scope exit (eliminates 1850 GOT accesses/frame)
-          #    - Lighting ONLY for Dora & 102 Dalmatians when polys <= 85; OFF for Pooh, Sesame Street, and all others
+          #    - Use register-local counters inside do_cmd_list() and flush to g_telem only on scope exit
+          #    - Store eff_light in gpu_telem_scope_timer so ~gpu_telem_scope_timer() does not depend on gpu_unai declaration order
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
               gpu = f.read()
           assert "gpu_unai.config.lighting" in gpu, "Missing gpu_unai.config.lighting in gpulib_if.cpp"
@@ -267,8 +267,8 @@ jobs:
           }
           struct gpu_telem_scope_timer {
               struct timeval t0;
-              uint32_t p_tot, p_light, p_blend, p_tex, spr, vram;
-              gpu_telem_scope_timer() : p_tot(0), p_light(0), p_blend(0), p_tex(0), spr(0), vram(0) {
+              uint32_t p_tot, p_light, p_blend, p_tex, spr, vram, eff_light;
+              gpu_telem_scope_timer() : p_tot(0), p_light(0), p_blend(0), p_tex(0), spr(0), vram(0), eff_light(0) {
                   gettimeofday(&t0, 0);
               }
               ~gpu_telem_scope_timer() {
@@ -281,14 +281,14 @@ jobs:
                   g_telem.frame_poly_tex   += p_tex;
                   g_telem.frame_sprites    += spr;
                   g_telem.frame_vram_writes += vram;
-                  g_telem.effective_light = gpu_unai.config.lighting;
+                  g_telem.effective_light = eff_light;
               }
           };
           """
           gpu = gpu_top + gpu
           gpu = gpu.replace(
               "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{",
-              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tgpu_telem_scope_timer _gt;\n\tconst uint32_t allow_l = g_telem.allow_menu_light;\n\tconst uint32_t base_p = g_telem.frame_poly_total;\n\tgpu_unai.config.lighting = (allow_l && g_telem.last_frame_polys <= 85 && base_p <= 85) ? 1 : 0;\n",
+              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tgpu_telem_scope_timer _gt;\n\tconst uint32_t allow_l = g_telem.allow_menu_light;\n\tconst uint32_t base_p = g_telem.frame_poly_total;\n\t_gt.eff_light = (allow_l && g_telem.last_frame_polys <= 85 && base_p <= 85) ? 1 : 0;\n\tgpu_unai.config.lighting = _gt.eff_light;\n",
               1
           )
           old_switch = "    switch (cmd)"
@@ -301,7 +301,7 @@ jobs:
           \t\t} else if (cmd & 0x10) {
           \t\t\t_gt.p_light++;
           \t\t}
-          \t\tif (allow_l && (base_p + _gt.p_tot) > 85) gpu_unai.config.lighting = 0;
+          \t\tif (allow_l && (base_p + _gt.p_tot) > 85) { _gt.eff_light = 0; gpu_unai.config.lighting = 0; }
           \t} else if (cmd >= 0x60 && cmd < 0x80) {
           \t\t_gt.spr++;
           \t\tif (cmd & 0x02) _gt.p_blend++;
