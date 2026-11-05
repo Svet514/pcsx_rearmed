@@ -265,43 +265,36 @@ jobs:
               f.write(cdriso)
           log_msg("SUCCESS 3A: Reverted libpcsxcore/cdriso.c to exact V51!")
 
-          # 3B. Patch libpcsxcore/cdrom.c: Phase-locked CDR_READ_INT overshoot compensation
-          #     Eliminates the 1-2% PSXINT_CDRREAD sector drift caused by dynarec block overshoot at high cycle_multiplier
+          # 3B. Patch libpcsxcore/cdrom.c: Phase-locked cdrReadInterrupt() overshoot compensation via wrapper
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
 
-          old_cdr_macro = """#define CDR_READ_INT(eCycle) { \\
-          \tpsxRegs.interrupt |= (1 << PSXINT_CDRREAD); \\
-          \tpsxRegs.intCycle[PSXINT_CDRREAD].cycle = eCycle; \\
-          \tpsxRegs.intCycle[PSXINT_CDRREAD].sCycle = psxRegs.cycle; \\
-          }"""
+          cdr_wrapper = """static void inner_cdrReadInterrupt(void);
+          void cdrReadInterrupt(void) {
+          \tu32 prev_s = psxRegs.intCycle[PSXINT_CDRREAD].sCycle;
+          \tu32 prev_c = psxRegs.intCycle[PSXINT_CDRREAD].cycle;
+          \tu32 expected = prev_s + prev_c;
+          \ts32 overshoot = (s32)(psxRegs.cycle - expected);
+          \tinner_cdrReadInterrupt();
+          \tif ((psxRegs.interrupt & (1 << PSXINT_CDRREAD)) &&
+          \t    psxRegs.intCycle[PSXINT_CDRREAD].sCycle == psxRegs.cycle &&
+          \t    overshoot > 0 && (u32)overshoot < (psxRegs.intCycle[PSXINT_CDRREAD].cycle >> 1)) {
+          \t\tpsxRegs.intCycle[PSXINT_CDRREAD].sCycle = psxRegs.cycle - (u32)overshoot;
+          \t}
+          }
+          static void inner_cdrReadInterrupt(void) {"""
 
-          new_cdr_macro = """static u32 g_cdr_in_read_irq = 0;
-          static s32 g_cdr_overshoot = 0;
-          #define CDR_READ_INT(eCycle) { \\
-          \tu32 _ec = (eCycle); \\
-          \tif (g_cdr_in_read_irq && g_cdr_overshoot > 0 && (u32)g_cdr_overshoot < (_ec >> 1)) \\
-          \t\t_ec -= (u32)g_cdr_overshoot; \\
-          \tpsxRegs.interrupt |= (1 << PSXINT_CDRREAD); \\
-          \tpsxRegs.intCycle[PSXINT_CDRREAD].cycle = _ec; \\
-          \tpsxRegs.intCycle[PSXINT_CDRREAD].sCycle = psxRegs.cycle; \\
-          \tg_cdr_in_read_irq = 0; \\
-          }"""
-
-          assert old_cdr_macro in cdrom, "Could not find CDR_READ_INT macro in libpcsxcore/cdrom.c"
-          cdrom = cdrom.replace(old_cdr_macro, new_cdr_macro, 1)
-
-          old_read_irq = "void cdrReadInterrupt(void) {"
-          new_read_irq = """void cdrReadInterrupt(void) {
-          \tu32 _expected = psxRegs.intCycle[PSXINT_CDRREAD].sCycle + psxRegs.intCycle[PSXINT_CDRREAD].cycle;
-          \tg_cdr_overshoot = (s32)(psxRegs.cycle - _expected);
-          \tg_cdr_in_read_irq = 1;"""
-          assert old_read_irq in cdrom, "Could not find cdrReadInterrupt in libpcsxcore/cdrom.c"
-          cdrom = cdrom.replace(old_read_irq, new_read_irq, 1)
+          cdrom, n_cdr_irq = re.subn(
+              r'void\s+cdrReadInterrupt\s*\(\s*(?:void)?\s*\)\s*\{',
+              cdr_wrapper,
+              cdrom,
+              count=1
+          )
+          assert n_cdr_irq == 1, "Could not find void cdrReadInterrupt in libpcsxcore/cdrom.c"
 
           with open("libpcsxcore/cdrom.c", "w") as f:
               f.write(cdrom)
-          log_msg("SUCCESS 3B: Patched libpcsxcore/cdrom.c with phase-locked CDR_READ_INT overshoot compensation!")
+          log_msg("SUCCESS 3B: Patched libpcsxcore/cdrom.c with phase-locked cdrReadInterrupt() overshoot compensation!")
 
           # 4. Revert plugins/gpu_unai/gpulib_if.cpp to exact V51
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
