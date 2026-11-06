@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V54 (V51 Base + Pre-GPU Audio Flush + Dynamic 3D CycleMult)
+name: Build PCSX-ReARMed V55 (V51 Base + Safe VBlank-Only 1.0x Audio Bridge + CycleMult 275/300)
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
           cp -r /tmp/zlib-1.2.11 deps/libchdr/deps/zlib-1.2.11
           mkdir -p deps/libchdr/deps/lzma-26.02/include/real
 
-      - name: Apply V54 Patches (Revert V53 XA/CDR to V51 + Pre-GPU SPU Flush + Dynamic 3D CycleMult)
+      - name: Apply V55 Patches (Remove Mid-Frame GPU Audio Flush + Safe VBlank 1.0x Bridge + CycleMult 275/300)
         run: |
           cd pcsx_src
           python3 - << 'EOF'
@@ -166,7 +166,6 @@ jobs:
               uint32_t effective_light;
           };
           extern struct pcsx_telem_s g_telem;
-          void telem_spu_midframe_flush(void);
           #endif
           """
           with open("include/pcsx_telemetry.h", "w") as f:
@@ -174,9 +173,9 @@ jobs:
           log_msg("SUCCESS 1A: Created include/pcsx_telemetry.h!")
 
           # 2. Patch plugins/dfsound/spu.c:
-          #    - Reverted FeedXA to 100% pure V51 (no XALastVal repeat buzz)
-          #    - Added telem_spu_midframe_flush() so heavy 3D frames flush already-mixed SPU samples BEFORE a 35ms GPU render
-          #    - Fixed ALSA buffer deficit estimator so sustained <42 FPS scenes get a smooth 1.0x crossfaded tail before ALSA can XRUN
+          #    - Feed ONLY once per frame at VBlank (flags & 1)
+          #    - 100% untouched stock FeedXA
+          #    - Fixed ALSA deficit estimator with strict <= 1020 stereo frame cap for 1.0x crossfaded tail bridge
           with open("plugins/dfsound/spu.c", "r") as f:
               spu = f.read()
 
@@ -186,7 +185,7 @@ jobs:
           struct pcsx_telem_s g_telem;
           static struct timeval g_spu_last_tv = {0, 0};
           static long g_alsa_buf_us = 48000;
-          static short g_pad_buf[2048];
+          static short g_pad_buf[2048] __attribute__((aligned(16)));
           """
           spu = spu_top + spu
 
@@ -201,38 +200,7 @@ jobs:
             out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);
             spu.pS = (short *)spu.pSpuBuffer;"""
 
-          new_spu_async = """void telem_spu_midframe_flush(void)
-          {
-           if (!spu.pSpuBuffer || !spu.pS || !out_current || !out_current->feed) return;
-           int bytes_to_feed = (unsigned char *)spu.pS - spu.pSpuBuffer;
-           int rem_frames = bytes_to_feed >> 2;
-           if (rem_frames < 192) return;
-           struct timeval before_feed_tv, after_feed_tv;
-           gettimeofday(&before_feed_tv, NULL);
-           if (g_spu_last_tv.tv_sec != 0) {
-            long wall_us = (before_feed_tv.tv_sec - g_spu_last_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - g_spu_last_tv.tv_usec);
-            if (wall_us < 11500L) return;
-            if (wall_us > 0 && wall_us < 250000L) {
-             g_alsa_buf_us -= wall_us;
-             if (g_alsa_buf_us < 0) g_alsa_buf_us = 0;
-            } else if (wall_us >= 250000L) {
-             g_alsa_buf_us = 48000L;
-            }
-           }
-           out_current->feed(spu.pSpuBuffer, bytes_to_feed);
-           spu.pS = (short *)spu.pSpuBuffer;
-           g_telem.frame_spu_samples += (uint32_t)rem_frames;
-           gettimeofday(&after_feed_tv, NULL);
-           long f_us = (after_feed_tv.tv_sec - before_feed_tv.tv_sec) * 1000000L + (after_feed_tv.tv_usec - before_feed_tv.tv_usec);
-           if (f_us > 0) g_telem.frame_feed_us += (uint32_t)f_us;
-           if (f_us > 0 && f_us < 100000L) g_alsa_buf_us -= f_us;
-           if (g_alsa_buf_us < 0) g_alsa_buf_us = 0;
-           g_alsa_buf_us += ((long)rem_frames * 24295L) / 1000L;
-           if (f_us > 5000L || g_alsa_buf_us > 49700L) g_alsa_buf_us = 49700L;
-           g_spu_last_tv = after_feed_tv;
-          }
-
-          void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
+          new_spu_async = """void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
           {
            struct timeval t_spu0, t_spu1;
            gettimeofday(&t_spu0, NULL);
@@ -250,7 +218,7 @@ jobs:
              long wall_us = (before_feed_tv.tv_sec - g_spu_last_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - g_spu_last_tv.tv_usec);
              if (wall_us > 0 && wall_us < 250000L) {
               g_alsa_buf_us -= wall_us;
-              if (g_alsa_buf_us < -12000L) g_alsa_buf_us = -12000L;
+              if (g_alsa_buf_us < 0) g_alsa_buf_us = 0;
              } else if (wall_us >= 250000L) {
               g_alsa_buf_us = 48000L;
              }
@@ -258,23 +226,22 @@ jobs:
             int bytes_to_feed = (unsigned char *)spu.pS - spu.pSpuBuffer;
             int rem_frames = bytes_to_feed >> 2;
             long added_us = ((long)rem_frames * 24295L) / 1000L;
-            long base_buf_us = (g_alsa_buf_us > 0) ? g_alsa_buf_us : 0;
-            long projected_buf_us = base_buf_us + added_us;
+            long projected_buf_us = g_alsa_buf_us + added_us;
             int pad_frames = 0;
-            if (projected_buf_us < 25000L && rem_frames >= 220) {
-             long deficit_us = 29000L - projected_buf_us;
+            if (projected_buf_us < 24500L && rem_frames >= 256 && rem_frames < 960) {
+             long deficit_us = 28500L - projected_buf_us;
              int needed = (int)((deficit_us * 41L) / 1000L);
-             int max_pad = rem_frames >> 1;
-             if (max_pad > 176) max_pad = 176;
+             int max_pad = 1020 - rem_frames;
+             if (max_pad > 138) max_pad = 138;
              if (needed > max_pad) needed = max_pad;
-             if (needed >= 32) pad_frames = needed;
+             if (needed >= 28) pad_frames = needed;
             }
             int out_frames = rem_frames + pad_frames;
-            if (pad_frames > 0 && out_frames < 1600) {
+            if (pad_frames > 0 && out_frames <= 1020) {
              const short *src = (const short *)spu.pSpuBuffer;
              memcpy(g_pad_buf, src, rem_frames * 4);
              int tail_start = rem_frames - pad_frames;
-             int xfade = 64;
+             int xfade = 48;
              if (xfade > (pad_frames >> 1)) xfade = pad_frames >> 1;
              for (int i = 0; i < xfade; i++) {
               int w_old = ((xfade - i) << 8) / xfade;
@@ -286,21 +253,22 @@ jobs:
              }
              memcpy(&g_pad_buf[rem_frames * 2], &src[tail_start * 2], pad_frames * 4);
              out_current->feed(g_pad_buf, out_frames * 4);
-            } else if (bytes_to_feed > 0) {
+            } else {
              out_current->feed(spu.pSpuBuffer, bytes_to_feed);
             }
             spu.pS = (short *)spu.pSpuBuffer;
-            g_telem.frame_spu_samples += (uint32_t)out_frames;
-            g_telem.frame_padded_samples += (uint32_t)pad_frames;
+            g_telem.frame_spu_samples = (uint32_t)out_frames;
+            g_telem.frame_padded_samples = (uint32_t)pad_frames;
             g_telem.frame_xa_active = (spu.XAPlay != spu.XAFeed) ? 1 : 0;
             gettimeofday(&after_feed_tv, NULL);
             long f_us = (after_feed_tv.tv_sec - before_feed_tv.tv_sec) * 1000000L + (after_feed_tv.tv_usec - before_feed_tv.tv_usec);
             if (f_us > 0) g_telem.frame_feed_us += (uint32_t)f_us;
-            if (g_alsa_buf_us < 0) g_alsa_buf_us = 0;
-            if (f_us > 0 && f_us < 100000L) g_alsa_buf_us -= f_us;
-            if (g_alsa_buf_us < 0) g_alsa_buf_us = 0;
+            if (f_us > 0 && f_us < 100000L) {
+             g_alsa_buf_us -= f_us;
+             if (g_alsa_buf_us < 0) g_alsa_buf_us = 0;
+            }
             g_alsa_buf_us += ((long)out_frames * 24295L) / 1000L;
-            if (f_us > 5000L || g_alsa_buf_us > 49700L) g_alsa_buf_us = 49700L;
+            if (f_us > 4500L || g_alsa_buf_us > 49700L) g_alsa_buf_us = 49700L;
             g_telem.frame_alsa_buf_ms = (uint32_t)(g_alsa_buf_us / 1000L);
             g_spu_last_tv = after_feed_tv;"""
 
@@ -315,7 +283,7 @@ jobs:
 
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu)
-          log_msg("SUCCESS 2: Patched plugins/dfsound/spu.c (Pure V51 FeedXA + Pre-GPU SPU Flush + Fixed ALSA Deficit Bridge)!")
+          log_msg("SUCCESS 2: Patched plugins/dfsound/spu.c (Safe VBlank-Only 1.0x Bridge, zero mid-frame calls)!")
 
           # 3. Patch libpcsxcore/cdriso.c (Exact V51)
           with open("libpcsxcore/cdriso.c", "r") as f:
@@ -342,10 +310,9 @@ jobs:
           )
           with open("libpcsxcore/cdriso.c", "w") as f:
               f.write(cdriso)
-          log_msg("SUCCESS 3: Patched libpcsxcore/cdriso.c (Exact V51, cdrom.c left 100% untouched stock)!")
+          log_msg("SUCCESS 3: Patched libpcsxcore/cdriso.c (Exact V51)!")
 
-          # 4. Patch plugins/gpu_unai/gpulib_if.cpp:
-          #    - Call telem_spu_midframe_flush() right before heavy 3D command lists (list_len >= 400) so ALSA never starves during 35ms GPU renders
+          # 4. Patch plugins/gpu_unai/gpulib_if.cpp (Exact V51/V53 - NO midframe SPU call)
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
               gpu = f.read()
           assert "gpu_unai.config.lighting" in gpu, "Missing gpu_unai.config.lighting in gpulib_if.cpp"
@@ -378,7 +345,7 @@ jobs:
           gpu = gpu_top + gpu
           gpu = gpu.replace(
               "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{",
-              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tif (list_len >= 400) telem_spu_midframe_flush();\n\tgpu_telem_scope_timer _gt;\n\tconst uint32_t allow_l = g_telem.allow_menu_light;\n\tconst uint32_t base_p = g_telem.frame_poly_total;\n\t_gt.eff_light = (allow_l && g_telem.last_frame_polys <= 85 && base_p <= 85) ? 1 : 0;\n\tgpu_unai.config.lighting = _gt.eff_light;\n",
+              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tgpu_telem_scope_timer _gt;\n\tconst uint32_t allow_l = g_telem.allow_menu_light;\n\tconst uint32_t base_p = g_telem.frame_poly_total;\n\t_gt.eff_light = (allow_l && g_telem.last_frame_polys <= 85 && base_p <= 85) ? 1 : 0;\n\tgpu_unai.config.lighting = _gt.eff_light;\n",
               1
           )
           old_switch = "    switch (cmd)"
@@ -404,7 +371,7 @@ jobs:
           gpu = gpu.replace(old_switch, new_switch, 1)
           with open("plugins/gpu_unai/gpulib_if.cpp", "w") as f:
               f.write(gpu)
-          log_msg("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp (Pre-GPU midframe audio flush + V51 polygon pipeline)!")
+          log_msg("SUCCESS 4: Patched plugins/gpu_unai/gpulib_if.cpp (Exact V51/V53)!")
 
           # 5A. Update CYCLE_MULT_DEFAULT to 275 across libpcsxcore, frontend, and include
           patched_cm_files = []
@@ -423,8 +390,7 @@ jobs:
           log_msg(f"SUCCESS 5A: Updated CYCLE_MULT_DEFAULT to 275 in {patched_cm_files}!")
 
           # 5B. Patch frontend/libretro.c:
-          #     - Dynamic cycle_multiplier: 275 in 2D/Menus (polys <= 180), 310 in Medium 3D (181..450), 335 in Heavy 3D (> 450)
-          #     - Reset frame_spu_samples & frame_padded_samples per frame
+          #     - Safe Dynamic cycle_multiplier: 275 in 2D/Menus (polys <= 180), 300 in 3D (polys > 180)
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
@@ -461,7 +427,7 @@ jobs:
              g_prev_f_tv.tv_sec = 0; g_prev_f_tv.tv_usec = 0;
              g_sec_tv.tv_sec = 0; g_sec_tv.tv_usec = 0;
              if (g_tlog) {
-                fprintf(g_tlog, "\n=== PCSX-ReARMed V54 Telemetry Started ===\nGame: %s (allow_menu_light=%u, base_cycle_mult=%d)\n",
+                fprintf(g_tlog, "\n=== PCSX-ReARMed V55 Telemetry Started ===\nGame: %s (allow_menu_light=%u, base_cycle_mult=%d)\n",
                    (info && info->path) ? info->path : "unknown", g_telem.allow_menu_light, cycle_multiplier);
                 fprintf(g_tlog, "Columns: [SEC] fps | min_fps(max_ms) | avg_cpu_us avg_gpu_us avg_spu_us avg_feed_us avg_cd_us | polys(light/blend/tex) sprites vram_w | chd_hunks(last_hunk) xa_sect | samples(pad) buf_ms xa_on cm\n");
                 fflush(g_tlog);
@@ -542,16 +508,13 @@ jobs:
              g_telem.frame_vram_writes = 0;
              g_telem.frame_spu_us = 0;
              g_telem.frame_feed_us = 0;
-             g_telem.frame_spu_samples = 0;
              g_telem.frame_padded_samples = 0;
           }
           void retro_run(void)
           {
              telem_step_frame();
-             if (g_telem.last_frame_polys > 450) {
-                cycle_multiplier = 335;
-             } else if (g_telem.last_frame_polys > 180) {
-                cycle_multiplier = 310;
+             if (g_telem.last_frame_polys > 180) {
+                cycle_multiplier = 300;
              } else {
                 cycle_multiplier = 275;
              }"""
@@ -561,15 +524,15 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg(f"SUCCESS 5B: Patched frontend/libretro.c (Dynamic 3D cycle_multiplier 275/310/335 + V54 Telemetry)!")
+          log_msg(f"SUCCESS 5B: Patched frontend/libretro.c (Safe Dynamic cycle_multiplier 275/300 + V55 Telemetry)!")
 
-          with open("../build_v54_report.txt", "w") as rf:
+          with open("../build_v55_report.txt", "w") as rf:
               for line in report_lines:
                   rf.write(line + "\n")
-              rf.write("=== VERIFIED GIT DIFF FOR V54 ===\n")
+              rf.write("=== VERIFIED GIT DIFF FOR V55 ===\n")
           EOF
 
-          git diff Makefile Makefile.libretro include/ libpcsxcore/ plugins/ frontend/ >> ../build_v54_report.txt
+          git diff Makefile Makefile.libretro include/ libpcsxcore/ plugins/ frontend/ >> ../build_v55_report.txt
 
       - name: Compile Inside Ubuntu 18.04 Container (I-Cache Optimized Cortex-A9 Flags)
         run: |
@@ -595,18 +558,18 @@ jobs:
               HAVE_CHD=1 \
               HAVE_NEON=0 \
               HAVE_NEON_ASM=0 \
-              -j$(nproc) 2>&1 | tee ../build_v54.log
+              -j$(nproc) 2>&1 | tee ../build_v55.log
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
-            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v54_report.txt
+            ls -lh ../pcsx_rearmed_libretro.so >> ../build_v55_report.txt
           '
-          ls -lh pcsx_rearmed_libretro.so build_v54.log build_v54_report.txt
+          ls -lh pcsx_rearmed_libretro.so build_v55.log build_v55_report.txt
 
-      - name: Upload V54 Core + Build Log + Diff Report
+      - name: Upload V55 Core + Build Log + Diff Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx_rearmed_libretro_v54
+          name: pcsx_rearmed_libretro_v55
           path: |
             pcsx_rearmed_libretro.so
-            build_v54.log
-            build_v54_report.txt
+            build_v55.log
+            build_v55_report.txt
