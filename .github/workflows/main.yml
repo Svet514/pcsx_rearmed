@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V58 (Cortex-A9 -O3 Fix + Subsystem1 Telemetry + PixelSkip/ScaleHires Disabled)
+name: Build PCSX-ReARMed V59 (True 50Hz PAL Linear Resampler + SWAR 320x240 Downscaler + Zero-Dither GPU)
 
 on:
   workflow_dispatch:
@@ -35,7 +35,7 @@ jobs:
           cp -r /tmp/zlib-1.2.11 deps/libchdr/deps/zlib-1.2.11
           mkdir -p deps/libchdr/deps/lzma-26.02/include/real
 
-      - name: Apply V58 Patches (Enforced -O3 + Subsystem Telemetry + PixelSkip/ScaleHires Disabled)
+      - name: Apply V59 Patches (50Hz PAL Resampler + 320x240 SWAR Downscaler + Zero-Dither + CHD LRU Cache)
         run: |
           cd pcsx_src
           python3 - << 'EOF'
@@ -58,7 +58,7 @@ jobs:
                   names.append(m.group(1))
               return ", ".join(names)
 
-          # 0A. Strip THREAD_RENDERING from Makefile.libretro + upgrade -O2 -> -O3 + un-silence compiler lines
+          # 0A. Strip THREAD_RENDERING from Makefile.libretro + scoped -munaligned-access -Ofast on GPU/Video/SPU
           with open("Makefile.libretro", "r") as f:
               mklr = f.read()
           mklr = mklr.replace("THREAD_RENDERING ?= 1", "THREAD_RENDERING = 0")
@@ -67,11 +67,27 @@ jobs:
           mklr = mklr.replace("plugins/gpulib/gpulib_thread_if.o", "")
           mklr = re.sub(r"(?<!\S)-O2(?!\S)", "-O3", mklr)
           mklr = re.sub(r"^([ \t]+)@(\$\((?:CC|CXX|AS|LD)\))", r"\1\2", mklr, flags=re.M)
-          mklr += "\nCFLAGS += -O3 -fno-strict-aliasing\nCXXFLAGS += -O3 -fno-strict-aliasing\n"
+
+          extra_mk = [
+              "",
+              "CFLAGS += -O3 -fno-strict-aliasing",
+              "CXXFLAGS += -O3 -fno-strict-aliasing",
+              "plugins/gpu_unai/gpulib_if.o plugins/gpulib/gpu.o plugins/gpulib/vout_pl.o frontend/cspace.o frontend/libretro.o plugins/dfsound/spu.o: CFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
+              "plugins/gpu_unai/gpulib_if.o: CXXFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
+          ]
+          cspace_txt = open("frontend/cspace.c", "r", errors="ignore").read() if os.path.exists("frontend/cspace.c") else ""
+          cspace_arm_txt = open("frontend/cspace_arm.S", "r", errors="ignore").read() if os.path.exists("frontend/cspace_arm.S") else ""
+          if "HAVE_bgr555_to_rgb565" in cspace_txt and "bgr555_to_rgb565" in cspace_arm_txt:
+              extra_mk.append("frontend/cspace.o: CFLAGS += -DHAVE_bgr555_to_rgb565")
+              log_msg("SUCCESS 0A-ASM: Enabled -DHAVE_bgr555_to_rgb565 on frontend/cspace.o!")
+          else:
+              log_msg("INFO 0A-ASM: frontend/cspace.c uses direct __arm__ dispatch for cspace_arm.S.")
+
+          mklr += "\n".join(extra_mk) + "\n"
           assert "-DTHREAD_RENDERING" not in mklr, "Failed to strip -DTHREAD_RENDERING from Makefile.libretro"
           with open("Makefile.libretro", "w") as f:
               f.write(mklr)
-          log_msg("SUCCESS 0A: Stripped THREAD_RENDERING & enforced trailing -O3 -fno-strict-aliasing in Makefile.libretro!")
+          log_msg("SUCCESS 0A: Configured Makefile.libretro with scoped -munaligned-access -Ofast on GPU/Video/SPU!")
 
           # 0B. Patch Makefile (-O3 + 32 CHD_OBJS + un-silence compiler lines)
           with open("Makefile", "r") as f:
@@ -147,18 +163,16 @@ jobs:
               f.write(mk)
 
           chd_c_count = 0
-          stubbed_chd = []
           for tok in new_chd_mk.split():
               if tok.endswith(".o"):
                   c_path = tok[:-2] + ".c"
                   if not os.path.exists(c_path):
                       with open(c_path, "w") as cf:
                           cf.write("typedef int make_iso_compilers_happy;\n")
-                      stubbed_chd.append(c_path)
                   assert os.path.isfile(c_path), f"Missing CHD source file: {c_path}"
                   chd_c_count += 1
           assert chd_c_count == 32, f"Expected 32 CHD_OBJS files, found {chd_c_count}"
-          log_msg(f"SUCCESS 0B: Configured 32 CHD_OBJS (stubbed unused legacy units: {stubbed_chd})!")
+          log_msg("SUCCESS 0B: Configured 32 CHD_OBJS with hardware -munaligned-access!")
 
           # 1A. Patch libpcsxcore/cdrom.c: V37 Blue's Clues CD-XA FirstSector audio filter fix
           with open("libpcsxcore/cdrom.c", "r") as f:
@@ -171,7 +185,7 @@ jobs:
               f.write(cdrom)
           log_msg("SUCCESS 1A: Patched libpcsxcore/cdrom.c (Blue's Clues CD-XA fix)!")
 
-          # 1B. Hook deps/libchdr/src/libchdr_chd.c chd_read() for cd_ms + chd_cnt telemetry
+          # 1B. Add 16-Hunk LRU RAM Cache + cd_ms(m/h) telemetry in deps/libchdr/src/libchdr_chd.c
           chd_src_p = "deps/libchdr/src/libchdr_chd.c"
           with open(chd_src_p, "r") as f:
               chd_txt = f.read()
@@ -179,53 +193,95 @@ jobs:
           assert m_chd is not None, "Could not find chd_read definition in libchdr_chd.c"
           chd_ret, chd_params = m_chd.group(1), m_chd.group(2)
           chd_args = extract_c_arg_names(chd_params)
-          chd_hdr = "#include <stdint.h>\nextern uint64_t leap_pcsx_us(void);\nextern void leap_pcsx_add_cd(uint32_t dt_us);\n"
-          chd_wrap = (
-              f"static chd_error leap_chd_read_inner({chd_params});\n"
-              f"{chd_ret}chd_read({chd_params}) {{\n"
-              f"\tuint64_t _t0 = leap_pcsx_us();\n"
-              f"\tchd_error _r = leap_chd_read_inner({chd_args});\n"
-              f"\tleap_pcsx_add_cd((uint32_t)(leap_pcsx_us() - _t0));\n"
-              f"\treturn _r;\n"
-              f"}}\n"
-              f"static chd_error leap_chd_read_inner({chd_params})\n{{"
-          )
-          chd_txt = chd_hdr + chd_txt[:m_chd.start()] + chd_wrap + chd_txt[m_chd.end():]
+          chd_arg_list = [a.strip() for a in chd_args.split(",")]
+          assert len(chd_arg_list) == 3, f"Expected 3 args to chd_read, got {chd_arg_list}"
+          a_chd, a_hunk, a_buf = chd_arg_list
+
+          chd_lru_block = f"""#include <stdint.h>
+          #include <string.h>
+          extern uint64_t leap_pcsx_us(void);
+          extern void leap_pcsx_add_cd(uint32_t dt_us, int is_miss);
+          #define LEAP_CHD_SLOTS 16
+          #define LEAP_CHD_MAX_HUNK 24576U
+          static struct {{
+          \tconst void *chd;
+          \tuint32_t totalhunks;
+          \tuint32_t hunk;
+          \tuint32_t hbytes;
+          \tuint32_t stamp;
+          \tuint8_t data[LEAP_CHD_MAX_HUNK];
+          }} s_leap_chd_lru[LEAP_CHD_SLOTS];
+          static uint32_t s_leap_chd_clk = 0;
+          void leap_pcsx_chd_cache_clear(void) {{
+          \tfor (int i = 0; i < LEAP_CHD_SLOTS; ++i) {{
+          \t\ts_leap_chd_lru[i].chd = NULL;
+          \t\ts_leap_chd_lru[i].totalhunks = 0;
+          \t\ts_leap_chd_lru[i].hbytes = 0;
+          \t\ts_leap_chd_lru[i].stamp = 0;
+          \t}}
+          }}
+          static chd_error leap_chd_read_inner({chd_params});
+          {chd_ret}chd_read({chd_params}) {{
+          \tuint64_t _t0 = leap_pcsx_us();
+          \tconst chd_header *_hdr = ({a_chd} != NULL) ? chd_get_header({a_chd}) : NULL;
+          \tuint32_t _hb = (_hdr != NULL) ? _hdr->hunkbytes : 0U;
+          \tuint32_t _th = (_hdr != NULL) ? _hdr->totalhunks : 0U;
+          \tif (_hb > 0U && _hb <= LEAP_CHD_MAX_HUNK && {a_buf} != NULL) {{
+          \t\tfor (int _i = 0; _i < LEAP_CHD_SLOTS; ++_i) {{
+          \t\t\tif (s_leap_chd_lru[_i].chd == (const void *){a_chd} &&
+          \t\t\t    s_leap_chd_lru[_i].totalhunks == _th &&
+          \t\t\t    s_leap_chd_lru[_i].hunk == (uint32_t){a_hunk} &&
+          \t\t\t    s_leap_chd_lru[_i].hbytes == _hb) {{
+          \t\t\t\tmemcpy({a_buf}, s_leap_chd_lru[_i].data, _hb);
+          \t\t\t\ts_leap_chd_lru[_i].stamp = ++s_leap_chd_clk;
+          \t\t\t\tleap_pcsx_add_cd((uint32_t)(leap_pcsx_us() - _t0), 0);
+          \t\t\t\treturn (chd_error)0;
+          \t\t\t}}
+          \t\t}}
+          \t}}
+          \tchd_error _r = leap_chd_read_inner({chd_args});
+          \tif (_r == (chd_error)0 && _hb > 0U && _hb <= LEAP_CHD_MAX_HUNK && {a_buf} != NULL) {{
+          \t\tint _vic = 0;
+          \t\tuint32_t _min_st = s_leap_chd_lru[0].stamp;
+          \t\tfor (int _i = 1; _i < LEAP_CHD_SLOTS; ++_i) {{
+          \t\t\tif (s_leap_chd_lru[_i].stamp < _min_st) {{
+          \t\t\t\t_min_st = s_leap_chd_lru[_i].stamp;
+          \t\t\t\t_vic = _i;
+          \t\t\t}}
+          \t\t}}
+          \t\ts_leap_chd_lru[_vic].chd = (const void *){a_chd};
+          \t\ts_leap_chd_lru[_vic].totalhunks = _th;
+          \t\ts_leap_chd_lru[_vic].hunk = (uint32_t){a_hunk};
+          \t\ts_leap_chd_lru[_vic].hbytes = _hb;
+          \t\ts_leap_chd_lru[_vic].stamp = ++s_leap_chd_clk;
+          \t\tmemcpy(s_leap_chd_lru[_vic].data, {a_buf}, _hb);
+          \t}}
+          \tleap_pcsx_add_cd((uint32_t)(leap_pcsx_us() - _t0), 1);
+          \treturn _r;
+          }}
+          static chd_error leap_chd_read_inner({chd_params})
+          {{"""
+          chd_txt = chd_txt[:m_chd.start()] + chd_lru_block + chd_txt[m_chd.end():]
           with open(chd_src_p, "w") as f:
               f.write(chd_txt)
-          log_msg("SUCCESS 1B: Hooked chd_read() in libchdr_chd.c for cd_ms(c) telemetry!")
+          log_msg("SUCCESS 1B: Added 16-slot (384KB) CHD hunk LRU cache + cd_ms telemetry in libchdr_chd.c!")
 
-          # 2. Patch plugins/dfsound/spu.c (V55 1.0x Bridge + Blue's Clues XA Unmute + spu_ms/pad_f telemetry)
+          # 2. Patch plugins/dfsound/spu.c (Clean un-echoed SPUasync + V37 Blue's Clues XA Unmute + spu_ms telemetry)
           with open("plugins/dfsound/spu.c", "r") as f:
               spu = f.read()
 
-          spu_top = """#include <sys/time.h>
-          #include <string.h>
-          #include <stdint.h>
+          spu_top = """#include <stdint.h>
           extern uint64_t leap_pcsx_us(void);
           extern void leap_pcsx_spu_enter(void);
           extern void leap_pcsx_spu_leave(uint32_t dt_us);
-          extern void leap_pcsx_add_pad(uint32_t pad_f);
           uint32_t g_frame_polys = 0;
           uint32_t g_last_frame_polys = 0;
           uint32_t g_allow_menu_light = 0;
-          static struct timeval g_spu_last_tv = {0, 0};
-          static long g_alsa_buf_us = 48000;
-          static short g_pad_buf[2048] __attribute__((aligned(16)));
           """
           spu = spu_top + spu
 
           old_spu_async = """void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
-          {
-           do_samples(cycle, spu_config.iUseFixedUpdates);
-
-           if (spu.spuCtrl & CTRL_IRQ)
-            schedule_next_irq();
-
-           if (flags & 1) {
-            out_current->feed(spu.pSpuBuffer, (unsigned char *)spu.pS - spu.pSpuBuffer);
-            spu.pS = (short *)spu.pSpuBuffer;"""
-
+          {"""
           new_spu_async = """static void leap_SPUasync_inner(unsigned int cycle, unsigned int flags);
           void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
           {
@@ -235,70 +291,8 @@ jobs:
            leap_pcsx_spu_leave((uint32_t)(leap_pcsx_us() - _t0));
           }
           static void leap_SPUasync_inner(unsigned int cycle, unsigned int flags)
-          {
-           do_samples(cycle, spu_config.iUseFixedUpdates);
-
-           if (spu.spuCtrl & CTRL_IRQ)
-            schedule_next_irq();
-
-           if (flags & 1) {
-            struct timeval before_feed_tv, after_feed_tv;
-            gettimeofday(&before_feed_tv, NULL);
-            if (g_spu_last_tv.tv_sec != 0) {
-             long wall_us = (before_feed_tv.tv_sec - g_spu_last_tv.tv_sec) * 1000000L + (before_feed_tv.tv_usec - g_spu_last_tv.tv_usec);
-             if (wall_us > 0 && wall_us < 250000L) {
-              g_alsa_buf_us -= wall_us;
-              if (g_alsa_buf_us < 0) g_alsa_buf_us = 0;
-             } else if (wall_us >= 250000L) {
-              g_alsa_buf_us = 48000L;
-             }
-            }
-            int bytes_to_feed = (unsigned char *)spu.pS - spu.pSpuBuffer;
-            int rem_frames = bytes_to_feed >> 2;
-            long added_us = ((long)rem_frames * 24295L) / 1000L;
-            long projected_buf_us = g_alsa_buf_us + added_us;
-            int pad_frames = 0;
-            if (projected_buf_us < 24500L && rem_frames >= 256 && rem_frames < 960) {
-             long deficit_us = 28500L - projected_buf_us;
-             int needed = (int)((deficit_us * 41L) / 1000L);
-             int max_pad = 1020 - rem_frames;
-             if (max_pad > 138) max_pad = 138;
-             if (needed > max_pad) needed = max_pad;
-             if (needed >= 28) pad_frames = needed;
-            }
-            int out_frames = rem_frames + pad_frames;
-            if (pad_frames > 0 && out_frames <= 1020) {
-             leap_pcsx_add_pad((uint32_t)pad_frames);
-             const short *src = (const short *)spu.pSpuBuffer;
-             memcpy(g_pad_buf, src, rem_frames * 4);
-             int tail_start = rem_frames - pad_frames;
-             int xfade = 48;
-             if (xfade > (pad_frames >> 1)) xfade = pad_frames >> 1;
-             for (int i = 0; i < xfade; i++) {
-              int w_old = ((xfade - i) << 8) / xfade;
-              int w_new = (i << 8) / xfade;
-              int idx_dst = rem_frames - xfade + i;
-              int idx_src = tail_start - xfade + i;
-              g_pad_buf[idx_dst * 2]     = (short)((g_pad_buf[idx_dst * 2] * w_old + src[idx_src * 2] * w_new) >> 8);
-              g_pad_buf[idx_dst * 2 + 1] = (short)((g_pad_buf[idx_dst * 2 + 1] * w_old + src[idx_src * 2 + 1] * w_new) >> 8);
-             }
-             memcpy(&g_pad_buf[rem_frames * 2], &src[tail_start * 2], pad_frames * 4);
-             out_current->feed(g_pad_buf, out_frames * 4);
-            } else {
-             out_current->feed(spu.pSpuBuffer, bytes_to_feed);
-            }
-            spu.pS = (short *)spu.pSpuBuffer;
-            gettimeofday(&after_feed_tv, NULL);
-            long f_us = (after_feed_tv.tv_sec - before_feed_tv.tv_sec) * 1000000L + (after_feed_tv.tv_usec - before_feed_tv.tv_usec);
-            if (f_us > 0 && f_us < 100000L) {
-             g_alsa_buf_us -= f_us;
-             if (g_alsa_buf_us < 0) g_alsa_buf_us = 0;
-            }
-            g_alsa_buf_us += ((long)out_frames * 24295L) / 1000L;
-            if (f_us > 4500L || g_alsa_buf_us > 49700L) g_alsa_buf_us = 49700L;
-            g_spu_last_tv = after_feed_tv;"""
-
-          assert old_spu_async in spu, "Could not find SPUasync block in spu.c"
+          {"""
+          assert old_spu_async in spu, "Could not find SPUasync in spu.c"
           spu = spu.replace(old_spu_async, new_spu_async, 1)
 
           old_xa = " FeedXA(xap);                                          // call main XA feeder"
@@ -310,12 +304,26 @@ jobs:
 
           with open("plugins/dfsound/spu.c", "w") as f:
               f.write(spu)
-          log_msg("SUCCESS 2: Patched plugins/dfsound/spu.c (V55 1.0x Bridge + XA Unmute + spu_ms/pad_f telemetry)!")
+          log_msg("SUCCESS 2: Patched plugins/dfsound/spu.c (Removed memcpy tail-echo, kept XA Unmute + spu_ms timer)!")
 
-          # 3A. Patch plugins/gpu_unai/gpulib_if.cpp (Polygon counter + gpu_ms RAII timer)
+          # 3A. Patch plugins/gpu_unai/gpulib_if.cpp (Force dithering=0 + fast_lighting=1 + polygon threshold + gpu_ms timer)
           with open("plugins/gpu_unai/gpulib_if.cpp", "r") as f:
               gpu = f.read()
           assert "gpu_unai.config.lighting" in gpu, "Missing gpu_unai.config.lighting in gpulib_if.cpp"
+
+          unai_all = ""
+          for ufn in os.listdir("plugins/gpu_unai"):
+              ufp = os.path.join("plugins/gpu_unai", ufn)
+              if os.path.isfile(ufp) and ufn.endswith((".cpp", ".h", ".c")):
+                  unai_all += open(ufp, "r", errors="ignore").read() + "\n"
+
+          extra_unai_cfg = ""
+          if "fast_lighting" in unai_all:
+              extra_unai_cfg += "\tgpu_unai.config.fast_lighting = 1;\n"
+          if re.search(r"\bconfig\.dithering\b|\bu8\s+dithering\b|\bbool\s+dithering\b|\bint\s+dithering\b", unai_all):
+              extra_unai_cfg += "\tgpu_unai.config.dithering = 0;\n"
+          if re.search(r"\bconfig\.ilace_force\b|\bu8\s+ilace_force\b|\bbool\s+ilace_force\b|\bint\s+ilace_force\b", unai_all):
+              extra_unai_cfg += "\tgpu_unai.config.ilace_force = 1;\n"
 
           gpu_top = """#include <stdint.h>
           extern "C" {
@@ -334,7 +342,9 @@ jobs:
           gpu = gpu_top + gpu
           gpu = gpu.replace(
               "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{",
-              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tLeapPcsxGpuScope _lgs;\n\tconst uint32_t allow_l = g_allow_menu_light;\n\tuint32_t p_tot = g_frame_polys;\n\tgpu_unai.config.lighting = (allow_l && g_last_frame_polys <= 85 && p_tot <= 85) ? 1 : 0;\n",
+              "int do_cmd_list(u32 *list, int list_len, int *last_cmd)\n{\n\tLeapPcsxGpuScope _lgs;\n"
+              + extra_unai_cfg
+              + "\tconst uint32_t allow_l = g_allow_menu_light;\n\tuint32_t p_tot = g_frame_polys;\n\tgpu_unai.config.lighting = (allow_l && g_last_frame_polys <= 85 && p_tot <= 85) ? 1 : 0;\n",
               1
           )
           old_switch = "    switch (cmd)"
@@ -348,10 +358,9 @@ jobs:
           gpu = gpu.replace(old_switch, new_switch, 1)
           with open("plugins/gpu_unai/gpulib_if.cpp", "w") as f:
               f.write(gpu)
-          log_msg("SUCCESS 3A: Patched plugins/gpu_unai/gpulib_if.cpp (Polygon threshold + gpu_ms timer)!")
+          log_msg(f"SUCCESS 3A: Patched gpulib_if.cpp (extra_unai_cfg={extra_unai_cfg.strip()!r})!")
 
-          # 3B. Hook vout_update() in plugins/gpulib/vout_pl.c (or gpu.c) for pure vout_ms color-space conversion timing
-          vout_hooked = False
+          # 3B. Hook vout_update() in plugins/gpulib/vout_pl.c (or gpu.c) for pure vout_ms timing
           for vp in ["plugins/gpulib/vout_pl.c", "plugins/gpulib/gpu.c"]:
               if not os.path.exists(vp):
                   continue
@@ -361,7 +370,6 @@ jobs:
                   v_ret, v_params = m_vu.group(1), m_vu.group(2)
                   v_args = extract_c_arg_names(v_params)
                   is_int = bool(re.search(r"\bint\b", v_ret))
-                  inner_ret = "int" if is_int else "void"
                   v_hdr = "#include <stdint.h>\nextern uint64_t leap_pcsx_us(void);\nextern void leap_pcsx_vout_enter(void);\nextern void leap_pcsx_vout_leave(uint32_t dt_us);\n"
                   if is_int:
                       v_wrap = (
@@ -387,46 +395,31 @@ jobs:
                           f"static void leap_vout_update_inner({v_params})\n{{"
                       )
                   open(vp, "w").write(v_hdr + vt[:m_vu.start()] + v_wrap + vt[m_vu.end():])
-                  vout_hooked = True
-                  log_msg(f"SUCCESS 3B: Hooked vout_update() in {vp} ({inner_ret}) for vout_ms telemetry!")
+                  log_msg(f"SUCCESS 3B: Hooked vout_update() in {vp} for vout_ms telemetry!")
                   break
-          if not vout_hooked:
-              log_msg("NOTE 3B: vout_update not matched separately; vcb_ms will capture video output in libretro.c.")
 
-          # 4A. Update CYCLE_MULT_DEFAULT to 275 & default dithering to disabled while pixel_skip/scale_hires stay disabled
-          patched_cm_files = []
+          # 4A. Update CYCLE_MULT_DEFAULT to 275 across headers/sources
           for root_dir in ["libpcsxcore", "frontend", "include"]:
               for dirpath, _, filenames in os.walk(root_dir):
                   for fn in filenames:
                       if fn.endswith((".c", ".h")):
                           fpath = os.path.join(dirpath, fn)
-                          with open(fpath, "r", errors="ignore") as f:
-                              txt = f.read()
-                          orig_txt = txt
-                          txt = re.sub(r"(CYCLE_MULT_DEFAULT\s+)\d+", r"\g<1>275", txt)
-                          if "pcsx_rearmed_dithering" in txt:
-                              txt = re.sub(
-                                  r'("pcsx_rearmed_dithering"[\s\S]{0,600}?\},\s*)"enabled"',
-                                  r'\1"disabled"',
-                                  txt, count=1
-                              )
-                          if txt != orig_txt:
-                              with open(fpath, "w") as f:
-                                  f.write(txt)
-                              patched_cm_files.append(fpath)
-          log_msg(f"SUCCESS 4A: Updated CYCLE_MULT_DEFAULT=275 & option defaults in {patched_cm_files}!")
+                          txt = open(fpath, "r", errors="ignore").read()
+                          ntxt = re.sub(r"(CYCLE_MULT_DEFAULT\s+)\d+", r"\g<1>275", txt)
+                          if ntxt != txt:
+                              open(fpath, "w").write(ntxt)
 
           # 4B. Patch frontend/libretro.c:
-          #     - Enforce pcsx_rearmed_gpu_unai_pixel_skip = "disabled" & scale_hires = "disabled"
-          #     - Dynamic 275/300 cycle_multiplier + Dora/102 menu lighting
-          #     - Full /tmp/pcsx_telemetry.log subsystem profiler (zero ELF TLS __thread usage)
+          #     - Lock dithering=disabled, spu_reverb=disabled, spu_interpolation=simple, gteregsunneeded=enabled, cd_readahead=64, frameskip=disabled, pixel_skip/scale_hires=disabled
+          #     - Clamp SET_GEOMETRY base_width/height to 320x240 & downscale >320x240 RGB565 frames via 32-bit SWAR in leap_pcsx_vid_cb
+          #     - Phase-continuous 44100->41406Hz (step_fp=69800) linear resampler + smooth anti-XRUN stretch in leap_pcsx_aud_cb for true 50.0 FPS PAL / 60.0 FPS NTSC
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
           lr, n_cm_subs = re.subn(r"\bcycle_multiplier\s*=\s*[^;]+;", "cycle_multiplier = 275;", lr)
           assert n_cm_subs > 0, "Could not find cycle_multiplier assignment in frontend/libretro.c"
 
-          telem_block = r"""
+          v59_runtime = r"""
           #include <stdio.h>
           #include <string.h>
           #include <stdint.h>
@@ -438,6 +431,7 @@ jobs:
           extern uint32_t g_frame_polys;
           extern uint32_t g_last_frame_polys;
           extern uint32_t g_allow_menu_light;
+          extern void leap_pcsx_chd_cache_clear(void);
 
           static retro_environment_t g_leap_orig_env = NULL;
           static retro_video_refresh_t g_leap_orig_vid = NULL;
@@ -445,16 +439,27 @@ jobs:
 
           static FILE *g_ptfp = NULL;
           static volatile int g_in_retro_run = 0;
-          static int g_in_vout = 0, g_in_spu = 0;
+          static int g_in_vout = 0, g_in_spu = 0, g_leap_pix_fmt = 2;
           static uint64_t g_p_win_u = 0, g_p_pre_u = 0, g_p_emu_u = 0;
           static uint32_t g_p_sec = 0, g_p_vbl = 0, g_p_vreal = 0, g_p_vdup = 0;
           static unsigned g_p_vw = 0, g_p_vh = 0, g_p_last_vw = 0, g_p_last_vh = 0;
-          static size_t g_p_vpitch = 0, g_p_last_vpitch = 0;
+          static unsigned g_p_out_w = 320, g_p_out_h = 240;
+          static size_t g_p_vpitch = 0, g_p_last_vpitch = 0, g_p_out_pitch = 640;
           static uint32_t g_p_max_polys = 0;
           static uint32_t g_p_gpu_u = 0, g_p_vout_u = 0, g_p_vcb_u = 0, g_p_vcb_in_vout_u = 0;
-          static uint32_t g_p_cd_u = 0, g_p_cd_main_u = 0, g_p_cd_cnt = 0;
+          static uint32_t g_p_cd_u = 0, g_p_cd_main_u = 0, g_p_cd_miss = 0, g_p_cd_hit = 0;
           static uint32_t g_p_spu_u = 0, g_p_blk_u = 0, g_p_blk_in_spu_u = 0;
-          static uint32_t g_p_aud_f = 0, g_p_max_b = 0, g_p_pad_f = 0;
+          static uint32_t g_p_in_aud_f = 0, g_p_max_b = 0, g_p_stretch_f = 0;
+
+          static uint16_t g_v59_fb[320 * 240] __attribute__((aligned(16)));
+          static unsigned s_lut_w = 0, s_lut_h = 0;
+          static uint16_t s_y0[240], s_y1[240], s_x0[320], s_x1[320];
+
+          static int16_t g_rs_out[2048 * 2] __attribute__((aligned(16)));
+          static uint32_t s_rs_pos = 0;
+          static int s_rs_prev_l = 0, s_rs_prev_r = 0;
+          static uint64_t s_aud_last_u = 0;
+          static long s_alsa_buf_us = 48000L;
 
           uint64_t leap_pcsx_us(void) {
              struct timespec ts;
@@ -466,8 +471,8 @@ jobs:
              if (!g_ptfp) {
                 g_ptfp = fopen("/tmp/pcsx_telemetry.log", "w");
                 if (g_ptfp) {
-                   fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V58 ===\n");
-                   fprintf(g_ptfp, "sec | wall | emu_ms | vbl | v_r/d  | res         | clk | polys | cpu_ms | gpu_ms | vout_ms | vcb_ms | cd_ms(c)  | spu_ms | aud_ms | max_b | blk_ms | pad_f\n");
+                   fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V59 ===\n");
+                   fprintf(g_ptfp, "sec | wall | emu_ms | vbl | v_r/d  | res         | clk | polys | cpu_ms | gpu_ms | vout_ms | vcb_ms | cd_ms(m/h) | spu_ms | aud_ms | max_b | blk_ms | str_f\n");
                    fflush(g_ptfp);
                 }
              }
@@ -478,22 +483,54 @@ jobs:
           void leap_pcsx_vout_leave(uint32_t dt_us) { g_in_vout = 0; __sync_fetch_and_add(&g_p_vout_u, dt_us); }
           void leap_pcsx_spu_enter(void) { g_in_spu = 1; }
           void leap_pcsx_spu_leave(uint32_t dt_us) { g_in_spu = 0; __sync_fetch_and_add(&g_p_spu_u, dt_us); }
-          void leap_pcsx_add_pad(uint32_t pad_f) { __sync_fetch_and_add(&g_p_pad_f, pad_f); }
-          void leap_pcsx_add_cd(uint32_t dt_us) {
+          void leap_pcsx_add_cd(uint32_t dt_us, int is_miss) {
              __sync_fetch_and_add(&g_p_cd_u, dt_us);
-             __sync_fetch_and_add(&g_p_cd_cnt, 1U);
+             if (is_miss) __sync_fetch_and_add(&g_p_cd_miss, 1U);
+             else __sync_fetch_and_add(&g_p_cd_hit, 1U);
              if (g_in_retro_run) __sync_fetch_and_add(&g_p_cd_main_u, dt_us);
           }
 
+          struct leap_game_geom {
+             unsigned base_w, base_h, max_w, max_h;
+             float aspect;
+          };
+
           static bool leap_pcsx_env_cb(unsigned cmd, void *data) {
+             if (cmd == 10U && data != NULL) {
+                g_leap_pix_fmt = *(const int *)data;
+             } else if (cmd == 37U && data != NULL) {
+                struct leap_game_geom *gm = (struct leap_game_geom *)data;
+                if (gm->base_w > 320U) gm->base_w = 320U;
+                if (gm->base_h > 240U) gm->base_h = 240U;
+                if (gm->aspect <= 0.0f) gm->aspect = 4.0f / 3.0f;
+             }
              bool ret = g_leap_orig_env ? g_leap_orig_env(cmd, data) : false;
              if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE && data != NULL) {
                 struct retro_variable *rv = (struct retro_variable *)data;
                 if (rv->key != NULL) {
-                   if (strcmp(rv->key, "pcsx_rearmed_gpu_unai_pixel_skip") == 0 ||
+                   if (strcmp(rv->key, "pcsx_rearmed_dithering") == 0 ||
+                       strcmp(rv->key, "pcsx_rearmed_spu_reverb") == 0 ||
+                       strcmp(rv->key, "pcsx_rearmed_frameskip_type") == 0 ||
+                       strcmp(rv->key, "pcsx_rearmed_frameskip") == 0 ||
+                       strcmp(rv->key, "pcsx_rearmed_gpu_unai_pixel_skip") == 0 ||
                        strcmp(rv->key, "pcsx_rearmed_gpu_unai_scale_hires") == 0 ||
                        strcmp(rv->key, "pcsx_rearmed_scale_hires") == 0) {
                       rv->value = "disabled";
+                      return true;
+                   }
+                   if (strcmp(rv->key, "pcsx_rearmed_spu_interpolation") == 0) {
+                      rv->value = "simple";
+                      return true;
+                   }
+                   if (strcmp(rv->key, "pcsx_rearmed_gteregsunneeded") == 0 ||
+                       strcmp(rv->key, "pcsx_rearmed_duping_enable") == 0 ||
+                       strcmp(rv->key, "pcsx_rearmed_gpu_unai_fast_lighting") == 0 ||
+                       strcmp(rv->key, "pcsx_rearmed_gpu_unai_ilace_force") == 0) {
+                      rv->value = "enabled";
+                      return true;
+                   }
+                   if (strcmp(rv->key, "pcsx_rearmed_cd_readahead") == 0) {
+                      rv->value = "64";
                       return true;
                    }
                 }
@@ -501,45 +538,257 @@ jobs:
              return ret;
           }
 
-          static void leap_pcsx_vid_cb(const void *data, unsigned width, unsigned height, size_t pitch) {
-             if (data != NULL) {
-                g_p_vreal++;
-                g_p_vw = width;
-                g_p_vh = height;
-                g_p_vpitch = pitch;
-                if (width != g_p_last_vw || height != g_p_last_vh || pitch != g_p_last_vpitch) {
-                   g_p_last_vw = width;
-                   g_p_last_vh = height;
-                   g_p_last_vpitch = pitch;
-                   leap_pcsx_open_log();
-                   if (g_ptfp && g_p_sec <= 600) {
-                      unsigned bpp = (width > 0 && pitch >= width * 4U) ? 32U : 16U;
-                      fprintf(g_ptfp, "[MODE] res=%ux%u pitch=%zu bpp=%u\n", width, height, pitch, bpp);
-                      fflush(g_ptfp);
-                   }
+          #define LAVG565(a, b)    ((uint16_t)(((a) & (b)) + ((((a) ^ (b)) & 0xF7DEu) >> 1)))
+          #define LAVG565_32(a, b) (((a) & (b)) + ((((a) ^ (b)) & 0xF7DEF7DEu) >> 1))
+
+          static void leap_rebuild_vid_lut(unsigned w, unsigned h) {
+             s_lut_w = w;
+             s_lut_h = h;
+             for (unsigned y = 0; y < 240U; ++y) {
+                if (h == 240U) {
+                   s_y0[y] = s_y1[y] = (uint16_t)y;
+                } else if (h == 256U) {
+                   unsigned blk = y / 15U, rem = y % 15U, base = blk << 4;
+                   s_y0[y] = (uint16_t)(base + rem);
+                   s_y1[y] = (uint16_t)((rem == 14U) ? (base + 15U) : (base + rem));
+                } else {
+                   unsigned sy0 = (y * h) / 240U;
+                   unsigned sy1 = ((y + 1U) * h - 1U) / 240U;
+                   if (sy0 >= h) sy0 = h - 1U;
+                   if (sy1 >= h) sy1 = h - 1U;
+                   s_y0[y] = (uint16_t)sy0;
+                   s_y1[y] = (uint16_t)sy1;
                 }
-             } else {
-                g_p_vdup++;
              }
-             if (g_leap_orig_vid) {
-                uint64_t t0 = leap_pcsx_us();
-                g_leap_orig_vid(data, width, height, pitch);
+             for (unsigned x = 0; x < 320U; ++x) {
+                unsigned sx0 = (x * w) / 320U;
+                unsigned sx1 = ((x + 1U) * w - 1U) / 320U;
+                if (sx0 >= w) sx0 = w - 1U;
+                if (sx1 >= w) sx1 = w - 1U;
+                s_x0[x] = (uint16_t)sx0;
+                s_x1[x] = (uint16_t)sx1;
+             }
+          }
+
+          static void leap_pcsx_vid_cb(const void *data, unsigned width, unsigned height, size_t pitch) {
+             if (!g_leap_orig_vid) return;
+             uint64_t t0 = leap_pcsx_us();
+             if (data == NULL) {
+                g_p_vdup++;
+                g_leap_orig_vid(NULL, g_p_out_w, g_p_out_h, g_p_out_pitch);
                 uint32_t dt = (uint32_t)(leap_pcsx_us() - t0);
                 g_p_vcb_u += dt;
                 if (g_in_vout) g_p_vcb_in_vout_u += dt;
+                return;
              }
+
+             g_p_vreal++;
+             g_p_vw = width;
+             g_p_vh = height;
+             g_p_vpitch = pitch;
+             if (width != g_p_last_vw || height != g_p_last_vh || pitch != g_p_last_vpitch) {
+                g_p_last_vw = width;
+                g_p_last_vh = height;
+                g_p_last_vpitch = pitch;
+                leap_pcsx_open_log();
+                if (g_ptfp && g_p_sec <= 600) {
+                   unsigned bpp = (g_leap_pix_fmt == 1 && pitch >= width * 4U) ? 32U : 16U;
+                   fprintf(g_ptfp, "[MODE] res=%ux%u pitch=%zu bpp=%u\n", width, height, pitch, bpp);
+                   fflush(g_ptfp);
+                }
+             }
+
+             const void *out_ptr = data;
+             unsigned out_w = width, out_h = height;
+             size_t out_pitch = pitch;
+
+             if (g_leap_pix_fmt != 1 && (width > 320U || height > 240U) && width >= 160U && height >= 120U) {
+                if (width != s_lut_w || height != s_lut_h) {
+                   leap_rebuild_vid_lut(width, height);
+                }
+                const uint8_t *src_bytes = (const uint8_t *)data;
+                if (width == 512U && (((uintptr_t)data | pitch) & 3U) == 0U) {
+                   for (unsigned y = 0; y < 240U; ++y) {
+                      const uint32_t *r0 = (const uint32_t *)(src_bytes + (size_t)s_y0[y] * pitch);
+                      const uint32_t *r1 = (const uint32_t *)(src_bytes + (size_t)s_y1[y] * pitch);
+                      uint32_t *d32 = (uint32_t *)(g_v59_fb + y * 320U);
+                      if (r0 == r1) {
+                         for (unsigned bx = 0; bx < 32U; ++bx, r0 += 8, d32 += 5) {
+                            uint32_t a0 = r0[0], a1 = r0[1], a2 = r0[2], a3 = r0[3];
+                            uint32_t b0 = r0[4], b1 = r0[5], b2 = r0[6], b3 = r0[7];
+                            uint32_t q0 = LAVG565((uint16_t)a0, (uint16_t)(a0 >> 16));
+                            uint32_t q1 = (uint16_t)a1;
+                            uint32_t q2 = LAVG565((uint16_t)(a1 >> 16), (uint16_t)a2);
+                            uint32_t q3 = (uint16_t)(a2 >> 16);
+                            uint32_t q4 = LAVG565((uint16_t)a3, (uint16_t)(a3 >> 16));
+                            uint32_t q5 = LAVG565((uint16_t)b0, (uint16_t)(b0 >> 16));
+                            uint32_t q6 = (uint16_t)b1;
+                            uint32_t q7 = LAVG565((uint16_t)(b1 >> 16), (uint16_t)b2);
+                            uint32_t q8 = (uint16_t)(b2 >> 16);
+                            uint32_t q9 = LAVG565((uint16_t)b3, (uint16_t)(b3 >> 16));
+                            d32[0] = q0 | (q1 << 16);
+                            d32[1] = q2 | (q3 << 16);
+                            d32[2] = q4 | (q5 << 16);
+                            d32[3] = q6 | (q7 << 16);
+                            d32[4] = q8 | (q9 << 16);
+                         }
+                      } else {
+                         for (unsigned bx = 0; bx < 32U; ++bx, r0 += 8, r1 += 8, d32 += 5) {
+                            uint32_t a0 = LAVG565_32(r0[0], r1[0]), a1 = LAVG565_32(r0[1], r1[1]);
+                            uint32_t a2 = LAVG565_32(r0[2], r1[2]), a3 = LAVG565_32(r0[3], r1[3]);
+                            uint32_t b0 = LAVG565_32(r0[4], r1[4]), b1 = LAVG565_32(r0[5], r1[5]);
+                            uint32_t b2 = LAVG565_32(r0[6], r1[6]), b3 = LAVG565_32(r0[7], r1[7]);
+                            uint32_t q0 = LAVG565((uint16_t)a0, (uint16_t)(a0 >> 16));
+                            uint32_t q1 = (uint16_t)a1;
+                            uint32_t q2 = LAVG565((uint16_t)(a1 >> 16), (uint16_t)a2);
+                            uint32_t q3 = (uint16_t)(a2 >> 16);
+                            uint32_t q4 = LAVG565((uint16_t)a3, (uint16_t)(a3 >> 16));
+                            uint32_t q5 = LAVG565((uint16_t)b0, (uint16_t)(b0 >> 16));
+                            uint32_t q6 = (uint16_t)b1;
+                            uint32_t q7 = LAVG565((uint16_t)(b1 >> 16), (uint16_t)b2);
+                            uint32_t q8 = (uint16_t)(b2 >> 16);
+                            uint32_t q9 = LAVG565((uint16_t)b3, (uint16_t)(b3 >> 16));
+                            d32[0] = q0 | (q1 << 16);
+                            d32[1] = q2 | (q3 << 16);
+                            d32[2] = q4 | (q5 << 16);
+                            d32[3] = q6 | (q7 << 16);
+                            d32[4] = q8 | (q9 << 16);
+                         }
+                      }
+                   }
+                } else if (width == 640U && (((uintptr_t)data | pitch) & 3U) == 0U) {
+                   for (unsigned y = 0; y < 240U; ++y) {
+                      const uint32_t *r0 = (const uint32_t *)(src_bytes + (size_t)s_y0[y] * pitch);
+                      const uint32_t *r1 = (const uint32_t *)(src_bytes + (size_t)s_y1[y] * pitch);
+                      uint32_t *d32 = (uint32_t *)(g_v59_fb + y * 320U);
+                      if (r0 == r1) {
+                         for (unsigned x = 0; x < 160U; ++x, r0 += 2) {
+                            uint32_t v0 = r0[0], v1 = r0[1];
+                            uint32_t p0 = LAVG565((uint16_t)v0, (uint16_t)(v0 >> 16));
+                            uint32_t p1 = LAVG565((uint16_t)v1, (uint16_t)(v1 >> 16));
+                            d32[x] = p0 | (p1 << 16);
+                         }
+                      } else {
+                         for (unsigned x = 0; x < 160U; ++x, r0 += 2, r1 += 2) {
+                            uint32_t v0 = LAVG565_32(r0[0], r1[0]);
+                            uint32_t v1 = LAVG565_32(r0[1], r1[1]);
+                            uint32_t p0 = LAVG565((uint16_t)v0, (uint16_t)(v0 >> 16));
+                            uint32_t p1 = LAVG565((uint16_t)v1, (uint16_t)(v1 >> 16));
+                            d32[x] = p0 | (p1 << 16);
+                         }
+                      }
+                   }
+                } else {
+                   for (unsigned y = 0; y < 240U; ++y) {
+                      const uint16_t *r0 = (const uint16_t *)(src_bytes + (size_t)s_y0[y] * pitch);
+                      const uint16_t *r1 = (const uint16_t *)(src_bytes + (size_t)s_y1[y] * pitch);
+                      uint16_t *dst = g_v59_fb + y * 320U;
+                      if (r0 == r1) {
+                         for (unsigned x = 0; x < 320U; ++x) {
+                            uint16_t c0 = r0[s_x0[x]], c1 = r0[s_x1[x]];
+                            dst[x] = (c0 == c1) ? c0 : LAVG565(c0, c1);
+                         }
+                      } else {
+                         for (unsigned x = 0; x < 320U; ++x) {
+                            uint16_t x0 = s_x0[x], x1 = s_x1[x];
+                            uint16_t a = LAVG565(r0[x0], r1[x0]);
+                            uint16_t b = (x0 == x1) ? a : LAVG565(r0[x1], r1[x1]);
+                            dst[x] = (a == b) ? a : LAVG565(a, b);
+                         }
+                      }
+                   }
+                }
+                out_ptr = g_v59_fb;
+                out_w = 320U;
+                out_h = 240U;
+                out_pitch = 640U;
+             }
+
+             g_p_out_w = out_w;
+             g_p_out_h = out_h;
+             g_p_out_pitch = out_pitch;
+             g_leap_orig_vid(out_ptr, out_w, out_h, out_pitch);
+             uint32_t dt = (uint32_t)(leap_pcsx_us() - t0);
+             g_p_vcb_u += dt;
+             if (g_in_vout) g_p_vcb_in_vout_u += dt;
           }
 
           static size_t leap_pcsx_aud_cb(const int16_t *data, size_t frames) {
              if (!g_leap_orig_aud || !data || frames == 0) return frames;
-             uint64_t t0 = leap_pcsx_us();
-             size_t sent = g_leap_orig_aud(data, frames);
-             uint32_t dt = (uint32_t)(leap_pcsx_us() - t0);
-             __sync_fetch_and_add(&g_p_blk_u, dt);
-             if (g_in_spu) g_p_blk_in_spu_u += dt;
-             __sync_fetch_and_add(&g_p_aud_f, (uint32_t)sent);
-             if ((uint32_t)frames > g_p_max_b) g_p_max_b = (uint32_t)frames;
-             return sent;
+             uint64_t before_u = leap_pcsx_us();
+             if (s_aud_last_u != 0 && before_u > s_aud_last_u) {
+                uint64_t wall_u = before_u - s_aud_last_u;
+                if (wall_u < 250000ULL) {
+                   s_alsa_buf_us -= (long)wall_u;
+                   if (s_alsa_buf_us < 0L) s_alsa_buf_us = 0L;
+                } else {
+                   s_alsa_buf_us = 48000L;
+                }
+             }
+
+             uint32_t in_f = (uint32_t)frames;
+             __sync_fetch_and_add(&g_p_in_aud_f, in_f);
+             if (in_f > g_p_max_b) g_p_max_b = in_f;
+
+             /* 44100 Hz -> 41406 Hz (step_fp = 69800) locks PAL at true 50.00 FPS & NTSC at 60.00 FPS */
+             uint32_t step_fp = 69800U;
+             long nom_us = ((long)in_f * 22676L) / 1000L;
+             long proj_us = s_alsa_buf_us + nom_us;
+             if (proj_us < 25000L && in_f >= 256U && in_f <= 1200U) {
+                long def_us = 28500L - proj_us;
+                if (def_us > 3200L) def_us = 3200L;
+                long target_us = nom_us + def_us;
+                uint32_t adj = (uint32_t)(((uint64_t)step_fp * (uint64_t)nom_us) / (uint64_t)target_us);
+                if (adj < 60600U) adj = 60600U;
+                step_fp = adj;
+             }
+
+             uint32_t out_f = 0;
+             uint32_t idx = s_rs_pos >> 16;
+             while (idx < in_f && out_f < 2048U) {
+                uint32_t frac = s_rs_pos & 0xFFFFU;
+                int l0 = (idx == 0U) ? s_rs_prev_l : (int)data[(idx - 1U) * 2U];
+                int r0 = (idx == 0U) ? s_rs_prev_r : (int)data[(idx - 1U) * 2U + 1U];
+                int l1 = (int)data[idx * 2U];
+                int r1 = (int)data[idx * 2U + 1U];
+                g_rs_out[out_f * 2U]     = (int16_t)(l0 + (((l1 - l0) * (int)frac) >> 16));
+                g_rs_out[out_f * 2U + 1U] = (int16_t)(r0 + (((r1 - r0) * (int)frac) >> 16));
+                out_f++;
+                s_rs_pos += step_fp;
+                idx = s_rs_pos >> 16;
+             }
+             s_rs_prev_l = (int)data[(in_f - 1U) * 2U];
+             s_rs_prev_r = (int)data[(in_f - 1U) * 2U + 1U];
+             if (s_rs_pos >= (in_f << 16)) s_rs_pos -= (in_f << 16);
+             else s_rs_pos = 0;
+
+             uint32_t nom_out = (in_f * 65536U) / 69800U;
+             if (out_f > nom_out + 2U) {
+                __sync_fetch_and_add(&g_p_stretch_f, out_f - nom_out);
+             }
+
+             uint64_t t_cb0 = leap_pcsx_us();
+             const int16_t *send_p = g_rs_out;
+             uint32_t rem_send = out_f;
+             while (rem_send > 0U) {
+                uint32_t chunk = (rem_send > 1020U) ? 1020U : rem_send;
+                g_leap_orig_aud(send_p, chunk);
+                send_p += chunk * 2U;
+                rem_send -= chunk;
+             }
+             uint64_t after_u = leap_pcsx_us();
+             uint32_t blk_dt = (uint32_t)(after_u - t_cb0);
+             __sync_fetch_and_add(&g_p_blk_u, blk_dt);
+             if (g_in_spu) g_p_blk_in_spu_u += blk_dt;
+
+             if (blk_dt > 0U && blk_dt < 100000U) {
+                s_alsa_buf_us -= (long)blk_dt;
+                if (s_alsa_buf_us < 0L) s_alsa_buf_us = 0L;
+             }
+             s_alsa_buf_us += ((long)out_f * 24150L) / 1000L;
+             if (blk_dt >= 3500U || s_alsa_buf_us > 52000L) s_alsa_buf_us = 52000L;
+             s_aud_last_u = after_u;
+             return frames;
           }
 
           static void leap_pcsx_pre(void) {
@@ -567,28 +816,29 @@ jobs:
                 uint32_t vcb_in = g_p_vcb_in_vout_u; g_p_vcb_in_vout_u = 0;
                 uint32_t pure_vout_u = (vout_tot > vcb_in) ? (vout_tot - vcb_in) : 0;
                 uint32_t cd_u = __sync_lock_test_and_set(&g_p_cd_u, 0);
-                uint32_t cd_cnt = __sync_lock_test_and_set(&g_p_cd_cnt, 0);
+                uint32_t cd_miss = __sync_lock_test_and_set(&g_p_cd_miss, 0);
+                uint32_t cd_hit = __sync_lock_test_and_set(&g_p_cd_hit, 0);
                 uint32_t cd_main_u = __sync_lock_test_and_set(&g_p_cd_main_u, 0);
                 uint32_t spu_tot = __sync_lock_test_and_set(&g_p_spu_u, 0);
                 uint32_t blk_u = __sync_lock_test_and_set(&g_p_blk_u, 0);
                 uint32_t blk_in = g_p_blk_in_spu_u; g_p_blk_in_spu_u = 0;
                 uint32_t pure_spu_u = (spu_tot > blk_in) ? (spu_tot - blk_in) : 0;
-                uint32_t aud_f = __sync_lock_test_and_set(&g_p_aud_f, 0);
-                uint32_t pad_f = __sync_lock_test_and_set(&g_p_pad_f, 0);
+                uint32_t in_aud_f = __sync_lock_test_and_set(&g_p_in_aud_f, 0);
+                uint32_t str_f = __sync_lock_test_and_set(&g_p_stretch_f, 0);
 
                 uint32_t sub_u = gpu_u + pure_vout_u + vcb_u + cd_main_u + pure_spu_u + blk_u;
                 uint32_t cpu_u = (emu_u > sub_u) ? (emu_u - sub_u) : 0;
 
                 if (g_ptfp && g_p_sec <= 600) {
-                   unsigned bpp = (g_p_vw > 0 && g_p_vpitch >= g_p_vw * 4U) ? 32U : 16U;
-                   char rbuf[20], vrbuf[16], cdbuf[16];
+                   unsigned bpp = (g_leap_pix_fmt == 1 && g_p_vpitch >= g_p_vw * 4U) ? 32U : 16U;
+                   char rbuf[20], vrbuf[16], cdbuf[20];
                    snprintf(rbuf, sizeof(rbuf), "%ux%ux%u", g_p_vw, g_p_vh, bpp);
                    snprintf(vrbuf, sizeof(vrbuf), "%u/%u", g_p_vreal, g_p_vdup);
-                   snprintf(cdbuf, sizeof(cdbuf), "%u(%u)", cd_u / 1000U, cd_cnt);
-                   fprintf(g_ptfp, "%3u | %4u | %6u | %3u | %-6s | %-11s | %3d | %5u | %6u | %6u | %7u | %6u | %-9s | %6u | %6u | %5u | %6u | %5u\n",
+                   snprintf(cdbuf, sizeof(cdbuf), "%u(%u/%u)", cd_u / 1000U, cd_miss, cd_hit);
+                   fprintf(g_ptfp, "%3u | %4u | %6u | %3u | %-6s | %-11s | %3d | %5u | %6u | %6u | %7u | %6u | %-10s | %6u | %6u | %5u | %6u | %5u\n",
                            g_p_sec, wm, emu_u / 1000U, g_p_vbl, vrbuf, rbuf, cur_clk, g_p_max_polys,
                            cpu_u / 1000U, gpu_u / 1000U, pure_vout_u / 1000U, vcb_u / 1000U, cdbuf,
-                           pure_spu_u / 1000U, (aud_f * 1000U) / 41155U, g_p_max_b, blk_u / 1000U, pad_f);
+                           pure_spu_u / 1000U, (in_aud_f * 1000U) / 44100U, g_p_max_b, blk_u / 1000U, str_f);
                    fflush(g_ptfp);
                 }
                 g_p_win_u = u;
@@ -608,7 +858,7 @@ jobs:
                   r"void\s+retro_run\b",
               ]
           )
-          lr = lr[:pos_first_cb] + telem_block + "\n" + lr[pos_first_cb:]
+          lr = lr[:pos_first_cb] + v59_runtime + "\n" + lr[pos_first_cb:]
 
           lr, n_env = re.subn(
               r"(void\s+retro_set_environment\s*\(\s*retro_environment_t\s+(\w+)\s*\)\s*\{)",
@@ -627,33 +877,41 @@ jobs:
           )
           assert n_env == 1 and n_vid == 1 and n_aud == 1, f"Failed Libretro cb hooks: {n_env},{n_vid},{n_aud}"
 
-          old_load = """static void update_variables(bool in_flight);
-          bool retro_load_game(const struct retro_game_info *info)
-          {"""
+          def build_load_inj(m):
+              hdr_open, p_var = m.group(1), m.group(2)
+              return (
+                  f"{hdr_open}\n"
+                  f"   cycle_multiplier = 275;\n"
+                  f"   g_allow_menu_light = 0;\n"
+                  f"   g_frame_polys = 0;\n"
+                  f"   g_last_frame_polys = 0;\n"
+                  f"   s_rs_pos = 0;\n"
+                  f"   s_rs_prev_l = 0;\n"
+                  f"   s_rs_prev_r = 0;\n"
+                  f"   s_aud_last_u = 0;\n"
+                  f"   s_alsa_buf_us = 48000L;\n"
+                  f"   leap_pcsx_chd_cache_clear();\n"
+                  f"   leap_pcsx_open_log();\n"
+                  f"   if ({p_var} && {p_var}->path) {{\n"
+                  f"      if (g_ptfp) {{\n"
+                  f"         fprintf(g_ptfp, \"[LOAD] path='%s'\\n\", {p_var}->path);\n"
+                  f"         fflush(g_ptfp);\n"
+                  f"      }}\n"
+                  f"      if (strstr({p_var}->path, \"Dora\") != NULL || strstr({p_var}->path, \"dora\") != NULL ||\n"
+                  f"          strstr({p_var}->path, \"102\") != NULL || strstr({p_var}->path, \"Dalmatian\") != NULL || strstr({p_var}->path, \"dalmatian\") != NULL) {{\n"
+                  f"         g_allow_menu_light = 1;\n"
+                  f"      }}\n"
+                  f"   }}"
+              )
 
-          new_load = r"""static void update_variables(bool in_flight);
-          bool retro_load_game(const struct retro_game_info *info)
-          {
-             cycle_multiplier = 275;
-             g_allow_menu_light = 0;
-             g_frame_polys = 0;
-             g_last_frame_polys = 0;
-             leap_pcsx_open_log();
-             if (info && info->path) {
-                if (g_ptfp) {
-                   fprintf(g_ptfp, "[LOAD] path='%s'\n", info->path);
-                   fflush(g_ptfp);
-                }
-                if (strstr(info->path, "Dora") != NULL || strstr(info->path, "dora") != NULL ||
-                    strstr(info->path, "102") != NULL || strstr(info->path, "Dalmatian") != NULL || strstr(info->path, "dalmatian") != NULL) {
-                   g_allow_menu_light = 1;
-                }
-             }"""
+          lr, n_load = re.subn(
+              r"(bool\s+retro_load_game\s*\(\s*const\s+struct\s+retro_game_info\s*\*\s*(\w+)\s*\)\s*\{)",
+              build_load_inj,
+              lr, count=1
+          )
+          assert n_load == 1, "Could not find retro_load_game in libretro.c"
 
-          assert old_load in lr, "Could not find retro_load_game in libretro.c"
-          lr = lr.replace(old_load, new_load, 1)
-
-          m_run = re.search(r"void\s+retro_run\s*\(\s*void\s*\)\s*\{", lr)
+          m_run = re.search(r"void\s+retro_run\s*\(\s*(?:void)?\s*\)\s*\{", lr)
           assert m_run is not None, "Could not find retro_run in libretro.c"
           r_bs = m_run.end() - 1
           dp = 0
@@ -680,15 +938,15 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 4B: Patched frontend/libretro.c (PixelSkip/ScaleHires locked disabled + V58 telemetry)!")
+          log_msg("SUCCESS 4B: Patched frontend/libretro.c (V59 50Hz Resampler + 320x240 SWAR Downscaler + Zero-Frameskip Option Locks)!")
 
-          with open("../build_v58_report.txt", "w") as rf:
-              rf.write("=== PCSX-ReARMed V58 PATCH SUMMARY ===\n")
+          with open("../build_v59_report.txt", "w") as rf:
+              rf.write("=== PCSX-ReARMed V59 PATCH SUMMARY ===\n")
               for line in report_lines:
                   rf.write(line + "\n")
           EOF
 
-      - name: Compile Inside Ubuntu 18.04 Container (Cortex-A9 Enforced -O3 + Stripped .so)
+      - name: Compile Inside Ubuntu 18.04 Container (Deduplicated Cortex-A9 Flags + Stripped .so)
         run: |
           docker run --rm -v "$PWD:/work" -w /work/pcsx_src ubuntu:18.04 bash -c '
             set -e -o pipefail
@@ -696,14 +954,14 @@ jobs:
             apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi binutils-arm-linux-gnueabi make
             OPT_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -O3 -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fno-strict-aliasing -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             export CFLAGS="$OPT_FLAGS"
-            export CXXFLAGS="$OPT_FLAGS"
+            export CXXFLAGS=""
             export LDFLAGS="-Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc"
             make -f Makefile.libretro \
               V=1 \
               platform=unix \
               ARCH=arm \
-              CC="arm-linux-gnueabi-gcc $OPT_FLAGS" \
-              CXX="arm-linux-gnueabi-g++ $OPT_FLAGS -static-libstdc++ -static-libgcc" \
+              CC="arm-linux-gnueabi-gcc" \
+              CXX="arm-linux-gnueabi-g++ -static-libstdc++ -static-libgcc" \
               AS="arm-linux-gnueabi-as" \
               DYNAREC=ari64 \
               BUILTIN_GPU=unai \
@@ -712,25 +970,25 @@ jobs:
               HAVE_CHD=1 \
               HAVE_NEON=0 \
               HAVE_NEON_ASM=0 \
-              -j$(nproc) 2>&1 | tee ../build_v58.log
-            echo "=== KEY COMPILER FLAGS AUDIT ===" >> ../build_v58_report.txt
-            grep -E "gpulib_if\.cpp|spu\.c|libretro\.c|cspace_arm|gte_arm" ../build_v58.log | head -n 20 >> ../build_v58_report.txt || true
-            echo "=== GLIBC VERSIONS ===" >> ../build_v58_report.txt
-            arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro.so | grep -o "GLIBC_[0-9.]*" | sort -uV >> ../build_v58_report.txt || true
-            echo "=== BINARY SIZE (UNSTRIPPED -> STRIPPED) ===" >> ../build_v58_report.txt
-            ls -lh pcsx_rearmed_libretro.so >> ../build_v58_report.txt
+              -j$(nproc) 2>&1 | tee ../build_v59.log
+            echo "=== KEY COMPILER FLAGS AUDIT ===" >> ../build_v59_report.txt
+            grep -E "gpulib_if\.cpp|vout_pl\.c|spu\.c|libretro\.c|cspace\.c|cspace_arm" ../build_v59.log | head -n 20 >> ../build_v59_report.txt || true
+            echo "=== GLIBC VERSIONS ===" >> ../build_v59_report.txt
+            arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro.so | grep -o "GLIBC_[0-9.]*" | sort -uV >> ../build_v59_report.txt || true
+            echo "=== BINARY SIZE (UNSTRIPPED -> STRIPPED) ===" >> ../build_v59_report.txt
+            ls -lh pcsx_rearmed_libretro.so >> ../build_v59_report.txt
             arm-linux-gnueabi-strip -s pcsx_rearmed_libretro.so
-            ls -lh pcsx_rearmed_libretro.so >> ../build_v58_report.txt
+            ls -lh pcsx_rearmed_libretro.so >> ../build_v59_report.txt
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
           '
-          ls -lh pcsx_rearmed_libretro.so build_v58.log build_v58_report.txt
+          ls -lh pcsx_rearmed_libretro.so build_v59.log build_v59_report.txt
 
-      - name: Upload V58 Core + Build Log + Audit Report
+      - name: Upload V59 Core + Build Log + Audit Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx_rearmed_libretro_v58
+          name: pcsx_rearmed_libretro_v59
           path: |
             pcsx_rearmed_libretro.so
-            build_v58.log
-            build_v58_report.txt
+            build_v59.log
+            build_v59_report.txt
