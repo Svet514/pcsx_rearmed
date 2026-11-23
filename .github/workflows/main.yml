@@ -391,7 +391,7 @@ jobs:
                               open(fpath, "w").write(ntxt)
 
           # 4B. Patch frontend/libretro.c:
-          #     - Single-pass SWAR 512/640 -> 320 BGR555->RGB565 in vout_set_mode / vout_flip (zero scanline skip on 240p/256p)
+          #     - Single-pass SWAR 512/640 -> 320 BGR555->RGB565 in vout_set_mode / vout_flip (zero reliance on post-2021 symbols!)
           #     - 8-VBlank closed-loop clock governor (275 .. 480)
           #     - Positive-bias 49.93 Hz PAL / 59.92 Hz NTSC resampler (step_fp = 69750)
           with open("frontend/libretro.c", "r") as f:
@@ -400,7 +400,6 @@ jobs:
           lr, n_cm_subs = re.subn(r"\bcycle_multiplier\s*=\s*[^;]+;", "cycle_multiplier = 275;", lr)
           assert n_cm_subs > 0, "Could not find cycle_multiplier assignment in frontend/libretro.c"
 
-          # Hook static vout_set_mode and static vout_flip in frontend/libretro.c
           m_vsm = re.search(r"^static\s+void\s+vout_set_mode\s*\(([^;{}]*)\)\s*\{", lr, flags=re.M)
           m_vfl = re.search(r"^static\s+void\s+vout_flip\s*\(([^;{}]*)\)\s*\{", lr, flags=re.M)
           assert m_vsm is not None and m_vfl is not None, "Could not find vout_set_mode / vout_flip in frontend/libretro.c"
@@ -410,7 +409,6 @@ jobs:
           vfl_params = m_vfl.group(1)
           vfl_args = [a.strip() for a in extract_c_arg_names(vfl_params).split(",")]
 
-          # Rename vout_set_mode -> leap_orig_vout_set_mode and append wrapper right after its closing brace
           vsm_open = lr.index("{", m_vsm.start())
           vsm_close = find_matching_brace(lr, vsm_open)
           assert len(vsm_args) == 5, f"Unexpected vout_set_mode args: {vsm_args}"
@@ -419,15 +417,17 @@ jobs:
           vsm_wrapper = f"""
 
           static int g_v61_hscale_w = 0;
+          static int g_v61_pix_fmt = 2; /* RETRO_PIXEL_FORMAT_RGB565 */
           static unsigned g_v61_out_h = 240U;
           static uint16_t g_v61_vout_fb[320 * 256] __attribute__((aligned(16)));
+          typedef uint32_t leap_u32_ua __attribute__((aligned(2)));
 
           #define L555_AVG(a, b) ((uint16_t)(((a) & (b)) + ((((a) ^ (b)) & 0x7BDEu) >> 1)))
           #define L555_TO_565_PAIR(p) ((((p) & 0x001F001Fu) << 11) | (((p) & 0x03E003E0u) << 1) | (((p) & 0x7C007C00u) >> 10))
 
           static void leap_v61_blit_row_320(uint32_t *dst32, const uint16_t *src16, int src_w)
           {{
-             const uint32_t *r32 = (const uint32_t *)src16;
+             const leap_u32_ua *r32 = (const leap_u32_ua *)src16;
              if (src_w == 512) {{
                 for (unsigned bx = 0; bx < 32U; ++bx, r32 += 8, dst32 += 5) {{
                    uint32_t a0 = r32[0], a1 = r32[1], a2 = r32[2], a3 = r32[3];
@@ -491,7 +491,6 @@ jobs:
               + lr[vsm_close + 1 :]
           )
 
-          # Re-locate vout_flip after vout_set_mode insertion
           m_vfl = re.search(r"^static\s+void\s+vout_flip\s*\(([^;{}]*)\)\s*\{", lr, flags=re.M)
           assert m_vfl is not None
           vfl_open = lr.index("{", m_vfl.start())
@@ -503,12 +502,12 @@ jobs:
 
               static void vout_flip({vfl_params})
               {{
-                 if (g_v61_hscale_w != 0 && (in_enable_crosshair[0] + in_enable_crosshair[1]) == 0) {{
+                 if (g_v61_hscale_w != 0) {{
                     if ({vf_vram} == NULL) {{
                        if (video_cb) video_cb(NULL, 320U, g_v61_out_h, 640U);
                        return;
                     }}
-                    if (!{vf_bgr24} && current_fmt == RETRO_PIXEL_FORMAT_RGB565 && {vf_w} >= 320 && {vf_w} <= 640 && {vf_h} > 0 && {vf_h} <= 512) {{
+                    if (!{vf_bgr24} && g_v61_pix_fmt == 2 && {vf_w} >= 320 && {vf_w} <= 640 && {vf_h} > 0 && {vf_h} <= 512) {{
                        unsigned out_h = ({vf_h} > 256) ? ((unsigned){vf_h} >> 1) : (unsigned){vf_h};
                        if (out_h > 256U) out_h = 256U;
                        size_t row_b = ({vf_stride} <= 1024) ? ((size_t){vf_stride} * 2U) : (size_t){vf_stride};
@@ -533,12 +532,12 @@ jobs:
 
               static void vout_flip({vfl_params})
               {{
-                 if (g_v61_hscale_w != 0 && (in_enable_crosshair[0] + in_enable_crosshair[1]) == 0 && !enhres) {{
+                 if (g_v61_hscale_w != 0) {{
                     if ({vf_vram} == NULL) {{
                        if (video_cb) video_cb(NULL, 320U, g_v61_out_h, 640U);
                        return;
                     }}
-                    if (!{vf_bgr24} && current_fmt == RETRO_PIXEL_FORMAT_RGB565 && {vf_x} == 0 && {vf_y} == 0 && {vf_w} >= 320 && {vf_w} <= 640 && {vf_h} > 0 && {vf_h} <= 512) {{
+                    if (!{vf_bgr24} && g_v61_pix_fmt == 2 && {vf_x} == 0 && {vf_y} == 0 && {vf_w} >= 320 && {vf_w} <= 640 && {vf_h} > 0 && {vf_h} <= 512) {{
                        unsigned out_h = ({vf_h} > 256) ? ((unsigned){vf_h} >> 1) : (unsigned){vf_h};
                        if (out_h > 256U) out_h = 256U;
                        unsigned row_step = ({vf_h} > 256) ? 4096U : 2048U;
@@ -559,9 +558,6 @@ jobs:
               """
           else:
               raise AssertionError(f"Unexpected vout_flip args: {vfl_args}")
-
-          # Note: for 8-arg case remove `&& !enhres` since `enhres` is local to orig_vout_flip (psx_w <= 640 already checked by w <= 640)
-          vfl_wrapper = vfl_wrapper.replace(" && !enhres", "")
 
           lr = (
               lr[:m_vfl.start()]
@@ -585,6 +581,7 @@ jobs:
           extern uint32_t g_last_frame_polys;
           extern uint32_t g_allow_menu_light;
 
+          static retro_environment_t g_leap_orig_env = NULL;
           static retro_video_refresh_t g_leap_orig_vid = NULL;
           static retro_audio_sample_batch_t g_leap_orig_aud = NULL;
 
@@ -637,6 +634,14 @@ jobs:
              __sync_fetch_and_add(&g_p_cd_u, dt_us);
              __sync_fetch_and_add(&g_p_cd_cnt, 1U);
              if (g_in_retro_run) __sync_fetch_and_add(&g_p_cd_main_u, dt_us);
+          }
+
+          static bool leap_pcsx_env_cb(unsigned cmd, void *data) {
+             bool ret = g_leap_orig_env ? g_leap_orig_env(cmd, data) : false;
+             if (cmd == 10U && data != NULL && ret) {
+                g_v61_pix_fmt = *(const int *)data;
+             }
+             return ret;
           }
 
           static void leap_pcsx_vid_cb(const void *data, unsigned width, unsigned height, size_t pitch) {
@@ -844,6 +849,11 @@ jobs:
           )
           lr = lr[:pos_first_cb] + v61_runtime + "\n" + lr[pos_first_cb:]
 
+          lr, n_env = re.subn(
+              r"(void\s+retro_set_environment\s*\(\s*retro_environment_t\s+(\w+)\s*\)\s*\{)",
+              r"\1 g_leap_orig_env = \2; \2 = leap_pcsx_env_cb;",
+              lr, count=1
+          )
           lr, n_vid = re.subn(
               r"(void\s+retro_set_video_refresh\s*\(\s*retro_video_refresh_t\s+(\w+)\s*\)\s*\{)",
               r"\1 g_leap_orig_vid = \2; \2 = leap_pcsx_vid_cb;",
@@ -854,13 +864,14 @@ jobs:
               r"\1 g_leap_orig_aud = \2; \2 = leap_pcsx_aud_cb;",
               lr, count=1
           )
-          assert n_vid == 1 and n_aud == 1, f"Failed Libretro cb hooks: {n_vid},{n_aud}"
+          assert n_env == 1 and n_vid == 1 and n_aud == 1, f"Failed Libretro cb hooks: {n_env},{n_vid},{n_aud}"
 
           def build_load_inj(m):
               hdr_open, p_var = m.group(1), m.group(2)
               return (
                   f"{hdr_open}\n"
                   f"   cycle_multiplier = 275;\n"
+                  f"   g_v61_pix_fmt = 2;\n"
                   f"   g_allow_menu_light = 0;\n"
                   f"   g_frame_polys = 0;\n"
                   f"   g_last_frame_polys = 0;\n"
