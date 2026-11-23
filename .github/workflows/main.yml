@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V58 (Cortex-A9 -O3 Fix + Subsystem Telemetry + PixelSkip/ScaleHires Disabled)
+name: Build PCSX-ReARMed V58 (Cortex-A9 -O3 Fix + Subsystem1 Telemetry + PixelSkip/ScaleHires Disabled)
 
 on:
   workflow_dispatch:
