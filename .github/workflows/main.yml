@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V64 (Unlocked PSX Clock + CLZ/SMULL Div + Gouraud->ARM ASM + Cached 320w Vout + Fixed 41.29kHz)
+name: Build PCSX-ReARMed V65 (2026 Master + 3D DMA/Stall Dial-Back + 4KB L1 InvTable + Cached 320w + 41.18kHz)
 
 on:
   workflow_dispatch:
@@ -16,13 +16,13 @@ jobs:
     steps:
       - name: Clone Current libretro/pcsx_rearmed Master
         run: |
-          rm -rf pcsx_src build_v64_report.txt build_v64.log
+          rm -rf pcsx_src build_v65_report.txt build_v65.log
           git clone --depth 1 https://github.com/libretro/pcsx_rearmed.git pcsx_src
           cd pcsx_src
-          echo "=== UPSTREAM MASTER BASE COMMIT ===" > ../build_v64_report.txt
-          git log -1 --format="%H (%ci) %s" >> ../build_v64_report.txt
+          echo "=== UPSTREAM MASTER BASE COMMIT ===" > ../build_v65_report.txt
+          git log -1 --format="%H (%ci) %s" >> ../build_v65_report.txt
 
-      - name: Apply V64 Patches (Unlocked PSX Clock + CLZ/SMULL Div + Gouraud->ASM + Cached Vout + Fixed 41.29kHz Resampler)
+      - name: Apply V65 Surgical Master Patches (Zero Frameskip + 3D Stall Dial-Back + 4KB L1 InvTable + Cached 320w + 41.18kHz)
         run: |
           cd pcsx_src
           python3 - << 'EOF'
@@ -45,26 +45,29 @@ jobs:
                   names.append(m.group(1))
               return ", ".join(names)
 
-          def find_matching_brace(text, open_idx):
-              assert text[open_idx] == "{", f"Expected '{{' at {open_idx}"
+          def find_matching_delim(text, open_idx, open_ch="{", close_ch="}"):
+              assert text[open_idx] == open_ch, f"Expected {open_ch!r} at {open_idx}"
               depth = 0
               for idx in range(open_idx, len(text)):
                   ch = text[idx]
-                  if ch == "{":
+                  if ch == open_ch:
                       depth += 1
-                  elif ch == "}":
+                  elif ch == close_ch:
                       depth -= 1
                       if depth == 0:
                           return idx
-              raise AssertionError("Unmatched '{' in C/C++ source")
+              raise AssertionError(f"Unmatched {open_ch!r} in C/C++ source")
 
-          # 1. Scoped Cortex-A9 flags + -DGPU_UNAI_USE_INT_DIV_MULTINV (4-cycle inline ARM CLZ+SMULL div, zero -funroll-loops bloat)
+          def find_matching_brace(text, open_idx):
+              return find_matching_delim(text, open_idx, "{", "}")
+
+          # 1. Scoped Cortex-A9 flags + -DGPU_UNAI_USE_INT_DIV_MULTINV (zero -funroll-loops bloat)
           with open("Makefile.libretro", "r") as f:
               mklr = f.read()
 
           extra_mk = [
               "",
-              "# V64: Keep -mno-unaligned-access globally for ari64 JIT; enable hardware unaligned loads + CLZ/SMULL reciprocal div on GPU/GTE/SPU/Vout",
+              "# V65: Keep -mno-unaligned-access globally for ari64 JIT; enable hardware unaligned loads + 4KB L1 CLZ/SMULL div on GPU/GTE/SPU/Vout",
               "deps/libchdr/%.o: CFLAGS += -munaligned-access -O3 -fno-strict-aliasing",
               "plugins/gpulib/%.o frontend/cspace.o frontend/libretro.o plugins/dfsound/spu.o: CFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
               "libpcsxcore/gte.o libpcsxcore/gte_nf.o libpcsxcore/gte_divider.o libpcsxcore/mdec.o: CFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
@@ -74,23 +77,55 @@ jobs:
           mklr += "\n".join(extra_mk) + "\n"
           with open("Makefile.libretro", "w") as f:
               f.write(mklr)
-          log_msg("SUCCESS 1: Enabled -DGPU_UNAI_USE_INT_DIV_MULTINV + scoped -munaligned-access -Ofast (zero loop-unroll bloat)!")
+          log_msg("SUCCESS 1: Enabled scoped -munaligned-access -Ofast + -DGPU_UNAI_USE_INT_DIV_MULTINV (zero loop-unroll bloat)!")
 
-          # 2A. Verify CD-XA subheader handling in libpcsxcore/cdrom.c
+          # 2A. Dial back 3D DMA2 linked-list gpuIdleAfter spin-stalls in libpcsxcore/psxdma.c (leaves MDEC mem2vram & RGB24 FMVs 100% intact!)
+          dma_p = "libpcsxcore/psxdma.c"
+          with open(dma_p, "r") as f:
+              dma_txt = f.read()
+          old_dma2_chain = (
+              "\t\t\tpsxRegs.gpuIdleAfter = psxRegs.cycle + cycles_sum + cycles_last_cmd;\n"
+              "\t\t\tset_event(PSXINT_GPUDMA, cycles_sum);"
+          )
+          new_dma2_chain = (
+              "\t\t\tif (!do_walking && !(HW_GPU_STATUS & SWAP32(PSXGPU_RGB24))) {\n"
+              "\t\t\t\tif (cycles_sum > 512) cycles_sum = 512;\n"
+              "\t\t\t\tcycles_last_cmd = 0;\n"
+              "\t\t\t}\n"
+              "\t\t\tpsxRegs.gpuIdleAfter = psxRegs.cycle + cycles_sum + cycles_last_cmd;\n"
+              "\t\t\tset_event(PSXINT_GPUDMA, cycles_sum);"
+          )
+          assert old_dma2_chain in dma_txt, "Could not find DMA2 chain gpuIdleAfter block in libpcsxcore/psxdma.c"
+          dma_txt = dma_txt.replace(old_dma2_chain, new_dma2_chain, 1)
+          with open(dma_p, "w") as f:
+              f.write(dma_txt)
+          log_msg("SUCCESS 2A: Dialed back 3D DMA2 OT gpuIdleAfter spin-stalls in libpcsxcore/psxdma.c (MDEC/FMV untouched)!")
+
+          # 2B. Pair NDHACK_NO_LD_DELAY with Config.DisableStalls in libpcsxcore/new_dynarec/emu_if.c & set CYCLE_MULT_DEFAULT = 263 (38% Auto)
+          emu_p = "libpcsxcore/new_dynarec/emu_if.c"
+          with open(emu_p, "r") as f:
+              emu_txt = f.read()
+          old_nostalls = "if (Config.DisableStalls)\n\t\tndrc_g.hacks |= NDHACK_NO_STALLS;"
+          new_nostalls = "if (Config.DisableStalls)\n\t\tndrc_g.hacks |= (NDHACK_NO_STALLS | NDHACK_NO_LD_DELAY);"
+          assert old_nostalls in emu_txt, "Could not find Config.DisableStalls in libpcsxcore/new_dynarec/emu_if.c"
+          emu_txt = emu_txt.replace(old_nostalls, new_nostalls, 1)
+          with open(emu_p, "w") as f:
+              f.write(emu_txt)
+
+          psxcom_p = "libpcsxcore/psxcommon.h"
+          with open(psxcom_p, "r") as f:
+              psxcom_txt = f.read()
+          psxcom_new, n_cm_def = re.subn(r"(#define\s+CYCLE_MULT_DEFAULT\s+)\d+", r"\g<1>263", psxcom_txt, count=1)
+          assert n_cm_def == 1, "Could not update CYCLE_MULT_DEFAULT in libpcsxcore/psxcommon.h"
+          with open(psxcom_p, "w") as f:
+              f.write(psxcom_new)
+          log_msg("SUCCESS 2B: Enabled NDHACK_NO_LD_DELAY alongside DisableStalls in emu_if.c & set CYCLE_MULT_DEFAULT=263 (Auto=38%)!")
+
+          # 2C. Verify CD-XA subheader handling in libpcsxcore/cdrom.c & hook chd_read() in libchdr_chd.c
           with open("libpcsxcore/cdrom.c", "r") as f:
               cdrom = f.read()
-          old_cdrom_xa = "if( cdr.FirstSector == 1 && (cdr.Mode & MODE_SF)==0 ) {"
-          if old_cdrom_xa in cdrom:
-              new_cdrom_xa = "if (cdr.FirstSector == 1 && (cdr.Mode & MODE_SF) == 0 && (cdr.Transfer[4 + 2] & 0x4) && cdr.Transfer[4 + 1] != 255) {"
-              cdrom = cdrom.replace(old_cdrom_xa, new_cdrom_xa, 1)
-              with open("libpcsxcore/cdrom.c", "w") as f:
-                  f.write(cdrom)
-              log_msg("SUCCESS 2A: Patched legacy FirstSector check in libpcsxcore/cdrom.c!")
-          else:
-              assert "FileChannelSelected" in cdrom, "Expected upstream FileChannelSelected XA handling in libpcsxcore/cdrom.c"
-              log_msg("SUCCESS 2A: Verified upstream FileChannelSelected CD-XA handling in libpcsxcore/cdrom.c!")
+          assert "FileChannelSelected" in cdrom, "Expected upstream FileChannelSelected XA handling in libpcsxcore/cdrom.c"
 
-          # 2B. Hook chd_read() in deps/libchdr/src/libchdr_chd.c for cd_ms(c) telemetry
           chd_src_p = "deps/libchdr/src/libchdr_chd.c"
           with open(chd_src_p, "r") as f:
               chd_txt = f.read()
@@ -111,9 +146,9 @@ jobs:
           )
           with open(chd_src_p, "w") as f:
               f.write(chd_hdr + chd_txt[:m_chd.start()] + chd_wrap + chd_txt[m_chd.end():])
-          log_msg("SUCCESS 2B: Hooked chd_read() in libchdr_chd.c for cd_ms telemetry!")
+          log_msg("SUCCESS 2C: Verified CD-XA handling & hooked chd_read() in libchdr_chd.c!")
 
-          # 3A. Ensure CD-XA volume/CTRL_CD unmute guard in plugins/dfsound/xa.c
+          # 3A. Ensure CD-XA volume/CTRL_CD unmute guard in plugins/dfsound/xa.c & hook SPUasync() in spu.c
           xa_p = "plugins/dfsound/xa.c"
           with open(xa_p, "r") as f:
               xa_txt = f.read()
@@ -124,12 +159,9 @@ jobs:
               " spu.spuCtrl |= CTRL_CD;"
           )
           assert old_feed_xa in xa_txt, "Could not find FeedXA open guard in plugins/dfsound/xa.c"
-          xa_txt = xa_txt.replace(old_feed_xa, new_feed_xa, 1)
           with open(xa_p, "w") as f:
-              f.write(xa_txt)
-          log_msg("SUCCESS 3A: Added CD-XA volume/CTRL_CD unmute guard in plugins/dfsound/xa.c!")
+              f.write(xa_txt.replace(old_feed_xa, new_feed_xa, 1))
 
-          # 3B. Hook SPUasync() in plugins/dfsound/spu.c for pure spu_ms telemetry
           spu_p = "plugins/dfsound/spu.c"
           with open(spu_p, "r") as f:
               spu_txt = f.read()
@@ -155,15 +187,52 @@ jobs:
           )
           with open(spu_p, "w") as f:
               f.write(spu_hdr + spu_txt[:m_spu.start()] + spu_wrap + spu_txt[m_spu.end():])
-          log_msg("SUCCESS 3B: Hooked SPUasync() in plugins/dfsound/spu.c for spu_ms telemetry!")
+          log_msg("SUCCESS 3: Added CD-XA unmute guard in xa.c & hooked SPUasync() in spu.c!")
 
-          # 4A. Patch plugins/gpu_unai/gpulib_if.cpp:
-          #     - Menu lighting gate (<= 85 polys)
-          #     - Route high-poly (> 280 polys) Gouraud commands (0x30..0x3F) into flat/raw-textured commands (0x20..0x2F)
-          #       using le32_to_u32 / u32_to_le32 so 8bpp & semi-transparent polys hit 2024 gpu_arm.S & prim_try_simplify_quad_t!
+          # 4A. Shrink s_invTable in plugins/gpu_unai/gpu_fixedpoint.h from 256 KB (1<<16) -> 4 KB (1<<10, L1-cache hot!)
+          #     and fix upstream off-by-one s_invTable[uDen] -> s_invTable[uDen - 1]!
+          fp_p = "plugins/gpu_unai/gpu_fixedpoint.h"
+          with open(fp_p, "r") as f:
+              fp_txt = f.read()
+          assert "#define TABLE_BITS 16" in fp_txt, "Could not find TABLE_BITS 16 in gpu_fixedpoint.h"
+          assert "s_invTable[uDen]" in fp_txt, "Could not find s_invTable[uDen] in gpu_fixedpoint.h"
+          fp_txt = fp_txt.replace("#define TABLE_BITS 16", "#define TABLE_BITS 10", 1)
+          fp_txt = fp_txt.replace("s_invTable[uDen]", "s_invTable[uDen - 1]", 1)
+          with open(fp_p, "w") as f:
+              f.write(fp_txt)
+          log_msg("SUCCESS 4A: Shrunk s_invTable 256KB -> 4KB (L1-cache hot) & fixed s_invTable[uDen - 1] in gpu_fixedpoint.h!")
+
+          # 4B. Patch plugins/gpu_unai/gpulib_if.cpp:
+          #     - Avoid UB on i==1 in renderer_init() s_invTable loop
+          #     - Zero-out per-primitive gput_sum() overhead
+          #     - Gate prim_try_simplify_quad_t / prim_try_simplify_quad_gt to <= 280 scene polys
+          #     - Keep ONLY untextured Gouraud (0x30..0x33, 0x38..0x3B) -> Flat fast path above 280 polys
           gpu_p = "plugins/gpu_unai/gpulib_if.cpp"
           with open(gpu_p, "r") as f:
               gpu = f.read()
+
+          gpu = gpu.replace("double v = 1.0 / double(i);", "double v = (i == 1) ? 0.0 : (1.0 / double(i));", 1)
+
+          assert '#include "../gpulib/gpu_timing.h"' in gpu, "Could not find gpu_timing.h include in gpulib_if.cpp"
+          gpu = gpu.replace(
+              '#include "../gpulib/gpu_timing.h"',
+              '#include "../gpulib/gpu_timing.h"\n#undef gput_sum\n#define gput_sum(sum, last, cycles) do { (void)(sum); (void)(last); (void)(cycles); } while (0)',
+              1
+          )
+
+          sq_cnt = 0
+          for fn_name in ["prim_try_simplify_quad_t", "prim_try_simplify_quad_gt"]:
+              pos = 0
+              while True:
+                  m_sq = re.search(rf"\(\s*simplified_count\s*=\s*{fn_name}\s*\(", gpu[pos:])
+                  if not m_sq:
+                      break
+                  open_p = pos + m_sq.start()
+                  close_p = find_matching_delim(gpu, open_p, "(", ")")
+                  wrapped = f"((p_tot <= 280u && g_last_frame_polys <= 280u) && {gpu[open_p:close_p + 1]})"
+                  gpu = gpu[:open_p] + wrapped + gpu[close_p + 1 :]
+                  pos = open_p + len(wrapped)
+                  sq_cnt += 1
 
           gpu_top = """#include <stdint.h>
           extern "C" {
@@ -202,48 +271,28 @@ jobs:
                 p_tot++;
                 g_frame_polys = p_tot;
                 if (allow_l && p_tot > 85u) gpu_unai.config.lighting = 0;
-                if ((p_tot > 280u || g_last_frame_polys > 280u) && (cmd >= 0x30u)) {
-                  if ((cmd & 0x04u) == 0u) {
-                    const u32 c0 = le32_to_u32(gpu_unai.PacketBuffer.U4[0]);
-                    const u32 c1 = le32_to_u32(gpu_unai.PacketBuffer.U4[2]);
-                    const u32 c2 = le32_to_u32(gpu_unai.PacketBuffer.U4[4]);
-                    if ((cmd & 0x08u) == 0u) {
-                      const u32 r = (((c0 & 0xFFu) + (c1 & 0xFFu) + (c2 & 0xFFu) + 1u) * 85u) >> 8;
-                      const u32 g = ((((c0 >> 8) & 0xFFu) + ((c1 >> 8) & 0xFFu) + ((c2 >> 8) & 0xFFu) + 1u) * 85u) >> 8;
-                      const u32 b = ((((c0 >> 16) & 0xFFu) + ((c1 >> 16) & 0xFFu) + ((c2 >> 16) & 0xFFu) + 1u) * 85u) >> 8;
-                      cmd -= 0x10u;
-                      gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | (b << 16) | (g << 8) | r);
-                      gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];
-                      gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];
-                    } else {
-                      const u32 c3 = le32_to_u32(gpu_unai.PacketBuffer.U4[6]);
-                      const u32 a01 = ((c0 & c1) + (((c0 ^ c1) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;
-                      const u32 a23 = ((c2 & c3) + (((c2 ^ c3) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;
-                      const u32 c_avg = ((a01 & a23) + (((a01 ^ a23) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;
-                      cmd -= 0x10u;
-                      gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | c_avg);
-                      gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];
-                      gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];
-                      gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[7];
-                    }
-                  } else if (gpu_unai.config.lighting == 0) {
-                    if ((cmd & 0x08u) == 0u) {
-                      cmd = (cmd - 0x10u) | 0x01u;
-                      gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);
-                      gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];
-                      gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];
-                      gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];
-                      gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];
-                    } else {
-                      cmd = (cmd - 0x10u) | 0x01u;
-                      gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);
-                      gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];
-                      gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];
-                      gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];
-                      gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];
-                      gpu_unai.PacketBuffer.U4[7] = gpu_unai.PacketBuffer.U4[10];
-                      gpu_unai.PacketBuffer.U4[8] = gpu_unai.PacketBuffer.U4[11];
-                    }
+                if ((p_tot > 280u || g_last_frame_polys > 280u) && ((cmd & 0xF4u) == 0x30u)) {
+                  const u32 c0 = le32_to_u32(gpu_unai.PacketBuffer.U4[0]);
+                  const u32 c1 = le32_to_u32(gpu_unai.PacketBuffer.U4[2]);
+                  const u32 c2 = le32_to_u32(gpu_unai.PacketBuffer.U4[4]);
+                  if ((cmd & 0x08u) == 0u) {
+                    const u32 r = (((c0 & 0xFFu) + (c1 & 0xFFu) + (c2 & 0xFFu) + 1u) * 85u) >> 8;
+                    const u32 g = ((((c0 >> 8) & 0xFFu) + ((c1 >> 8) & 0xFFu) + ((c2 >> 8) & 0xFFu) + 1u) * 85u) >> 8;
+                    const u32 b = ((((c0 >> 16) & 0xFFu) + ((c1 >> 16) & 0xFFu) + ((c2 >> 16) & 0xFFu) + 1u) * 85u) >> 8;
+                    cmd -= 0x10u;
+                    gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | (b << 16) | (g << 8) | r);
+                    gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];
+                    gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];
+                  } else {
+                    const u32 c3 = le32_to_u32(gpu_unai.PacketBuffer.U4[6]);
+                    const u32 a01 = ((c0 & c1) + (((c0 ^ c1) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;
+                    const u32 a23 = ((c2 & c3) + (((c2 ^ c3) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;
+                    const u32 c_avg = ((a01 & a23) + (((a01 ^ a23) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;
+                    cmd -= 0x10u;
+                    gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | c_avg);
+                    gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];
+                    gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];
+                    gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[7];
                   }
                 }
               }
@@ -251,9 +300,9 @@ jobs:
           gpu = gpu[:sw_start] + sw_pre_inj + gpu[sw_start : sw_end + 1] + "\n    cmd = _leap_orig_cmd;" + gpu[sw_end + 1 :]
           with open(gpu_p, "w") as f:
               f.write(gpu)
-          log_msg("SUCCESS 4A: Patched renderer_do_cmd_list() in gpulib_if.cpp (Gouraud->ARM ASM & Quad Simplifier fast path)!")
+          log_msg(f"SUCCESS 4B: Patched gpulib_if.cpp (gput_sum zeroed, {sq_cnt} quad-simplify calls gated <=280p, untextured Gouraud->Flat)!")
 
-          # 4B. Hook vout_update() in plugins/gpulib/vout_pl.c for pure vout_ms telemetry
+          # 4C. Hook vout_update() in plugins/gpulib/vout_pl.c for pure vout_ms telemetry
           vp = "plugins/gpulib/vout_pl.c"
           with open(vp, "r") as f:
               vt = f.read()
@@ -275,7 +324,7 @@ jobs:
           )
           with open(vp, "w") as f:
               f.write(v_hdr + vt[:m_vu.start()] + v_wrap + vt[m_vu.end():])
-          log_msg("SUCCESS 4B: Hooked vout_update() in plugins/gpulib/vout_pl.c!")
+          log_msg("SUCCESS 4C: Hooked vout_update() in plugins/gpulib/vout_pl.c!")
 
           # 5A. Optimize 512->320 and 640->320 RGB565 downscalers in frontend/cspace.c using 32-bit word burst loads
           cs_p = "frontend/cspace.c"
@@ -336,7 +385,7 @@ jobs:
               f.write(cs_txt)
           log_msg("SUCCESS 5A: Optimized bgr555_to_rgb565_512_to_320 & 640_to_320 with 32-bit burst loads + prefetch!")
 
-          # 5B. Set LeapsterGS-optimal defaults for Core Options in frontend/libretro_core_options.h (handles #if/#else blocks too!)
+          # 5B. Set LeapsterGS-optimal defaults for Core Options in frontend/libretro_core_options.h
           opt_h_p = "frontend/libretro_core_options.h"
           if os.path.exists(opt_h_p):
               with open(opt_h_p, "r") as f:
@@ -344,7 +393,9 @@ jobs:
               for key_name, new_def in [
                   ("pcsx_rearmed_scale_hires", "enabled"),
                   ("pcsx_rearmed_nostalls", "enabled"),
+                  ("pcsx_rearmed_nolddelay", "enabled"),
                   ("pcsx_rearmed_dithering", "disabled"),
+                  ("pcsx_rearmed_icache_emulation", "disabled"),
               ]:
                   k_idx = opt_h.find(f'"{key_name}"')
                   if k_idx != -1:
@@ -362,9 +413,8 @@ jobs:
                   f.write(opt_h)
 
           # 5C. Patch frontend/libretro.c:
-          #     - UNLOCK Config.cycle_multiplier (respects Auto=175 [57%] and .opt pcsx_rearmed_psxclock!)
-          #     - Bypass GET_CURRENT_SOFTWARE_FRAMEBUFFER in set_vout_fb() so vout_buf stays in fast L1/L2 cache (fixes 6ms vcb_ms lock contention!)
-          #     - Constant-pitch step_fp = 70000 (41,288 Hz) linear resampler + 1s telemetry
+          #     - Bypass GET_CURRENT_SOFTWARE_FRAMEBUFFER in set_vout_fb() so vout_buf stays in fast L1/L2 cache
+          #     - Exact hardware-matched step_fp = 70184 (41,179.4 Hz) constant-pitch linear resampler (zero over-pacing, zero frameskip!)
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
@@ -374,11 +424,11 @@ jobs:
               lr, count=1
           )
           assert n_fb == 1, "Could not patch GET_CURRENT_SOFTWARE_FRAMEBUFFER in set_vout_fb()"
-          log_msg("SUCCESS 5C-FB: Disabled slow cross-thread GET_CURRENT_SOFTWARE_FRAMEBUFFER lock in set_vout_fb()!")
+          log_msg("SUCCESS 5C-FB: Disabled cross-thread GET_CURRENT_SOFTWARE_FRAMEBUFFER lock in set_vout_fb()!")
 
-          cm_ident_expr = "Config.cycle_multiplier" if "Config.cycle_multiplier" in lr else "175"
+          cm_ident_expr = "Config.cycle_multiplier" if "Config.cycle_multiplier" in lr else "263"
 
-          v64_runtime = """
+          v65_runtime = """
           #include <stdio.h>
           #include <string.h>
           #include <stdint.h>
@@ -421,7 +471,7 @@ jobs:
              if (!g_ptfp) {
                 g_ptfp = fopen("/tmp/pcsx_telemetry.log", "w");
                 if (g_ptfp) {
-                   fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V64 (2026 Master + Unlocked Clock + Cached 320w + Gouraud ASM) ===\\n");
+                   fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V65 (2026 Master + 3D Stall Dial-Back + 4KB InvTable + Cached 320w + 41.18kHz) ===\\n");
                    fprintf(g_ptfp, "sec | wall | emu_ms | vbl | v_r/d  | res         | clk | polys | cpu_ms | gpu_ms | vout_ms | vcb_ms | cd_ms(c)  | spu_ms | aud_ms | max_b | blk_ms\\n");
                    fflush(g_ptfp);
                 }
@@ -452,8 +502,9 @@ jobs:
                    leap_pcsx_open_log();
                    if (g_ptfp && g_p_sec <= 600) {
                       unsigned bpp = (width > 0 && pitch >= width * 4U) ? 32U : 16U;
-                      fprintf(g_ptfp, "[MODE] res=%ux%u pitch=%zu bpp=%u scale_hires=%d nostalls=%d clk=%d\\n",
-                              width, height, pitch, bpp, (int)pl_rearmed_cbs.scale_hires, (int)Config.DisableStalls, (int)Config.cycle_multiplier);
+                      fprintf(g_ptfp, "[MODE] res=%ux%u pitch=%zu bpp=%u scale_hires=%d nostalls=%d hacks=0x%x clk=%d\\n",
+                              width, height, pitch, bpp, (int)pl_rearmed_cbs.scale_hires,
+                              (int)Config.DisableStalls, (unsigned)ndrc_g.hacks, (int)Config.cycle_multiplier);
                       fflush(g_ptfp);
                    }
                 }
@@ -475,8 +526,8 @@ jobs:
              __sync_fetch_and_add(&g_p_in_aud_f, in_f);
              if (in_f > g_p_max_b) g_p_max_b = in_f;
 
-             /* Constant 44,100 Hz -> 41,288 Hz linear resampler (step_fp = 70000): zero pitch shift, phase-continuous */
-             const uint32_t step_fp = 70000U;
+             /* Constant 44,100 Hz -> 41,179.4 Hz linear resampler (step_fp = 70184): exact LeapsterGS DAC match, zero pitch shift */
+             const uint32_t step_fp = 70184U;
              uint32_t in_pos = s_rs_pos;
              uint32_t idx = in_pos >> 16;
              uint64_t blk_tot = 0;
@@ -578,7 +629,7 @@ jobs:
                   r"void\s+retro_run\b",
               ]
           )
-          lr = lr[:pos_first_cb] + v64_runtime + "\n" + lr[pos_first_cb:]
+          lr = lr[:pos_first_cb] + v65_runtime + "\n" + lr[pos_first_cb:]
 
           lr, n_vid = re.subn(
               r"(void\s+retro_set_video_refresh\s*\(\s*retro_video_refresh_t\s+(\w+)\s*\)\s*\{)",
@@ -635,18 +686,19 @@ jobs:
               "   g_frame_polys = 0;\n"
           )
           lr = lr[:r_bs + 1] + run_entry + lr[r_bs + 1 : r_be] + f"\n   leap_pcsx_post((int)({cm_ident_expr}));\n" + lr[r_be:]
+          assert "frameskip.active" not in v65_runtime, "Zero frameskip policy violated!"
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 5C: Patched frontend/libretro.c (Unlocked PSX Clock + Cached Vout + Fixed 41.29kHz Resampler + Telemetry)!")
+          log_msg("SUCCESS 5C: Patched frontend/libretro.c (Zero-Frameskip + Cached Vout + Exact 41.18kHz Resampler + Telemetry)!")
 
-          with open("../build_v64_report.txt", "a") as rf:
-              rf.write("=== PCSX-ReARMed V64 PATCH SUMMARY ===\n")
+          with open("../build_v65_report.txt", "a") as rf:
+              rf.write("=== PCSX-ReARMed V65 PATCH SUMMARY ===\n")
               for line in report_lines:
                   rf.write(line + "\n")
           EOF
 
-      - name: Compile Inside Ubuntu 18.04 Container (GLIBC <= 2.17 + Cortex-A9 CLZ/SMULL + Stripped .so)
+      - name: Compile Inside Ubuntu 18.04 Container (GLIBC <= 2.17 + Cortex-A9 4KB L1 InvTable + Stripped .so)
         run: |
           docker run --rm -v "$PWD:/work" -w /work/pcsx_src ubuntu:18.04 bash -c '
             set -e -o pipefail
@@ -674,27 +726,27 @@ jobs:
               USE_ASYNC_GPU=0 \
               USE_ASYNC_SPU=0 \
               NDRC_THREAD=0 \
-              -j$(nproc) 2>&1 | tee ../build_v64.log
-            echo "=== KEY COMPILER FLAGS AUDIT ===" >> ../build_v64_report.txt
-            grep -E "gpulib_if\.cpp|gpu_arm\.S|gte_nf_arm\.S|prim\.c|libretro\.c|cspace\.c|cspace_arm\.S" ../build_v64.log | head -n 24 >> ../build_v64_report.txt || true
-            echo "=== RECIPROCAL TABLE s_invTable SYMBOL AUDIT ===" >> ../build_v64_report.txt
-            arm-linux-gnueabi-nm plugins/gpu_unai/gpulib_if.o | grep "s_invTable" >> ../build_v64_report.txt || true
-            echo "=== GLIBC VERSIONS ===" >> ../build_v64_report.txt
-            arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro.so | grep -o "GLIBC_[0-9.]*" | sort -uV >> ../build_v64_report.txt || true
-            echo "=== BINARY SIZE (UNSTRIPPED -> STRIPPED) ===" >> ../build_v64_report.txt
-            ls -lh pcsx_rearmed_libretro.so >> ../build_v64_report.txt
+              -j$(nproc) 2>&1 | tee ../build_v65.log
+            echo "=== KEY COMPILER FLAGS AUDIT ===" >> ../build_v65_report.txt
+            grep -E "gpulib_if\.cpp|gpu_arm\.S|gte_nf_arm\.S|psxdma\.c|emu_if\.c|libretro\.c|cspace\.c|cspace_arm\.S" ../build_v65.log | head -n 26 >> ../build_v65_report.txt || true
+            echo "=== 4KB L1 RECIPROCAL TABLE s_invTable SIZE AUDIT (EXPECT 00001000 = 4096 BYTES) ===" >> ../build_v65_report.txt
+            arm-linux-gnueabi-nm -S plugins/gpu_unai/gpulib_if.o | grep "s_invTable" >> ../build_v65_report.txt || true
+            echo "=== GLIBC VERSIONS ===" >> ../build_v65_report.txt
+            arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro.so | grep -o "GLIBC_[0-9.]*" | sort -uV >> ../build_v65_report.txt || true
+            echo "=== BINARY SIZE (UNSTRIPPED -> STRIPPED) ===" >> ../build_v65_report.txt
+            ls -lh pcsx_rearmed_libretro.so >> ../build_v65_report.txt
             arm-linux-gnueabi-strip -s pcsx_rearmed_libretro.so
-            ls -lh pcsx_rearmed_libretro.so >> ../build_v64_report.txt
+            ls -lh pcsx_rearmed_libretro.so >> ../build_v65_report.txt
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
           '
-          ls -lh pcsx_rearmed_libretro.so build_v64.log build_v64_report.txt
+          ls -lh pcsx_rearmed_libretro.so build_v65.log build_v65_report.txt
 
-      - name: Upload V64 Core + Build Log + Audit Report
+      - name: Upload V65 Core + Build Log + Audit Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx_rearmed_libretro_v64
+          name: pcsx_rearmed_libretro_v65
           path: |
             pcsx_rearmed_libretro.so
-            build_v64.log
-            build_v64_report.txt
+            build_v65.log
+            build_v65_report.txt
