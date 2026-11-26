@@ -194,7 +194,7 @@ jobs:
               f.write(fp_txt)
           log_msg("SUCCESS 4A: Shrunk s_invTable to 4KB & fixed s_invTable[uDen - 1]!")
 
-          # 4B. Track 2D mem2vram uploads per buffer in plugins/gpulib/gpu.h (do_vram_line) so 2D splash/loading screens keep 512->320 while 3D scenes rasterize at native 320w!
+          # 4B. Track 2D mem2vram uploads per buffer in plugins/gpulib/gpu.h (do_vram_line) using x >= 512 quadrant split
           gph_p = "plugins/gpulib/gpu.h"
           with open(gph_p, "r") as f:
               gph = f.read()
@@ -205,7 +205,7 @@ jobs:
               "static inline void do_vram_line(uint16_t *vram_, int x, int y,\n"
               "    uint16_t *mem, int l, int is_read, uint32_t r6)\n{\n"
               "  if (!is_read && l >= 200 && x < 640) {\n"
-              "    unsigned _bi = (((unsigned)y >= 256u) ? 2u : 0u) | (((unsigned)x >= 384u) ? 1u : 0u);\n"
+              "    unsigned _bi = (((unsigned)y >= 256u) ? 2u : 0u) | (((unsigned)x >= 512u) ? 1u : 0u);\n"
               "    g_v68_buf_2d[_bi] = 1u;\n"
               "    g_v68_buf_320[_bi] = 0u;\n"
               "  }"
@@ -215,8 +215,8 @@ jobs:
               f.write(gph.replace(old_dvl, new_dvl, 1))
           log_msg("SUCCESS 4B: Added per-buffer 2D mem2vram guard in plugins/gpulib/gpu.h!")
 
-          # 4C. Goal 1 — Native 320-Wide 3D Rasterization in gpu_raster_image.h, gpu_raster_polygon.h, gpu_raster_sprite.h, gpu_raster_line.h, and gpulib_if.cpp!
-          # 4C-1: gpu_raster_image.h (gpuClearImage & gpuMoveImage)
+          # 4C. Goal 1 — Native 320-Wide 3D Rasterization in gpu_unai (with all 4 audit fixes!)
+          # 4C-1: gpu_raster_image.h (8-pixel aligned gpuClearImage for gpu_fill_asm + x >= 512 buffer origin)
           ri_p = "plugins/gpu_unai/gpu_raster_image.h"
           with open(ri_p, "r") as f:
               ri = f.read()
@@ -225,35 +225,33 @@ jobs:
           clr_b = ri.index("{", m_clr.start())
           clr_e = find_matching_brace(ri, clr_b)
           clr_body = ri[clr_b + 1 : clr_e]
-          # Find width/height variables in gpuClearImage (x0, y0, w0, h0)
           assert "w0 = " in clr_body and "x0 = " in clr_body and "y0 = " in clr_body, "Unexpected vars in gpuClearImage"
-          clr_hook = """
-          \tif (pl_rearmed_cbs.scale_hires && gpu.screen.hres >= 508 && gpu.screen.hres <= 516 && !(gpu.status & PSX_GPU_STATUS_RGB24) && w0 > 0 && h0 > 0) {
-          \t\tunsigned _bi = (((unsigned)y0 >= 256u) ? 2u : 0u) | (((unsigned)x0 >= 384u) ? 1u : 0u);
-          \t\tif (w0 >= 480 && h0 >= 160) {
-          \t\t\tg_v68_buf_2d[_bi] = 0u;
-          \t\t\tg_v68_buf_320[_bi] = 1u;
-          \t\t\tg_v68_scale320_active = 1;
-          \t\t\tg_v68_scale320_x0 = (x0 >= 384) ? 512 : 0;
-          \t\t}
-          \t\tif (g_v68_scale320_active || g_v68_buf_320[_bi]) {
-          \t\t\ts32 _bx = (x0 >= 384) ? 512 : 0;
-          \t\t\ts32 _x1 = x0 + w0;
-          \t\t\tx0 = _bx + (((x0 - _bx) * 5) >> 3);
-          \t\t\t_x1 = _bx + (((_x1 - _bx) * 5 + 7) >> 3);
-          \t\t\tw0 = _x1 - x0;
-          \t\t}
-          \t}
-          """
-          # Insert clr_hook right after w0 and h0 are parsed (before clipping/alignment)
+          clr_hook = (
+              "\n\tif (pl_rearmed_cbs.scale_hires && gpu.screen.hres >= 508 && gpu.screen.hres <= 516 && !(gpu.status & PSX_GPU_STATUS_RGB24) && w0 > 0 && h0 > 0) {\n"
+              "\t\tunsigned _bi = (((unsigned)y0 >= 256u) ? 2u : 0u) | (((unsigned)x0 >= 512u) ? 1u : 0u);\n"
+              "\t\tif (w0 >= 480 && h0 >= 160) {\n"
+              "\t\t\tg_v68_buf_2d[_bi] = 0u;\n"
+              "\t\t\tg_v68_buf_320[_bi] = 1u;\n"
+              "\t\t\tg_v68_scale320_active = 1;\n"
+              "\t\t\tg_v68_scale320_x0 = (x0 >= 512) ? 512 : 0;\n"
+              "\t\t}\n"
+              "\t\tif (g_v68_scale320_active || g_v68_buf_320[_bi]) {\n"
+              "\t\t\ts32 _bx = (x0 >= 512) ? 512 : 0;\n"
+              "\t\t\ts32 _x1 = x0 + w0;\n"
+              "\t\t\tx0 = (_bx + (((x0 - _bx) * 5) >> 3)) & ~7;\n"
+              "\t\t\t_x1 = _bx + (((_x1 - _bx) * 5 + 7) >> 3);\n"
+              "\t\t\tw0 = (_x1 - x0 + 7) & ~7;\n"
+              "\t\t}\n"
+              "\t}\n"
+          )
           m_w0h0 = re.search(r"h0\s*=\s*[^\n;]+;", clr_body)
           assert m_w0h0 is not None
           ins_p = clr_b + 1 + m_w0h0.end()
-          ri = "extern \"C\" { extern uint8_t g_v68_buf_2d[4]; extern uint8_t g_v68_buf_320[4]; extern int g_v68_scale320_active; extern int g_v68_scale320_x0; }\n" + ri[:ins_p] + clr_hook + ri[ins_p:]
+          ri = 'extern "C" { extern uint8_t g_v68_buf_2d[4]; extern uint8_t g_v68_buf_320[4]; extern int g_v68_scale320_active; extern int g_v68_scale320_x0; }\n' + ri[:ins_p] + clr_hook + ri[ins_p:]
           with open(ri_p, "w") as f:
               f.write(ri)
 
-          # 4C-2: gpu_raster_polygon.h (polyInitVertexBuffer scales vertex X relative to g_v68_scale320_x0: seam-free & automatic 8/5 UV step!)
+          # 4C-2: gpu_raster_polygon.h (seam-free vertex X scaling relative to g_v68_scale320_x0)
           rp_p = "plugins/gpu_unai/gpu_raster_polygon.h"
           with open(rp_p, "r") as f:
               rp = f.read()
@@ -274,7 +272,7 @@ jobs:
           with open(rp_p, "w") as f:
               f.write(rp.replace(old_piv, new_piv, 1))
 
-          # 4C-3: gpu_raster_sprite.h (scale flat tiles gpuDrawT; textured sprites 0x64..0x7F convert to 320-scaled quads in gpulib_if.cpp!)
+          # 4C-3: gpu_raster_sprite.h (scale flat tiles gpuDrawT)
           rs_p = "plugins/gpu_unai/gpu_raster_sprite.h"
           with open(rs_p, "r") as f:
               rs = f.read()
@@ -285,12 +283,12 @@ jobs:
           dt_body = rs[dt_b + 1 : dt_e]
           m_x1y1 = re.search(r"x1\s*=\s*x0\s*\+[^\n;]+;", dt_body)
           assert m_x1y1 is not None, "Could not find x1 = x0 + w in gpuDrawT"
-          dt_hook = """
-          \tif (g_v68_scale320_active) {
-          \t\tx0 = g_v68_scale320_x0 + (((x0 - g_v68_scale320_x0) * 5) >> 3);
-          \t\tx1 = g_v68_scale320_x0 + (((x1 - g_v68_scale320_x0) * 5 + 4) >> 3);
-          \t}
-          """
+          dt_hook = (
+              "\n\tif (g_v68_scale320_active) {\n"
+              "\t\tx0 = g_v68_scale320_x0 + (((x0 - g_v68_scale320_x0) * 5) >> 3);\n"
+              "\t\tx1 = g_v68_scale320_x0 + (((x1 - g_v68_scale320_x0) * 5 + 4) >> 3);\n"
+              "\t}\n"
+          )
           ins_dt = dt_b + 1 + m_x1y1.end()
           rs = rs[:ins_dt] + dt_hook + rs[ins_dt:]
           with open(rs_p, "w") as f:
@@ -309,10 +307,8 @@ jobs:
               f.write(rl)
 
           # 4C-5: gpulib_if.cpp:
-          #   - Update DrawingArea[2] in GP0(E3h/E4h) & renderer_sync_ecmds when 320-wide rasterization is active
-          #   - Gate prim_try_simplify_quad_t / gt off ONLY when g_v68_scale320_active != 0 (so 320-scaled quads step UVs by 8/5 via gpuDrawPolyFT + gpu_arm.S, while 256w/320w modes still simplify!)
-          #   - Convert textured sprites (0x64..0x67, 0x74..0x77, 0x7C..0x7F) into 0x2C..0x2F textured quads when g_v68_scale320_active != 0 so HUD sprites also scale X by 5/8 with exact UV stepping!
-          #   - Full 0x30..0x3F -> 0x20..0x2F high-poly Gouraud->ARM ASM fast path + gput_sum zeroed!
+          #   - Fix 1: Type-safe ((_c0 & 0xF8F8F8u) != 0x808080u) lighting check (no le32_t -> u32 type error!)
+          #   - Fix 2: Scale BOTH DrawingArea[0] and DrawingArea[2] & keep g_v68_scale320_active sticky on mid-frame HUD/dialogue sub-window clip boxes!
           gpu_p = "plugins/gpu_unai/gpulib_if.cpp"
           with open(gpu_p, "r") as f:
               gpu = f.read()
@@ -324,25 +320,35 @@ jobs:
               1
           )
 
-          # Update GP0(E3h) and GP0(E4h) to track unscaled DrawingArea and clamp DrawingArea[2] in 320w mode
-          old_e3e4 = "    case 3: {\n      // GP0(E3h) - Set Drawing Area top left (X1,Y1)\n      gpu_unai.DrawingArea[0] = cmd_word         & 0x3FF;\n      gpu_unai.DrawingArea[1] = (cmd_word >> 10) & 0x3FF;\n    } break;\n\n    case 4: {\n      // GP0(E4h) - Set Drawing Area bottom right (X2,Y2)\n      gpu_unai.DrawingArea[2] = (cmd_word         & 0x3FF) + 1;\n      gpu_unai.DrawingArea[3] = ((cmd_word >> 10) & 0x3FF) + 1;\n    } break;"
-          new_e3e4 = """    case 3: {
-                gpu_unai.DrawingArea[0] = cmd_word         & 0x3FF;
-                gpu_unai.DrawingArea[1] = (cmd_word >> 10) & 0x3FF;
-                g_v68_raw_da_x0 = gpu_unai.DrawingArea[0];
-                g_v68_update_scale320();
-              } break;
-
-              case 4: {
-                g_v68_raw_da_x2 = (cmd_word         & 0x3FF) + 1;
-                gpu_unai.DrawingArea[2] = g_v68_raw_da_x2;
-                gpu_unai.DrawingArea[3] = ((cmd_word >> 10) & 0x3FF) + 1;
-                g_v68_update_scale320();
-              } break;"""
+          old_e3e4 = (
+              "    case 3: {\n"
+              "      // GP0(E3h) - Set Drawing Area top left (X1,Y1)\n"
+              "      gpu_unai.DrawingArea[0] = cmd_word         & 0x3FF;\n"
+              "      gpu_unai.DrawingArea[1] = (cmd_word >> 10) & 0x3FF;\n"
+              "    } break;\n\n"
+              "    case 4: {\n"
+              "      // GP0(E4h) - Set Drawing Area bottom right (X2,Y2)\n"
+              "      gpu_unai.DrawingArea[2] = (cmd_word         & 0x3FF) + 1;\n"
+              "      gpu_unai.DrawingArea[3] = ((cmd_word >> 10) & 0x3FF) + 1;\n"
+              "    } break;"
+          )
+          new_e3e4 = (
+              "    case 3: {\n"
+              "      g_v68_raw_da_x0 = cmd_word & 0x3FF;\n"
+              "      gpu_unai.DrawingArea[0] = g_v68_raw_da_x0;\n"
+              "      gpu_unai.DrawingArea[1] = (cmd_word >> 10) & 0x3FF;\n"
+              "      g_v68_update_scale320();\n"
+              "    } break;\n\n"
+              "    case 4: {\n"
+              "      g_v68_raw_da_x2 = (cmd_word & 0x3FF) + 1;\n"
+              "      gpu_unai.DrawingArea[2] = g_v68_raw_da_x2;\n"
+              "      gpu_unai.DrawingArea[3] = ((cmd_word >> 10) & 0x3FF) + 1;\n"
+              "      g_v68_update_scale320();\n"
+              "    } break;"
+          )
           assert old_e3e4 in gpu, "Could not find GP0 E3/E4 in gpulib_if.cpp"
           gpu = gpu.replace(old_e3e4, new_e3e4, 1)
 
-          # Gate prim_try_simplify_quad_t & gt when g_v68_scale320_active != 0
           for fn_name in ["prim_try_simplify_quad_t", "prim_try_simplify_quad_gt"]:
               pos = 0
               while True:
@@ -355,84 +361,87 @@ jobs:
                   gpu = gpu[:open_p] + wrapped + gpu[close_p + 1 :]
                   pos = open_p + len(wrapped)
 
-          # In textured_sprite(), if g_v68_scale320_active != 0, draw via gpuDrawPolyFT so X scales 5/8 and UVs step 8/5!
           old_ts_call = "gpuDrawS(packet, driver, &w, &h);"
-          new_ts_call = """if (g_v68_scale320_active) {
-              s32 _sw = 0, _sh = 0;
-              switch ((PRIM >> 3) & 3u) {
-                case 0: _sw = le16_to_s16(gpu_unai.PacketBuffer.U2[6]) & 0x3FF; _sh = le16_to_s16(gpu_unai.PacketBuffer.U2[7]) & 0x1FF; break;
-                case 1: _sw = 1; _sh = 1; break;
-                case 2: _sw = 8; _sh = 8; break;
-                case 3: _sw = 16; _sh = 16; break;
-              }
-              if (_sw > 0 && _sh > 0) {
-                u32 _c0 = le32_to_u32(gpu_unai.PacketBuffer.U4[0]);
-                u32 _xy = le32_to_u32(gpu_unai.PacketBuffer.U4[1]);
-                u32 _uvc = le32_to_u32(gpu_unai.PacketBuffer.U4[2]);
-                s32 _x0 = GPU_EXPANDSIGN(_xy), _y0 = GPU_EXPANDSIGN(_xy >> 16);
-                u32 _u0 = _uvc & 0xFFu, _v0 = (_uvc >> 8) & 0xFFu;
-                u32 _u1 = (_u0 + (u32)_sw) & 0xFFu, _v1 = (_v0 + (u32)_sh) & 0xFFu;
-                if (_u0 + (u32)_sw > 255u) _u1 = 255u;
-                if (_v0 + (u32)_sh > 255u) _v1 = 255u;
-                u32 _qcmd = 0x2Cu | (PRIM & 0x03u);
-                gpu_unai.PacketBuffer.U4[0] = u32_to_le32((_qcmd << 24) | (_c0 & 0xFFFFFFu));
-                gpu_unai.PacketBuffer.U4[1] = u32_to_le32((((u32)(_y0) & 0xFFFFu) << 16) | ((u32)(_x0) & 0xFFFFu));
-                gpu_unai.PacketBuffer.U4[2] = u32_to_le32((_uvc & 0xFFFF0000u) | (_v0 << 8) | _u0);
-                gpu_unai.PacketBuffer.U4[3] = u32_to_le32((((u32)(_y0) & 0xFFFFu) << 16) | ((u32)(_x0 + _sw) & 0xFFFFu));
-                gpu_unai.PacketBuffer.U4[4] = u32_to_le32(((gpu_unai.GPU_GP1 & 0x7FFu) << 16) | (_v0 << 8) | _u1);
-                gpu_unai.PacketBuffer.U4[5] = u32_to_le32((((u32)(_y0 + _sh) & 0xFFFFu) << 16) | ((u32)(_x0) & 0xFFFFu));
-                gpu_unai.PacketBuffer.U4[6] = u32_to_le32((_v1 << 8) | _u0);
-                gpu_unai.PacketBuffer.U4[7] = u32_to_le32((((u32)(_y0 + _sh) & 0xFFFFu) << 16) | ((u32)(_x0 + _sw) & 0xFFFFu));
-                gpu_unai.PacketBuffer.U4[8] = u32_to_le32((_v1 << 8) | _u1);
-                u32 _pdrv = Blending_Mode | gpu_unai.TEXT_MODE | gpu_unai.Masking | Blending | gpu_unai.PixelMSB;
-                if (need_lighting(u32_to_le32(_c0))) _pdrv |= Lighting;
-                gpuDrawPolyFT(packet, gpuPolySpanDrivers[_pdrv], true);
-                w = _sw; h = _sh;
-              }
-            } else {
-              gpuDrawS(packet, driver, &w, &h);
-            }"""
+          new_ts_call = (
+              "if (g_v68_scale320_active) {\n"
+              "    s32 _sw = 0, _sh = 0;\n"
+              "    switch ((PRIM >> 3) & 3u) {\n"
+              "      case 0: _sw = le16_to_s16(gpu_unai.PacketBuffer.U2[6]) & 0x3FF; _sh = le16_to_s16(gpu_unai.PacketBuffer.U2[7]) & 0x1FF; break;\n"
+              "      case 1: _sw = 1; _sh = 1; break;\n"
+              "      case 2: _sw = 8; _sh = 8; break;\n"
+              "      case 3: _sw = 16; _sh = 16; break;\n"
+              "    }\n"
+              "    if (_sw > 0 && _sh > 0) {\n"
+              "      u32 _c0 = le32_to_u32(gpu_unai.PacketBuffer.U4[0]);\n"
+              "      u32 _xy = le32_to_u32(gpu_unai.PacketBuffer.U4[1]);\n"
+              "      u32 _uvc = le32_to_u32(gpu_unai.PacketBuffer.U4[2]);\n"
+              "      s32 _x0 = GPU_EXPANDSIGN(_xy), _y0 = GPU_EXPANDSIGN(_xy >> 16);\n"
+              "      u32 _u0 = _uvc & 0xFFu, _v0 = (_uvc >> 8) & 0xFFu;\n"
+              "      u32 _u1 = (_u0 + (u32)_sw > 255u) ? 255u : (_u0 + (u32)_sw);\n"
+              "      u32 _v1 = (_v0 + (u32)_sh > 255u) ? 255u : (_v0 + (u32)_sh);\n"
+              "      u32 _qcmd = 0x2Cu | (PRIM & 0x03u);\n"
+              "      gpu_unai.PacketBuffer.U4[0] = u32_to_le32((_qcmd << 24) | (_c0 & 0xFFFFFFu));\n"
+              "      gpu_unai.PacketBuffer.U4[1] = u32_to_le32((((u32)(_y0) & 0xFFFFu) << 16) | ((u32)(_x0) & 0xFFFFu));\n"
+              "      gpu_unai.PacketBuffer.U4[2] = u32_to_le32((_uvc & 0xFFFF0000u) | (_v0 << 8) | _u0);\n"
+              "      gpu_unai.PacketBuffer.U4[3] = u32_to_le32((((u32)(_y0) & 0xFFFFu) << 16) | ((u32)(_x0 + _sw) & 0xFFFFu));\n"
+              "      gpu_unai.PacketBuffer.U4[4] = u32_to_le32(((gpu_unai.GPU_GP1 & 0x7FFu) << 16) | (_v0 << 8) | _u1);\n"
+              "      gpu_unai.PacketBuffer.U4[5] = u32_to_le32((((u32)(_y0 + _sh) & 0xFFFFu) << 16) | ((u32)(_x0) & 0xFFFFu));\n"
+              "      gpu_unai.PacketBuffer.U4[6] = u32_to_le32((_v1 << 8) | _u0);\n"
+              "      gpu_unai.PacketBuffer.U4[7] = u32_to_le32((((u32)(_y0 + _sh) & 0xFFFFu) << 16) | ((u32)(_x0 + _sw) & 0xFFFFu));\n"
+              "      gpu_unai.PacketBuffer.U4[8] = u32_to_le32((_v1 << 8) | _u1);\n"
+              "      u32 _pdrv = Blending_Mode | gpu_unai.TEXT_MODE | gpu_unai.Masking | Blending | gpu_unai.PixelMSB;\n"
+              "      if ((_c0 & 0xF8F8F8u) != 0x808080u) _pdrv |= Lighting;\n"
+              "      gpuDrawPolyFT(packet, gpuPolySpanDrivers[_pdrv], true);\n"
+              "      w = _sw; h = _sh;\n"
+              "    }\n"
+              "  } else {\n"
+              "    gpuDrawS(packet, driver, &w, &h);\n"
+              "  }"
+          )
           assert old_ts_call in gpu, "Could not find gpuDrawS in textured_sprite"
           gpu = gpu.replace(old_ts_call, new_ts_call, 1)
 
-          v68_gpu_globals = """#include <stdint.h>
-          #include "../../frontend/plugin_lib.h"
-          extern "C" {
-          extern uint32_t g_frame_polys;
-          extern uint32_t g_last_frame_polys;
-          extern uint32_t g_allow_menu_light;
-          uint8_t g_v68_buf_2d[4] = {0, 0, 0, 0};
-          uint8_t g_v68_buf_320[4] = {0, 0, 0, 0};
-          int g_v68_scale320_active = 0;
-          int g_v68_scale320_x0 = 0;
-          static int g_v68_raw_da_x0 = 0;
-          static int g_v68_raw_da_x2 = 320;
-          uint64_t leap_pcsx_us(void);
-          void leap_pcsx_add_gpu(uint32_t dt_us);
-          }
-          struct LeapPcsxGpuScope {
-          \tuint64_t _t0;
-          \tLeapPcsxGpuScope() : _t0(leap_pcsx_us()) {}
-          \t~LeapPcsxGpuScope() { leap_pcsx_add_gpu((uint32_t)(leap_pcsx_us() - _t0)); }
-          };
-          """
-          v68_scale_helper = """
-          static inline void g_v68_update_scale320(void) {
-          \tint raw_w = g_v68_raw_da_x2 - g_v68_raw_da_x0;
-          \tunsigned bi = (((unsigned)gpu_unai.DrawingArea[1] >= 256u) ? 2u : 0u) | (((unsigned)g_v68_raw_da_x0 >= 384u) ? 1u : 0u);
-          \tif (pl_rearmed_cbs.scale_hires && gpu.screen.hres >= 508 && gpu.screen.hres <= 516 &&
-          \t    !(gpu.status & PSX_GPU_STATUS_RGB24) && raw_w >= 480 && !g_v68_buf_2d[bi]) {
-          \t\tg_v68_scale320_active = 1;
-          \t\tg_v68_scale320_x0 = (g_v68_raw_da_x0 >= 384) ? 512 : 0;
-          \t\tg_v68_buf_320[bi] = 1u;
-          \t\tgpu_unai.DrawingArea[2] = g_v68_scale320_x0 + (((g_v68_raw_da_x2 - g_v68_scale320_x0) * 5 + 7) >> 3);
-          \t} else {
-          \t\tg_v68_scale320_active = 0;
-          \t\tgpu_unai.DrawingArea[2] = g_v68_raw_da_x2;
-          \t}
-          }
-          """
-          # Place globals at top, and g_v68_update_scale320 right before gpuGP0Cmd_0xEx
+          v68_gpu_globals = (
+              "#include <stdint.h>\n"
+              '#include "../../frontend/plugin_lib.h"\n'
+              'extern "C" {\n'
+              "extern uint32_t g_frame_polys;\n"
+              "extern uint32_t g_last_frame_polys;\n"
+              "extern uint32_t g_allow_menu_light;\n"
+              "uint8_t g_v68_buf_2d[4] = {0, 0, 0, 0};\n"
+              "uint8_t g_v68_buf_320[4] = {0, 0, 0, 0};\n"
+              "int g_v68_scale320_active = 0;\n"
+              "int g_v68_scale320_x0 = 0;\n"
+              "static int g_v68_raw_da_x0 = 0;\n"
+              "static int g_v68_raw_da_x2 = 320;\n"
+              "uint64_t leap_pcsx_us(void);\n"
+              "void leap_pcsx_add_gpu(uint32_t dt_us);\n"
+              "}\n"
+              "struct LeapPcsxGpuScope {\n"
+              "\tuint64_t _t0;\n"
+              "\tLeapPcsxGpuScope() : _t0(leap_pcsx_us()) {}\n"
+              "\t~LeapPcsxGpuScope() { leap_pcsx_add_gpu((uint32_t)(leap_pcsx_us() - _t0)); }\n"
+              "};\n"
+          )
+          v68_scale_helper = (
+              "static inline void g_v68_update_scale320(void) {\n"
+              "\tint raw_w = g_v68_raw_da_x2 - g_v68_raw_da_x0;\n"
+              "\tint bx = (g_v68_raw_da_x0 >= 512) ? 512 : 0;\n"
+              "\tunsigned bi = (((unsigned)gpu_unai.DrawingArea[1] >= 256u) ? 2u : 0u) | ((bx >= 512) ? 1u : 0u);\n"
+              "\tif (pl_rearmed_cbs.scale_hires && gpu.screen.hres >= 508 && gpu.screen.hres <= 516 &&\n"
+              "\t    !(gpu.status & PSX_GPU_STATUS_RGB24) && !g_v68_buf_2d[bi] && (raw_w >= 480 || g_v68_buf_320[bi])) {\n"
+              "\t\tg_v68_scale320_active = 1;\n"
+              "\t\tg_v68_scale320_x0 = bx;\n"
+              "\t\tg_v68_buf_320[bi] = 1u;\n"
+              "\t\tgpu_unai.DrawingArea[0] = bx + (((g_v68_raw_da_x0 - bx) * 5) >> 3);\n"
+              "\t\tgpu_unai.DrawingArea[2] = bx + (((g_v68_raw_da_x2 - bx) * 5 + 7) >> 3);\n"
+              "\t} else {\n"
+              "\t\tg_v68_scale320_active = 0;\n"
+              "\t\tgpu_unai.DrawingArea[0] = g_v68_raw_da_x0;\n"
+              "\t\tgpu_unai.DrawingArea[2] = g_v68_raw_da_x2;\n"
+              "\t}\n"
+              "}\n"
+          )
           pos_gp0ex = gpu.index("static void gpuGP0Cmd_0xEx")
           gpu = v68_gpu_globals + gpu[:pos_gp0ex] + v68_scale_helper + "\n" + gpu[pos_gp0ex:]
 
@@ -455,57 +464,58 @@ jobs:
           sw_brace = gpu.index("{", sw_start)
           sw_end = find_matching_brace(gpu, sw_brace)
 
-          sw_pre_inj = """    const u32 _leap_orig_cmd = cmd;
-              if (cmd >= 0x20u && cmd < 0x40u) {
-                p_tot++;
-                g_frame_polys = p_tot;
-                if (allow_l && p_tot > 85u) gpu_unai.config.lighting = 0;
-                if ((p_tot > 280u || g_last_frame_polys > 280u) && (cmd >= 0x30u)) {
-                  if ((cmd & 0x04u) == 0u) {
-                    const u32 c0 = le32_to_u32(gpu_unai.PacketBuffer.U4[0]);
-                    const u32 c1 = le32_to_u32(gpu_unai.PacketBuffer.U4[2]);
-                    const u32 c2 = le32_to_u32(gpu_unai.PacketBuffer.U4[4]);
-                    if ((cmd & 0x08u) == 0u) {
-                      const u32 r = (((c0 & 0xFFu) + (c1 & 0xFFu) + (c2 & 0xFFu) + 1u) * 85u) >> 8;
-                      const u32 g = ((((c0 >> 8) & 0xFFu) + ((c1 >> 8) & 0xFFu) + ((c2 >> 8) & 0xFFu) + 1u) * 85u) >> 8;
-                      const u32 b = ((((c0 >> 16) & 0xFFu) + ((c1 >> 16) & 0xFFu) + ((c2 >> 16) & 0xFFu) + 1u) * 85u) >> 8;
-                      cmd -= 0x10u;
-                      gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | (b << 16) | (g << 8) | r);
-                      gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];
-                      gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];
-                    } else {
-                      const u32 c3 = le32_to_u32(gpu_unai.PacketBuffer.U4[6]);
-                      const u32 a01 = ((c0 & c1) + (((c0 ^ c1) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;
-                      const u32 a23 = ((c2 & c3) + (((c2 ^ c3) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;
-                      const u32 c_avg = ((a01 & a23) + (((a01 ^ a23) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;
-                      cmd -= 0x10u;
-                      gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | c_avg);
-                      gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];
-                      gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];
-                      gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[7];
-                    }
-                  } else if (gpu_unai.config.lighting == 0) {
-                    if ((cmd & 0x08u) == 0u) {
-                      cmd = (cmd - 0x10u) | 0x01u;
-                      gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);
-                      gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];
-                      gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];
-                      gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];
-                      gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];
-                    } else {
-                      cmd = (cmd - 0x10u) | 0x01u;
-                      gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);
-                      gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];
-                      gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];
-                      gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];
-                      gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];
-                      gpu_unai.PacketBuffer.U4[7] = gpu_unai.PacketBuffer.U4[10];
-                      gpu_unai.PacketBuffer.U4[8] = gpu_unai.PacketBuffer.U4[11];
-                    }
-                  }
-                }
-              }
-          """
+          sw_pre_inj = (
+              "    const u32 _leap_orig_cmd = cmd;\n"
+              "    if (cmd >= 0x20u && cmd < 0x40u) {\n"
+              "      p_tot++;\n"
+              "      g_frame_polys = p_tot;\n"
+              "      if (allow_l && p_tot > 85u) gpu_unai.config.lighting = 0;\n"
+              "      if ((p_tot > 280u || g_last_frame_polys > 280u) && (cmd >= 0x30u)) {\n"
+              "        if ((cmd & 0x04u) == 0u) {\n"
+              "          const u32 c0 = le32_to_u32(gpu_unai.PacketBuffer.U4[0]);\n"
+              "          const u32 c1 = le32_to_u32(gpu_unai.PacketBuffer.U4[2]);\n"
+              "          const u32 c2 = le32_to_u32(gpu_unai.PacketBuffer.U4[4]);\n"
+              "          if ((cmd & 0x08u) == 0u) {\n"
+              "            const u32 r = (((c0 & 0xFFu) + (c1 & 0xFFu) + (c2 & 0xFFu) + 1u) * 85u) >> 8;\n"
+              "            const u32 g = ((((c0 >> 8) & 0xFFu) + ((c1 >> 8) & 0xFFu) + ((c2 >> 8) & 0xFFu) + 1u) * 85u) >> 8;\n"
+              "            const u32 b = ((((c0 >> 16) & 0xFFu) + ((c1 >> 16) & 0xFFu) + ((c2 >> 16) & 0xFFu) + 1u) * 85u) >> 8;\n"
+              "            cmd -= 0x10u;\n"
+              "            gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | (b << 16) | (g << 8) | r);\n"
+              "            gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];\n"
+              "            gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];\n"
+              "          } else {\n"
+              "            const u32 c3 = le32_to_u32(gpu_unai.PacketBuffer.U4[6]);\n"
+              "            const u32 a01 = ((c0 & c1) + (((c0 ^ c1) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;\n"
+              "            const u32 a23 = ((c2 & c3) + (((c2 ^ c3) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;\n"
+              "            const u32 c_avg = ((a01 & a23) + (((a01 ^ a23) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;\n"
+              "            cmd -= 0x10u;\n"
+              "            gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | c_avg);\n"
+              "            gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];\n"
+              "            gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];\n"
+              "            gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[7];\n"
+              "          }\n"
+              "        } else if (gpu_unai.config.lighting == 0) {\n"
+              "          if ((cmd & 0x08u) == 0u) {\n"
+              "            cmd = (cmd - 0x10u) | 0x01u;\n"
+              "            gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);\n"
+              "            gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];\n"
+              "            gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];\n"
+              "            gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];\n"
+              "            gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];\n"
+              "          } else {\n"
+              "            cmd = (cmd - 0x10u) | 0x01u;\n"
+              "            gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);\n"
+              "            gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];\n"
+              "            gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];\n"
+              "            gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];\n"
+              "            gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];\n"
+              "            gpu_unai.PacketBuffer.U4[7] = gpu_unai.PacketBuffer.U4[10];\n"
+              "            gpu_unai.PacketBuffer.U4[8] = gpu_unai.PacketBuffer.U4[11];\n"
+              "          }\n"
+              "        }\n"
+              "      }\n"
+              "    }\n"
+          )
           gpu = gpu[:sw_start] + sw_pre_inj + gpu[sw_start : sw_end + 1] + "\n    cmd = _leap_orig_cmd;" + gpu[sw_end + 1 :]
           with open(gpu_p, "w") as f:
               f.write(gpu)
@@ -542,49 +552,53 @@ jobs:
 
           m_640 = re.search(r"^void\s+bgr555_to_rgb565_640_to_320\s*\([^;{}]*\)\s*\{", cs_txt, flags=re.M)
           b640_c = find_matching_brace(cs_txt, cs_txt.index("{", m_640.start()))
-          fast_640 = """void bgr555_to_rgb565_640_to_320(void * __restrict__ dst_,
-          \tconst void * __restrict__ src_, int dpixels)
-          {
-          \tconst uint32_t * __restrict__ s32 = (const uint32_t *)((uintptr_t)src_ & ~(uintptr_t)3U);
-          \tuint32_t * __restrict__ dst = (uint32_t *)dst_;
-          \tfor (; dpixels >= 8; dpixels -= 8, s32 += 8, dst += 4) {
-          \t\t__builtin_prefetch(s32 + 16);
-          \t\tuint32_t a0 = LE32TOH(s32[0]), a1 = LE32TOH(s32[1]);
-          \t\tuint32_t a2 = LE32TOH(s32[2]), a3 = LE32TOH(s32[3]);
-          \t\tuint32_t a4 = LE32TOH(s32[4]), a5 = LE32TOH(s32[5]);
-          \t\tuint32_t a6 = LE32TOH(s32[6]), a7 = LE32TOH(s32[7]);
-          \t\tdst[0] = bgr555_to_rgb565_pair((a0 & 0xFFFFu) | (a1 << 16));
-          \t\tdst[1] = bgr555_to_rgb565_pair((a2 & 0xFFFFu) | (a3 << 16));
-          \t\tdst[2] = bgr555_to_rgb565_pair((a4 & 0xFFFFu) | (a5 << 16));
-          \t\tdst[3] = bgr555_to_rgb565_pair((a6 & 0xFFFFu) | (a7 << 16));
-          \t}
-          \tfor (; dpixels >= 2; dpixels -= 2, s32 += 2, dst++) {
-          \t\tuint32_t a0 = LE32TOH(s32[0]), a1 = LE32TOH(s32[1]);
-          \t\t*dst = bgr555_to_rgb565_pair((a0 & 0xFFFFu) | (a1 << 16));
-          \t}
-          }"""
+          fast_640 = (
+              "void bgr555_to_rgb565_640_to_320(void * __restrict__ dst_,\n"
+              "\tconst void * __restrict__ src_, int dpixels)\n"
+              "{\n"
+              "\tconst uint32_t * __restrict__ s32 = (const uint32_t *)((uintptr_t)src_ & ~(uintptr_t)3U);\n"
+              "\tuint32_t * __restrict__ dst = (uint32_t *)dst_;\n"
+              "\tfor (; dpixels >= 8; dpixels -= 8, s32 += 8, dst += 4) {\n"
+              "\t\t__builtin_prefetch(s32 + 16);\n"
+              "\t\tuint32_t a0 = LE32TOH(s32[0]), a1 = LE32TOH(s32[1]);\n"
+              "\t\tuint32_t a2 = LE32TOH(s32[2]), a3 = LE32TOH(s32[3]);\n"
+              "\t\tuint32_t a4 = LE32TOH(s32[4]), a5 = LE32TOH(s32[5]);\n"
+              "\t\tuint32_t a6 = LE32TOH(s32[6]), a7 = LE32TOH(s32[7]);\n"
+              "\t\tdst[0] = bgr555_to_rgb565_pair((a0 & 0xFFFFu) | (a1 << 16));\n"
+              "\t\tdst[1] = bgr555_to_rgb565_pair((a2 & 0xFFFFu) | (a3 << 16));\n"
+              "\t\tdst[2] = bgr555_to_rgb565_pair((a4 & 0xFFFFu) | (a5 << 16));\n"
+              "\t\tdst[3] = bgr555_to_rgb565_pair((a6 & 0xFFFFu) | (a7 << 16));\n"
+              "\t}\n"
+              "\tfor (; dpixels >= 2; dpixels -= 2, s32 += 2, dst++) {\n"
+              "\t\tuint32_t a0 = LE32TOH(s32[0]), a1 = LE32TOH(s32[1]);\n"
+              "\t\t*dst = bgr555_to_rgb565_pair((a0 & 0xFFFFu) | (a1 << 16));\n"
+              "\t}\n"
+              "}"
+          )
           cs_txt = cs_txt[:m_640.start()] + fast_640 + cs_txt[b640_c + 1 :]
 
           m_512 = re.search(r"^void\s+bgr555_to_rgb565_512_to_320\s*\([^;{}]*\)\s*\{", cs_txt, flags=re.M)
           b512_c = find_matching_brace(cs_txt, cs_txt.index("{", m_512.start()))
-          fast_512 = """void bgr555_to_rgb565_512_to_320(void * __restrict__ dst_,
-          \tconst void * __restrict__ src_, int dpixels)
-          {
-          \tconst uint32_t * __restrict__ s32 = (const uint32_t *)((uintptr_t)src_ & ~(uintptr_t)3U);
-          \tuint32_t * __restrict__ dst = (uint32_t *)dst_;
-          \tfor (; dpixels >= 10; dpixels -= 10, s32 += 8, dst += 5) {
-          \t\t__builtin_prefetch(s32 + 16);
-          \t\tuint32_t w0 = LE32TOH(s32[0]), w1 = LE32TOH(s32[1]);
-          \t\tuint32_t w2 = LE32TOH(s32[2]), w3 = LE32TOH(s32[3]);
-          \t\tuint32_t w4 = LE32TOH(s32[4]), w5 = LE32TOH(s32[5]);
-          \t\tuint32_t w6 = LE32TOH(s32[6]), w7 = LE32TOH(s32[7]);
-          \t\tdst[0] = bgr555_to_rgb565_pair((w0 & 0xFFFFu) | (w1 << 16));
-          \t\tdst[1] = bgr555_to_rgb565_pair(w2);
-          \t\tdst[2] = bgr555_to_rgb565_pair((w3 >> 16) | (w4 << 16));
-          \t\tdst[3] = bgr555_to_rgb565_pair((w5 & 0xFFFFu) | (w6 << 16));
-          \t\tdst[4] = bgr555_to_rgb565_pair((w6 >> 16) | (w7 & 0xFFFF0000u));
-          \t}
-          }"""
+          fast_512 = (
+              "void bgr555_to_rgb565_512_to_320(void * __restrict__ dst_,\n"
+              "\tconst void * __restrict__ src_, int dpixels)\n"
+              "{\n"
+              "\tconst uint32_t * __restrict__ s32 = (const uint32_t *)((uintptr_t)src_ & ~(uintptr_t)3U);\n"
+              "\tuint32_t * __restrict__ dst = (uint32_t *)dst_;\n"
+              "\tfor (; dpixels >= 10; dpixels -= 10, s32 += 8, dst += 5) {\n"
+              "\t\t__builtin_prefetch(s32 + 16);\n"
+              "\t\tuint32_t w0 = LE32TOH(s32[0]), w1 = LE32TOH(s32[1]);\n"
+              "\t\tuint32_t w2 = LE32TOH(s32[2]), w3 = LE32TOH(s32[3]);\n"
+              "\t\tuint32_t w4 = LE32TOH(s32[4]), w5 = LE32TOH(s32[5]);\n"
+              "\t\tuint32_t w6 = LE32TOH(s32[6]), w7 = LE32TOH(s32[7]);\n"
+              "\t\tdst[0] = bgr555_to_rgb565_pair((w0 & 0xFFFFu) | (w1 << 16));\n"
+              "\t\tdst[1] = bgr555_to_rgb565_pair(w2);\n"
+              "\t\tdst[2] = bgr555_to_rgb565_pair((w3 >> 16) | (w4 << 16));\n"
+              "\t\tdst[3] = bgr555_to_rgb565_pair((w5 & 0xFFFFu) | (w6 << 16));\n"
+              "\t\tdst[4] = bgr555_to_rgb565_pair((w6 >> 16) | (w7 & 0xFFFF0000u));\n"
+              "\t}\n"
+              "}"
+          )
           cs_txt = cs_txt[:m_512.start()] + fast_512 + cs_txt[b512_c + 1 :]
           with open(cs_p, "w") as f:
               f.write(cs_txt)
@@ -617,11 +631,7 @@ jobs:
                   f.write(opt_h)
           log_msg("SUCCESS 5B: Updated Core Option defaults in libretro_core_options.h!")
 
-          # 5C. Goals 1, 2 & 3 in frontend/libretro.c:
-          #   - Bypass GET_CURRENT_SOFTWARE_FRAMEBUFFER lock in set_vout_fb()
-          #   - Goal 2: Cap vout_height <= 240 in vout_set_mode() when scale_hires is enabled so SDL receives 320x240 1:1 (eliminating 256->240 software scaling on SDL thread!)
-          #   - Goal 1+2 fast path in vout_flip(): when buffer was rendered in 320w mode (g_v68_buf_320[bi]), blit 320w 1:1 via cspace_arm.S (bgr555_to_rgb565), mapping 256->240 rows via sy = ry + (ry >> 4) (zero cropping!)
-          #   - Goal 3: Hardware-calibrated step_fp = 69530 resampler (locks steady PAL rate to 50.00 Hz, XRUN-free down to 48.04 Hz!)
+          # 5C. Goals 1, 2 & 3 in frontend/libretro.c (including 8-pixel alignment & 24-bit bgr24 PAL FMV 256->240 mapping!)
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
@@ -632,254 +642,262 @@ jobs:
           )
           assert n_fb == 1
 
-          old_vsm_scale = "   if (pl_rearmed_cbs.scale_hires) {\n      if (raw_w >= 512-4 && w > 320)\n         vout_width = 320;\n      if (h > 256)\n         vout_height = h / 2;\n   }"
-          new_vsm_scale = """   if (pl_rearmed_cbs.scale_hires) {
-                if (raw_w >= 512-4 && w > 320)
-                   vout_width = 320;
-                if (h > 256)
-                   vout_height = h / 2;
-                if (vout_height > 240)
-                   vout_height = 240;
-             }"""
+          old_vsm_scale = (
+              "   if (pl_rearmed_cbs.scale_hires) {\n"
+              "      if (raw_w >= 512-4 && w > 320)\n"
+              "         vout_width = 320;\n"
+              "      if (h > 256)\n"
+              "         vout_height = h / 2;\n"
+              "   }"
+          )
+          new_vsm_scale = (
+              "   if (pl_rearmed_cbs.scale_hires) {\n"
+              "      if (raw_w >= 512-4 && w > 320)\n"
+              "         vout_width = 320;\n"
+              "      if (h > 256)\n"
+              "         vout_height = h / 2;\n"
+              "      if (vout_height > 240)\n"
+              "         vout_height = 240;\n"
+              "   }"
+          )
           assert old_vsm_scale in lr, "Could not find scale_hires block in vout_set_mode"
           lr = lr.replace(old_vsm_scale, new_vsm_scale, 1)
 
           m_vfl = re.search(r"^static\s+void\s+vout_flip\s*\(([^;{}]*)\)\s*\{", lr, flags=re.M)
           assert m_vfl is not None
           vfl_b = lr.index("{", m_vfl.start())
-          vfl_fast = """
-             extern uint8_t g_v68_buf_320[4];
-             if (vram_ != NULL && !bgr24 && current_fmt == RETRO_PIXEL_FORMAT_RGB565 &&
-                 pl_rearmed_cbs.scale_hires && vout_width == 320 && w > 0 && h > 0 &&
-                 (in_enable_crosshair[0] + in_enable_crosshair[1]) == 0) {
-                int _sy0 = (vram_ofs >> 11) & 0x1ff;
-                int _sx0 = (vram_ofs >> 1) & 0x3ff;
-                unsigned _bi = (((unsigned)_sy0 >= 256u) ? 2u : 0u) | (((unsigned)_sx0 >= 384u) ? 1u : 0u);
-                int _is320 = (psx_w >= 508 && psx_w <= 516 && g_v68_buf_320[_bi]);
-                if (_is320 || vout_height == 240) {
-                   if (dims_changed) memset(vout_buf_ptr, 0, vout_pitch_b * vout_height);
-                   bgr_to_fb_func *_row_fn = _is320 ? bgr555_to_rgb565 : pl_rearmed_cbs.cspace_blit;
-                   int _src_h = (h > 256) ? (h >> 1) : h;
-                   int _row_step = (h > 256) ? 4096 : 2048;
-                   int _out_h = (_src_h > vout_height) ? vout_height : _src_h;
-                   int _y_pad = (y > 0 && _out_h < vout_height) ? y : 0;
-                   if (_y_pad + _out_h > vout_height) _out_h = vout_height - _y_pad;
-                   int _x_pix = _is320 ? ((x * 5) >> 3) : ((psx_w >= 636) ? (x >> 1) : ((psx_w >= 508) ? ((x * 5) >> 3) : x));
-                   if (_x_pix < 0) _x_pix = 0;
-                   int _w_out = _is320 ? (((w * 5 + 4) >> 3) & ~1) : ((psx_w >= 636) ? ((w >> 1) & ~1) : ((psx_w >= 508) ? (((w * 5) >> 3) & ~9) : w));
-                   if (_x_pix + _w_out > 320) _w_out = 320 - _x_pix;
-                   if (_w_out > 0 && _out_h > 0) {
-            const unsigned char *_vb = (const unsigned char *)vram_;
-            unsigned char *_dst = (unsigned char *)vout_buf_ptr + _y_pad * vout_pitch_b + _x_pix * 2;
-            for (int _ry = 0; _ry < _out_h; ++_ry, _dst += vout_pitch_b) {
-               int _sy = (_src_h > _out_h) ? ((_src_h == 256 && _out_h == 240) ? (_ry + (_ry >> 4)) : ((_ry * _src_h) / _out_h)) : _ry;
-               unsigned _ofs = ((unsigned)vram_ofs + (unsigned)(_sy * _row_step)) & 0xfffffu;
-               _row_fn(_dst, _vb + _ofs, _w_out);
-            }
-            vout_fb_dirty = 1;
-            return;
-                   }
-                }
-             }
-          """
+          vfl_fast = (
+              "\n   extern uint8_t g_v68_buf_320[4];\n"
+              "   if (vram_ != NULL && current_fmt == RETRO_PIXEL_FORMAT_RGB565 &&\n"
+              "       pl_rearmed_cbs.scale_hires && w > 0 && h > 0 &&\n"
+              "       (in_enable_crosshair[0] + in_enable_crosshair[1]) == 0) {\n"
+              "      int _sy0 = (vram_ofs >> 11) & 0x1ff;\n"
+              "      int _sx0 = (vram_ofs >> 1) & 0x3ff;\n"
+              "      unsigned _bi = (((unsigned)_sy0 >= 256u) ? 2u : 0u) | (((unsigned)_sx0 >= 512u) ? 1u : 0u);\n"
+              "      int _is320 = (!bgr24 && vout_width == 320 && psx_w >= 508 && psx_w <= 516 && g_v68_buf_320[_bi]);\n"
+              "      if (_is320 || vout_height == 240) {\n"
+              "         if (dims_changed) memset(vout_buf_ptr, 0, vout_pitch_b * vout_height);\n"
+              "         bgr_to_fb_func *_row_fn = _is320 ? bgr555_to_rgb565 : pl_rearmed_cbs.cspace_blit;\n"
+              "         int _src_h = (h > 256) ? (h >> 1) : h;\n"
+              "         int _row_step = (h > 256) ? 4096 : 2048;\n"
+              "         int _out_h = (_src_h > vout_height) ? vout_height : _src_h;\n"
+              "         int _y_pad = (y > 0 && _out_h < vout_height) ? y : 0;\n"
+              "         if (_y_pad + _out_h > vout_height) _out_h = vout_height - _y_pad;\n"
+              "         int _x_pix = x, _w_out = w;\n"
+              "         if (_is320) {\n"
+              "            _x_pix = (x * 5) >> 3;\n"
+              "            _w_out = (((w * 5 + 4) >> 3) + 7) & ~7;\n"
+              "         } else if (vout_width == 320 && psx_w >= 636) {\n"
+              "            _x_pix = x >> 1;\n"
+              "            _w_out = (w >> 1) & ~7;\n"
+              "         } else if (vout_width == 320 && psx_w >= 508) {\n"
+              "            _x_pix = (x * 5) >> 3;\n"
+              "            _w_out = ((((w * 5) >> 3) / 10) * 10);\n"
+              "         } else {\n"
+              "            _w_out = w & ~7;\n"
+              "         }\n"
+              "         if (_x_pix < 0) _x_pix = 0;\n"
+              "         if (_x_pix + _w_out > vout_width) {\n"
+              "            _w_out = vout_width - _x_pix;\n"
+              "            if (!_is320 && vout_width == 320 && psx_w >= 508 && psx_w < 636)\n"
+              "               _w_out = (_w_out / 10) * 10;\n"
+              "            else\n"
+              "               _w_out &= ~7;\n"
+              "         }\n"
+              "         if (_w_out >= 8 && _out_h > 0) {\n"
+              "            const unsigned char *_vb = (const unsigned char *)vram_;\n"
+              "            unsigned char *_dst = (unsigned char *)vout_buf_ptr + _y_pad * vout_pitch_b + _x_pix * 2;\n"
+              "            for (int _ry = 0; _ry < _out_h; ++_ry, _dst += vout_pitch_b) {\n"
+              "               int _sy = (_src_h > _out_h) ? ((_src_h == 256 && _out_h == 240) ? (_ry + (_ry >> 4)) : ((_ry * _src_h) / _out_h)) : _ry;\n"
+              "               unsigned _ofs = ((unsigned)vram_ofs + (unsigned)(_sy * _row_step)) & 0xfffffu;\n"
+              "               _row_fn(_dst, _vb + _ofs, _w_out);\n"
+              "            }\n"
+              "            vout_fb_dirty = 1;\n"
+              "            return;\n"
+              "         }\n"
+              "      }\n"
+              "   }\n"
+          )
           lr = lr[:vfl_b + 1] + vfl_fast + lr[vfl_b + 1 :]
 
           cm_ident_expr = "Config.cycle_multiplier" if "Config.cycle_multiplier" in lr else "217"
 
-          v68_runtime = """
-          #include <stdio.h>
-          #include <string.h>
-          #include <stdint.h>
-          #include <time.h>
-          #ifndef CLOCK_MONOTONIC
-          #define CLOCK_MONOTONIC 1
-          #endif
-
-          uint32_t g_frame_polys = 0;
-          uint32_t g_last_frame_polys = 0;
-          uint32_t g_allow_menu_light = 0;
-          extern uint8_t g_v68_buf_2d[4];
-          extern uint8_t g_v68_buf_320[4];
-          extern int g_v68_scale320_active;
-
-          static retro_video_refresh_t g_leap_orig_vid = NULL;
-          static retro_audio_sample_batch_t g_leap_orig_aud = NULL;
-
-          static FILE *g_ptfp = NULL;
-          static volatile int g_in_retro_run = 0;
-          static int g_in_vout = 0, g_in_spu = 0;
-          static uint64_t g_p_win_u = 0, g_p_pre_u = 0, g_p_emu_u = 0;
-          static uint32_t g_p_sec = 0, g_p_vbl = 0, g_p_vreal = 0, g_p_vdup = 0;
-          static unsigned g_p_vw = 0, g_p_vh = 0, g_p_last_vw = 0, g_p_last_vh = 0;
-          static size_t g_p_vpitch = 0, g_p_last_vpitch = 0;
-          static uint32_t g_p_max_polys = 0;
-          static uint32_t g_p_gpu_u = 0, g_p_vout_u = 0, g_p_vcb_u = 0, g_p_vcb_in_vout_u = 0;
-          static uint32_t g_p_cd_u = 0, g_p_cd_main_u = 0, g_p_cd_cnt = 0;
-          static uint32_t g_p_spu_u = 0, g_p_blk_u = 0, g_p_blk_in_spu_u = 0;
-          static uint32_t g_p_in_aud_f = 0, g_p_max_b = 0;
-
-          static int16_t g_rs_out[1024 * 2] __attribute__((aligned(16)));
-          static uint32_t s_rs_pos = 0;
-          static int s_rs_prev_l = 0, s_rs_prev_r = 0;
-
-          uint64_t leap_pcsx_us(void) {
-             struct timespec ts;
-             clock_gettime(CLOCK_MONOTONIC, &ts);
-             return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000ULL);
-          }
-
-          static void leap_pcsx_open_log(void) {
-             if (!g_ptfp) {
-                g_ptfp = fopen("/tmp/pcsx_telemetry.log", "w");
-                if (g_ptfp) {
-                   fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V68 (2026 Master + 46%% Clock + Native 320w 3D Raster + 320x240 1:1 + 50.00Hz) ===\\n");
-                   fprintf(g_ptfp, "sec | wall | emu_ms | vbl | v_r/d  | res         | clk | polys | cpu_ms | gpu_ms | vout_ms | vcb_ms | cd_ms(c)  | spu_ms | aud_ms | max_b | blk_ms | r320\\n");
-                   fflush(g_ptfp);
-                }
-             }
-          }
-
-          void leap_pcsx_add_gpu(uint32_t dt_us) { __sync_fetch_and_add(&g_p_gpu_u, dt_us); }
-          void leap_pcsx_vout_enter(void) { g_in_vout = 1; }
-          void leap_pcsx_vout_leave(uint32_t dt_us) { g_in_vout = 0; __sync_fetch_and_add(&g_p_vout_u, dt_us); }
-          void leap_pcsx_spu_enter(void) { g_in_spu = 1; }
-          void leap_pcsx_spu_leave(uint32_t dt_us) { g_in_spu = 0; __sync_fetch_and_add(&g_p_spu_u, dt_us); }
-          void leap_pcsx_add_cd(uint32_t dt_us) {
-             __sync_fetch_and_add(&g_p_cd_u, dt_us);
-             __sync_fetch_and_add(&g_p_cd_cnt, 1U);
-             if (g_in_retro_run) __sync_fetch_and_add(&g_p_cd_main_u, dt_us);
-          }
-
-          static void leap_pcsx_vid_cb(const void *data, unsigned width, unsigned height, size_t pitch) {
-             if (data != NULL) {
-                g_p_vreal++;
-                g_p_vw = width;
-                g_p_vh = height;
-                g_p_vpitch = pitch;
-                if (width != g_p_last_vw || height != g_p_last_vh || pitch != g_p_last_vpitch) {
-                   g_p_last_vw = width;
-                   g_p_last_vh = height;
-                   g_p_last_vpitch = pitch;
-                   leap_pcsx_open_log();
-                   if (g_ptfp && g_p_sec <= 600) {
-                      unsigned bpp = (width > 0 && pitch >= width * 4U) ? 32U : 16U;
-                      fprintf(g_ptfp, "[MODE] res=%ux%u pitch=%zu bpp=%u scale_hires=%d nostalls=%d hacks=0x%x clk=%d\\n",
-                              width, height, pitch, bpp, (int)pl_rearmed_cbs.scale_hires,
-                              (int)Config.DisableStalls, (unsigned)ndrc_g.hacks, (int)Config.cycle_multiplier);
-                      fflush(g_ptfp);
-                   }
-                }
-             } else {
-                g_p_vdup++;
-             }
-             if (g_leap_orig_vid) {
-                uint64_t t0 = leap_pcsx_us();
-                g_leap_orig_vid(data, width, height, pitch);
-                uint32_t dt = (uint32_t)(leap_pcsx_us() - t0);
-                g_p_vcb_u += dt;
-                if (g_in_vout) g_p_vcb_in_vout_u += dt;
-             }
-          }
-
-          static size_t leap_pcsx_aud_cb(const int16_t *data, size_t frames) {
-             if (!g_leap_orig_aud || !data || frames == 0) return frames;
-             uint32_t in_f = (uint32_t)frames;
-             __sync_fetch_and_add(&g_p_in_aud_f, in_f);
-             if (in_f > g_p_max_b) g_p_max_b = in_f;
-
-             /* Hardware-calibrated step_fp = 69530 (831.34 out/VBlank): locks steady PAL rate to 50.00 Hz, XRUN-free down to 48.04 Hz */
-             const uint32_t step_fp = 69530U;
-             uint32_t in_pos = s_rs_pos;
-             uint32_t idx = in_pos >> 16;
-             uint64_t blk_tot = 0;
-
-             while (idx < in_f) {
-                uint32_t out_f = 0;
-                while (idx < in_f && out_f < 1020U) {
-                   uint32_t frac = in_pos & 0xFFFFU;
-                   int l0 = (idx == 0U) ? s_rs_prev_l : (int)data[(idx - 1U) * 2U];
-                   int r0 = (idx == 0U) ? s_rs_prev_r : (int)data[(idx - 1U) * 2U + 1U];
-                   int l1 = (int)data[idx * 2U];
-                   int r1 = (int)data[idx * 2U + 1U];
-                   g_rs_out[out_f * 2U]     = (int16_t)(l0 + (((l1 - l0) * (int)frac) >> 16));
-                   g_rs_out[out_f * 2U + 1U] = (int16_t)(r0 + (((r1 - r0) * (int)frac) >> 16));
-                   out_f++;
-                   in_pos += step_fp;
-                   idx = in_pos >> 16;
-                }
-                if (out_f > 0U) {
-                   uint64_t t0 = leap_pcsx_us();
-                   g_leap_orig_aud(g_rs_out, out_f);
-                   blk_tot += leap_pcsx_us() - t0;
-                }
-             }
-
-             s_rs_prev_l = (int)data[(in_f - 1U) * 2U];
-             s_rs_prev_r = (int)data[(in_f - 1U) * 2U + 1U];
-             s_rs_pos = in_pos - (in_f << 16);
-
-             uint32_t blk_dt = (uint32_t)blk_tot;
-             __sync_fetch_and_add(&g_p_blk_u, blk_dt);
-             if (g_in_spu) g_p_blk_in_spu_u += blk_dt;
-             return frames;
-          }
-
-          static void leap_pcsx_pre(void) {
-             g_in_retro_run = 1;
-             g_p_pre_u = leap_pcsx_us();
-             if (!g_p_win_u) {
-                leap_pcsx_open_log();
-                g_p_win_u = g_p_pre_u;
-             }
-          }
-
-          static void leap_pcsx_post(int cur_clk) {
-             g_in_retro_run = 0;
-             uint64_t u = leap_pcsx_us();
-             uint32_t run_u = (g_p_pre_u && u > g_p_pre_u) ? (uint32_t)(u - g_p_pre_u) : 0U;
-             g_p_emu_u += run_u;
-             if (g_frame_polys > g_p_max_polys) g_p_max_polys = g_frame_polys;
-             g_p_vbl++;
-
-             if (u - g_p_win_u >= 1000000ULL) {
-                g_p_sec++;
-                uint32_t wm = (uint32_t)((u - g_p_win_u) / 1000ULL);
-                uint32_t emu_u = (uint32_t)g_p_emu_u;
-                uint32_t gpu_u = __sync_lock_test_and_set(&g_p_gpu_u, 0);
-                uint32_t vout_tot = __sync_lock_test_and_set(&g_p_vout_u, 0);
-                uint32_t vcb_u = g_p_vcb_u; g_p_vcb_u = 0;
-                uint32_t vcb_in = g_p_vcb_in_vout_u; g_p_vcb_in_vout_u = 0;
-                uint32_t pure_vout_u = (vout_tot > vcb_in) ? (vout_tot - vcb_in) : 0;
-                uint32_t cd_u = __sync_lock_test_and_set(&g_p_cd_u, 0);
-                uint32_t cd_cnt = __sync_lock_test_and_set(&g_p_cd_cnt, 0);
-                uint32_t cd_main_u = __sync_lock_test_and_set(&g_p_cd_main_u, 0);
-                uint32_t spu_tot = __sync_lock_test_and_set(&g_p_spu_u, 0);
-                uint32_t blk_u = __sync_lock_test_and_set(&g_p_blk_u, 0);
-                uint32_t blk_in = g_p_blk_in_spu_u; g_p_blk_in_spu_u = 0;
-                uint32_t pure_spu_u = (spu_tot > blk_in) ? (spu_tot - blk_in) : 0;
-                uint32_t in_aud_f = __sync_lock_test_and_set(&g_p_in_aud_f, 0);
-
-                uint32_t sub_u = gpu_u + pure_vout_u + vcb_u + cd_main_u + pure_spu_u + blk_u;
-                uint32_t cpu_u = (emu_u > sub_u) ? (emu_u - sub_u) : 0;
-
-                if (g_ptfp && g_p_sec <= 600) {
-                   unsigned bpp = (g_p_vw > 0 && g_p_vpitch >= g_p_vw * 4U) ? 32U : 16U;
-                   char rbuf[20], vrbuf[16], cdbuf[16];
-                   snprintf(rbuf, sizeof(rbuf), "%ux%ux%u", g_p_vw, g_p_vh, bpp);
-                   snprintf(vrbuf, sizeof(vrbuf), "%u/%u", g_p_vreal, g_p_vdup);
-                   snprintf(cdbuf, sizeof(cdbuf), "%u(%u)", cd_u / 1000U, cd_cnt);
-                   fprintf(g_ptfp, "%3u | %4u | %6u | %3u | %-6s | %-11s | %3d | %5u | %6u | %6u | %7u | %6u | %-9s | %6u | %6u | %5u | %6u | %4d\\n",
-                           g_p_sec, wm, emu_u / 1000U, g_p_vbl, vrbuf, rbuf, cur_clk, g_p_max_polys,
-                           cpu_u / 1000U, gpu_u / 1000U, pure_vout_u / 1000U, vcb_u / 1000U, cdbuf,
-                           pure_spu_u / 1000U, (in_aud_f * 1000U) / 44100U, g_p_max_b, blk_u / 1000U, g_v68_scale320_active);
-                   fflush(g_ptfp);
-                }
-                g_p_win_u = u;
-                g_p_emu_u = 0;
-                g_p_vbl = g_p_vreal = g_p_vdup = g_p_max_polys = g_p_max_b = 0;
-             }
-          }
-          """
+          v68_runtime = (
+              "#include <stdio.h>\n"
+              "#include <string.h>\n"
+              "#include <stdint.h>\n"
+              "#include <time.h>\n"
+              "#ifndef CLOCK_MONOTONIC\n"
+              "#define CLOCK_MONOTONIC 1\n"
+              "#endif\n\n"
+              "uint32_t g_frame_polys = 0;\n"
+              "uint32_t g_last_frame_polys = 0;\n"
+              "uint32_t g_allow_menu_light = 0;\n"
+              "extern uint8_t g_v68_buf_2d[4];\n"
+              "extern uint8_t g_v68_buf_320[4];\n"
+              "extern int g_v68_scale320_active;\n\n"
+              "static retro_video_refresh_t g_leap_orig_vid = NULL;\n"
+              "static retro_audio_sample_batch_t g_leap_orig_aud = NULL;\n\n"
+              "static FILE *g_ptfp = NULL;\n"
+              "static volatile int g_in_retro_run = 0;\n"
+              "static int g_in_vout = 0, g_in_spu = 0;\n"
+              "static uint64_t g_p_win_u = 0, g_p_pre_u = 0, g_p_emu_u = 0;\n"
+              "static uint32_t g_p_sec = 0, g_p_vbl = 0, g_p_vreal = 0, g_p_vdup = 0;\n"
+              "static unsigned g_p_vw = 0, g_p_vh = 0, g_p_last_vw = 0, g_p_last_vh = 0;\n"
+              "static size_t g_p_vpitch = 0, g_p_last_vpitch = 0;\n"
+              "static uint32_t g_p_max_polys = 0;\n"
+              "static uint32_t g_p_gpu_u = 0, g_p_vout_u = 0, g_p_vcb_u = 0, g_p_vcb_in_vout_u = 0;\n"
+              "static uint32_t g_p_cd_u = 0, g_p_cd_main_u = 0, g_p_cd_cnt = 0;\n"
+              "static uint32_t g_p_spu_u = 0, g_p_blk_u = 0, g_p_blk_in_spu_u = 0;\n"
+              "static uint32_t g_p_in_aud_f = 0, g_p_max_b = 0;\n\n"
+              "static int16_t g_rs_out[1024 * 2] __attribute__((aligned(16)));\n"
+              "static uint32_t s_rs_pos = 0;\n"
+              "static int s_rs_prev_l = 0, s_rs_prev_r = 0;\n\n"
+              "uint64_t leap_pcsx_us(void) {\n"
+              "   struct timespec ts;\n"
+              "   clock_gettime(CLOCK_MONOTONIC, &ts);\n"
+              "   return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000ULL);\n"
+              "}\n\n"
+              "static void leap_pcsx_open_log(void) {\n"
+              "   if (!g_ptfp) {\n"
+              '      g_ptfp = fopen("/tmp/pcsx_telemetry.log", "w");\n'
+              "      if (g_ptfp) {\n"
+              '         fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V68 (2026 Master + 46%% Clock + Native 320w 3D Raster + 320x240 1:1 + 50.00Hz) ===\\n");\n'
+              '         fprintf(g_ptfp, "sec | wall | emu_ms | vbl | v_r/d  | res         | clk | polys | cpu_ms | gpu_ms | vout_ms | vcb_ms | cd_ms(c)  | spu_ms | aud_ms | max_b | blk_ms | r320\\n");\n'
+              "         fflush(g_ptfp);\n"
+              "      }\n"
+              "   }\n"
+              "}\n\n"
+              "void leap_pcsx_add_gpu(uint32_t dt_us) { __sync_fetch_and_add(&g_p_gpu_u, dt_us); }\n"
+              "void leap_pcsx_vout_enter(void) { g_in_vout = 1; }\n"
+              "void leap_pcsx_vout_leave(uint32_t dt_us) { g_in_vout = 0; __sync_fetch_and_add(&g_p_vout_u, dt_us); }\n"
+              "void leap_pcsx_spu_enter(void) { g_in_spu = 1; }\n"
+              "void leap_pcsx_spu_leave(uint32_t dt_us) { g_in_spu = 0; __sync_fetch_and_add(&g_p_spu_u, dt_us); }\n"
+              "void leap_pcsx_add_cd(uint32_t dt_us) {\n"
+              "   __sync_fetch_and_add(&g_p_cd_u, dt_us);\n"
+              "   __sync_fetch_and_add(&g_p_cd_cnt, 1U);\n"
+              "   if (g_in_retro_run) __sync_fetch_and_add(&g_p_cd_main_u, dt_us);\n"
+              "}\n\n"
+              "static void leap_pcsx_vid_cb(const void *data, unsigned width, unsigned height, size_t pitch) {\n"
+              "   if (data != NULL) {\n"
+              "      g_p_vreal++;\n"
+              "      g_p_vw = width;\n"
+              "      g_p_vh = height;\n"
+              "      g_p_vpitch = pitch;\n"
+              "      if (width != g_p_last_vw || height != g_p_last_vh || pitch != g_p_last_vpitch) {\n"
+              "         g_p_last_vw = width;\n"
+              "         g_p_last_vh = height;\n"
+              "         g_p_last_vpitch = pitch;\n"
+              "         leap_pcsx_open_log();\n"
+              "         if (g_ptfp && g_p_sec <= 600) {\n"
+              "            unsigned bpp = (width > 0 && pitch >= width * 4U) ? 32U : 16U;\n"
+              '            fprintf(g_ptfp, "[MODE] res=%ux%u pitch=%zu bpp=%u scale_hires=%d nostalls=%d hacks=0x%x clk=%d\\n",\n'
+              "                    width, height, pitch, bpp, (int)pl_rearmed_cbs.scale_hires,\n"
+              "                    (int)Config.DisableStalls, (unsigned)ndrc_g.hacks, (int)Config.cycle_multiplier);\n"
+              "            fflush(g_ptfp);\n"
+              "         }\n"
+              "      }\n"
+              "   } else {\n"
+              "      g_p_vdup++;\n"
+              "   }\n"
+              "   if (g_leap_orig_vid) {\n"
+              "      uint64_t t0 = leap_pcsx_us();\n"
+              "      g_leap_orig_vid(data, width, height, pitch);\n"
+              "      uint32_t dt = (uint32_t)(leap_pcsx_us() - t0);\n"
+              "      g_p_vcb_u += dt;\n"
+              "      if (g_in_vout) g_p_vcb_in_vout_u += dt;\n"
+              "   }\n"
+              "}\n\n"
+              "static size_t leap_pcsx_aud_cb(const int16_t *data, size_t frames) {\n"
+              "   if (!g_leap_orig_aud || !data || frames == 0) return frames;\n"
+              "   uint32_t in_f = (uint32_t)frames;\n"
+              "   __sync_fetch_and_add(&g_p_in_aud_f, in_f);\n"
+              "   if (in_f > g_p_max_b) g_p_max_b = in_f;\n\n"
+              "   /* Hardware-calibrated step_fp = 69530 (831.34 out/VBlank): locks steady PAL rate to 50.00 Hz, XRUN-free down to 48.04 Hz */\n"
+              "   const uint32_t step_fp = 69530U;\n"
+              "   uint32_t in_pos = s_rs_pos;\n"
+              "   uint32_t idx = in_pos >> 16;\n"
+              "   uint64_t blk_tot = 0;\n\n"
+              "   while (idx < in_f) {\n"
+              "      uint32_t out_f = 0;\n"
+              "      while (idx < in_f && out_f < 1020U) {\n"
+              "         uint32_t frac = in_pos & 0xFFFFU;\n"
+              "         int l0 = (idx == 0U) ? s_rs_prev_l : (int)data[(idx - 1U) * 2U];\n"
+              "         int r0 = (idx == 0U) ? s_rs_prev_r : (int)data[(idx - 1U) * 2U + 1U];\n"
+              "         int l1 = (int)data[idx * 2U];\n"
+              "         int r1 = (int)data[idx * 2U + 1U];\n"
+              "         g_rs_out[out_f * 2U]     = (int16_t)(l0 + (((l1 - l0) * (int)frac) >> 16));\n"
+              "         g_rs_out[out_f * 2U + 1U] = (int16_t)(r0 + (((r1 - r0) * (int)frac) >> 16));\n"
+              "         out_f++;\n"
+              "         in_pos += step_fp;\n"
+              "         idx = in_pos >> 16;\n"
+              "      }\n"
+              "      if (out_f > 0U) {\n"
+              "         uint64_t t0 = leap_pcsx_us();\n"
+              "         g_leap_orig_aud(g_rs_out, out_f);\n"
+              "         blk_tot += leap_pcsx_us() - t0;\n"
+              "      }\n"
+              "   }\n\n"
+              "   s_rs_prev_l = (int)data[(in_f - 1U) * 2U];\n"
+              "   s_rs_prev_r = (int)data[(in_f - 1U) * 2U + 1U];\n"
+              "   s_rs_pos = in_pos - (in_f << 16);\n\n"
+              "   uint32_t blk_dt = (uint32_t)blk_tot;\n"
+              "   __sync_fetch_and_add(&g_p_blk_u, blk_dt);\n"
+              "   if (g_in_spu) g_p_blk_in_spu_u += blk_dt;\n"
+              "   return frames;\n"
+              "}\n\n"
+              "static void leap_pcsx_pre(void) {\n"
+              "   g_in_retro_run = 1;\n"
+              "   g_p_pre_u = leap_pcsx_us();\n"
+              "   if (!g_p_win_u) {\n"
+              "      leap_pcsx_open_log();\n"
+              "      g_p_win_u = g_p_pre_u;\n"
+              "   }\n"
+              "}\n\n"
+              "static void leap_pcsx_post(int cur_clk) {\n"
+              "   g_in_retro_run = 0;\n"
+              "   uint64_t u = leap_pcsx_us();\n"
+              "   uint32_t run_u = (g_p_pre_u && u > g_p_pre_u) ? (uint32_t)(u - g_p_pre_u) : 0U;\n"
+              "   g_p_emu_u += run_u;\n"
+              "   if (g_frame_polys > g_p_max_polys) g_p_max_polys = g_frame_polys;\n"
+              "   g_p_vbl++;\n\n"
+              "   if (u - g_p_win_u >= 1000000ULL) {\n"
+              "      g_p_sec++;\n"
+              "      uint32_t wm = (uint32_t)((u - g_p_win_u) / 1000ULL);\n"
+              "      uint32_t emu_u = (uint32_t)g_p_emu_u;\n"
+              "      uint32_t gpu_u = __sync_lock_test_and_set(&g_p_gpu_u, 0);\n"
+              "      uint32_t vout_tot = __sync_lock_test_and_set(&g_p_vout_u, 0);\n"
+              "      uint32_t vcb_u = g_p_vcb_u; g_p_vcb_u = 0;\n"
+              "      uint32_t vcb_in = g_p_vcb_in_vout_u; g_p_vcb_in_vout_u = 0;\n"
+              "      uint32_t pure_vout_u = (vout_tot > vcb_in) ? (vout_tot - vcb_in) : 0;\n"
+              "      uint32_t cd_u = __sync_lock_test_and_set(&g_p_cd_u, 0);\n"
+              "      uint32_t cd_cnt = __sync_lock_test_and_set(&g_p_cd_cnt, 0);\n"
+              "      uint32_t cd_main_u = __sync_lock_test_and_set(&g_p_cd_main_u, 0);\n"
+              "      uint32_t spu_tot = __sync_lock_test_and_set(&g_p_spu_u, 0);\n"
+              "      uint32_t blk_u = __sync_lock_test_and_set(&g_p_blk_u, 0);\n"
+              "      uint32_t blk_in = g_p_blk_in_spu_u; g_p_blk_in_spu_u = 0;\n"
+              "      uint32_t pure_spu_u = (spu_tot > blk_in) ? (spu_tot - blk_in) : 0;\n"
+              "      uint32_t in_aud_f = __sync_lock_test_and_set(&g_p_in_aud_f, 0);\n\n"
+              "      uint32_t sub_u = gpu_u + pure_vout_u + vcb_u + cd_main_u + pure_spu_u + blk_u;\n"
+              "      uint32_t cpu_u = (emu_u > sub_u) ? (emu_u - sub_u) : 0;\n\n"
+              "      if (g_ptfp && g_p_sec <= 600) {\n"
+              "         unsigned bpp = (g_p_vw > 0 && g_p_vpitch >= g_p_vw * 4U) ? 32U : 16U;\n"
+              "         char rbuf[20], vrbuf[16], cdbuf[16];\n"
+              '         snprintf(rbuf, sizeof(rbuf), "%ux%ux%u", g_p_vw, g_p_vh, bpp);\n'
+              '         snprintf(vrbuf, sizeof(vrbuf), "%u/%u", g_p_vreal, g_p_vdup);\n'
+              '         snprintf(cdbuf, sizeof(cdbuf), "%u(%u)", cd_u / 1000U, cd_cnt);\n'
+              '         fprintf(g_ptfp, "%3u | %4u | %6u | %3u | %-6s | %-11s | %3d | %5u | %6u | %6u | %7u | %6u | %-9s | %6u | %6u | %5u | %6u | %4d\\n",\n'
+              "                 g_p_sec, wm, emu_u / 1000U, g_p_vbl, vrbuf, rbuf, cur_clk, g_p_max_polys,\n"
+              "                 cpu_u / 1000U, gpu_u / 1000U, pure_vout_u / 1000U, vcb_u / 1000U, cdbuf,\n"
+              "                 pure_spu_u / 1000U, (in_aud_f * 1000U) / 44100U, g_p_max_b, blk_u / 1000U, g_v68_scale320_active);\n"
+              "         fflush(g_ptfp);\n"
+              "      }\n"
+              "      g_p_win_u = u;\n"
+              "      g_p_emu_u = 0;\n"
+              "      g_p_vbl = g_p_vreal = g_p_vdup = g_p_max_polys = g_p_max_b = 0;\n"
+              "   }\n"
+              "}\n"
+          )
 
           pos_first_cb = min(
               re.search(pat, lr).start()
@@ -953,7 +971,7 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 5C: Patched frontend/libretro.c (1:1 320x240 Vout + 320w Direct Blit + 50.00Hz Resampler)!")
+          log_msg("SUCCESS 5C: Patched frontend/libretro.c (1:1 320x240 Vout incl. 24-bit FMV + 8px-aligned 320w Blit + 50.00Hz Resampler)!")
 
           with open("../build_v68_report.txt", "a") as rf:
               rf.write("=== PCSX-ReARMed V68 PATCH SUMMARY ===\n")
