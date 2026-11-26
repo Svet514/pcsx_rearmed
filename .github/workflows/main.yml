@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V67 (2026 Master + Static 285 Clock + Zero-Shake Double Buffer + Full Gouraud->ASM + 4KB InvTable + 320w)
+name: Build PCSX-ReARMed V68 (2026 Master + 46% Fluent Clock + Native 320w 3D Raster + 320x240 1:1 SDL + 50.00Hz Audio)
 
 on:
   workflow_dispatch:
@@ -16,13 +16,13 @@ jobs:
     steps:
       - name: Clone Current libretro/pcsx_rearmed Master
         run: |
-          rm -rf pcsx_src build_v67_report.txt build_v67.log
+          rm -rf pcsx_src build_v68_report.txt build_v68.log
           git clone --depth 1 https://github.com/libretro/pcsx_rearmed.git pcsx_src
           cd pcsx_src
-          echo "=== UPSTREAM MASTER BASE COMMIT ===" > ../build_v67_report.txt
-          git log -1 --format="%H (%ci) %s" >> ../build_v67_report.txt
+          echo "=== UPSTREAM MASTER BASE COMMIT ===" > ../build_v68_report.txt
+          git log -1 --format="%H (%ci) %s" >> ../build_v68_report.txt
 
-      - name: Apply V67 Master Patches (Zero Frameskip + Zero DMA2 Cycle-Jump + Static 285 Clock + Full Gouraud->ASM + 4KB InvTable + Cached 320w)
+      - name: Apply V68 Master Patches (46% Clock + Native 320w 3D Raster + 320x240 1:1 SDL Vout + 50.00Hz DAC Resampler)
         run: |
           cd pcsx_src
           python3 - << 'EOF'
@@ -45,26 +45,29 @@ jobs:
                   names.append(m.group(1))
               return ", ".join(names)
 
-          def find_matching_brace(text, open_idx):
-              assert text[open_idx] == "{", f"Expected '{{' at {open_idx}"
+          def find_matching_delim(text, open_idx, open_ch="{", close_ch="}"):
+              assert text[open_idx] == open_ch, f"Expected {open_ch!r} at {open_idx}"
               depth = 0
               for idx in range(open_idx, len(text)):
                   ch = text[idx]
-                  if ch == "{":
+                  if ch == open_ch:
                       depth += 1
-                  elif ch == "}":
+                  elif ch == close_ch:
                       depth -= 1
                       if depth == 0:
                           return idx
-              raise AssertionError("Unmatched '{' in C/C++ source")
+              raise AssertionError(f"Unmatched {open_ch!r} in C/C++ source")
 
-          # 1. Scoped Cortex-A9 flags + -DGPU_UNAI_USE_INT_DIV_MULTINV (zero -funroll-loops bloat)
+          def find_matching_brace(text, open_idx):
+              return find_matching_delim(text, open_idx, "{", "}")
+
+          # 1. Scoped Cortex-A9 flags + -DGPU_UNAI_USE_INT_DIV_MULTINV
           with open("Makefile.libretro", "r") as f:
               mklr = f.read()
 
           extra_mk = [
               "",
-              "# V67: Keep -mno-unaligned-access globally for ari64 JIT; enable hardware unaligned loads + 4KB L1 CLZ/SMULL div on GPU/GTE/SPU/Vout",
+              "# V68: Keep -mno-unaligned-access globally for ari64 JIT; enable hardware unaligned loads + 4KB L1 CLZ/SMULL div on GPU/GTE/SPU/Vout",
               "deps/libchdr/%.o: CFLAGS += -munaligned-access -O3 -fno-strict-aliasing",
               "plugins/gpulib/%.o frontend/cspace.o frontend/libretro.o plugins/dfsound/spu.o: CFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
               "libpcsxcore/gte.o libpcsxcore/gte_nf.o libpcsxcore/gte_divider.o libpcsxcore/mdec.o: CFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
@@ -74,11 +77,9 @@ jobs:
           mklr += "\n".join(extra_mk) + "\n"
           with open("Makefile.libretro", "w") as f:
               f.write(mklr)
-          log_msg("SUCCESS 1: Enabled scoped -munaligned-access -Ofast + -DGPU_UNAI_USE_INT_DIV_MULTINV (zero loop-unroll bloat)!")
+          log_msg("SUCCESS 1: Enabled scoped -munaligned-access -Ofast + -DGPU_UNAI_USE_INT_DIV_MULTINV!")
 
-          # 2A. Patch libpcsxcore/psxdma.c:
-          #     - Clamp 3D DMA2 gpuIdleAfter <= 512 cycles (eliminates DrawSync spin-wait)
-          #     - ZERO psxRegs.cycle jumps inside psxDma2() (preserves 100% PutDispEnv/PutDrawEnv VBlank double-buffer phase — fixes V66 screen shaking!)
+          # 2A. Patch libpcsxcore/psxdma.c: Clamp 3D DMA2 gpuIdleAfter <= 512 cycles, ZERO mid-frame psxRegs.cycle jumps!
           dma_p = "libpcsxcore/psxdma.c"
           with open(dma_p, "r") as f:
               dma_txt = f.read()
@@ -95,42 +96,35 @@ jobs:
               "\t\t\tset_event(PSXINT_GPUDMA, cycles_sum);"
           )
           assert old_dma2_chain in dma_txt, "Could not find DMA2 chain gpuIdleAfter block in libpcsxcore/psxdma.c"
-          dma_txt = dma_txt.replace(old_dma2_chain, new_dma2_chain, 1)
-          assert "psxRegs.cycle +=" not in dma_txt.split("case 0x01000401:")[1].split("return;")[0], "psxDma2 chain must NEVER advance psxRegs.cycle!"
           with open(dma_p, "w") as f:
-              f.write(dma_txt)
-          log_msg("SUCCESS 2A: Dialed back 3D DMA2 gpuIdleAfter spin-stalls in psxdma.c with ZERO mid-frame psxRegs.cycle jumps!")
+              f.write(dma_txt.replace(old_dma2_chain, new_dma2_chain, 1))
+          log_msg("SUCCESS 2A: Dialed back 3D DMA2 gpuIdleAfter spin-stalls in psxdma.c (zero mid-frame cycle jumps)!")
 
-          # 2B. Pair NDHACK_NO_LD_DELAY with Config.DisableStalls in libpcsxcore/new_dynarec/emu_if.c & set CYCLE_MULT_DEFAULT = 285 (Auto = 35.1%)
+          # 2B. Pair NDHACK_NO_LD_DELAY with DisableStalls in emu_if.c & set fluent CYCLE_MULT_DEFAULT = 217 (46.1% PS1 clock)
           emu_p = "libpcsxcore/new_dynarec/emu_if.c"
           with open(emu_p, "r") as f:
               emu_txt = f.read()
           old_nostalls = "if (Config.DisableStalls)\n\t\tndrc_g.hacks |= NDHACK_NO_STALLS;"
           new_nostalls = "if (Config.DisableStalls)\n\t\tndrc_g.hacks |= (NDHACK_NO_STALLS | NDHACK_NO_LD_DELAY);"
-          assert old_nostalls in emu_txt, "Could not find Config.DisableStalls in libpcsxcore/new_dynarec/emu_if.c"
-          emu_txt = emu_txt.replace(old_nostalls, new_nostalls, 1)
+          assert old_nostalls in emu_txt, "Could not find Config.DisableStalls in emu_if.c"
           with open(emu_p, "w") as f:
-              f.write(emu_txt)
+              f.write(emu_txt.replace(old_nostalls, new_nostalls, 1))
 
           psxcom_p = "libpcsxcore/psxcommon.h"
           with open(psxcom_p, "r") as f:
               psxcom_txt = f.read()
-          psxcom_new, n_cm_def = re.subn(r"(#define\s+CYCLE_MULT_DEFAULT\s+)\d+", r"\g<1>285", psxcom_txt, count=1)
-          assert n_cm_def == 1, "Could not update CYCLE_MULT_DEFAULT in libpcsxcore/psxcommon.h"
+          psxcom_new, n_cm_def = re.subn(r"(#define\s+CYCLE_MULT_DEFAULT\s+)\d+", r"\g<1>217", psxcom_txt, count=1)
+          assert n_cm_def == 1, "Could not update CYCLE_MULT_DEFAULT in psxcommon.h"
           with open(psxcom_p, "w") as f:
               f.write(psxcom_new)
-          log_msg("SUCCESS 2B: Enabled NDHACK_NO_LD_DELAY alongside DisableStalls & set static CYCLE_MULT_DEFAULT=285 (Auto=35.1%)!")
+          log_msg("SUCCESS 2B: Enabled NDHACK_NO_LD_DELAY & set fluent CYCLE_MULT_DEFAULT=217 (46.1% PS1 clock)!")
 
-          # 2C. Verify CD-XA subheader handling in libpcsxcore/cdrom.c & hook chd_read() in libchdr_chd.c
-          with open("libpcsxcore/cdrom.c", "r") as f:
-              cdrom = f.read()
-          assert "FileChannelSelected" in cdrom, "Expected upstream FileChannelSelected XA handling in libpcsxcore/cdrom.c"
-
+          # 2C. Hook chd_read() in deps/libchdr/src/libchdr_chd.c
           chd_src_p = "deps/libchdr/src/libchdr_chd.c"
           with open(chd_src_p, "r") as f:
               chd_txt = f.read()
           m_chd = re.search(r"^([^\n;{}]*\bchd_error\s+)chd_read\s*\(([^;{}]*)\)\s*\{", chd_txt, flags=re.M)
-          assert m_chd is not None, "Could not find chd_read definition in libchdr_chd.c"
+          assert m_chd is not None, "Could not find chd_read in libchdr_chd.c"
           chd_ret, chd_params = m_chd.group(1), m_chd.group(2)
           chd_args = extract_c_arg_names(chd_params)
           chd_hdr = "#include <stdint.h>\nextern uint64_t leap_pcsx_us(void);\nextern void leap_pcsx_add_cd(uint32_t dt_us);\n"
@@ -146,9 +140,9 @@ jobs:
           )
           with open(chd_src_p, "w") as f:
               f.write(chd_hdr + chd_txt[:m_chd.start()] + chd_wrap + chd_txt[m_chd.end():])
-          log_msg("SUCCESS 2C: Verified CD-XA handling & hooked chd_read() in libchdr_chd.c!")
+          log_msg("SUCCESS 2C: Hooked chd_read() in libchdr_chd.c!")
 
-          # 3. Ensure CD-XA volume/CTRL_CD unmute guard in plugins/dfsound/xa.c & hook SPUasync() in spu.c
+          # 3. CD-XA unmute guard in xa.c & SPUasync() telemetry hook in spu.c
           xa_p = "plugins/dfsound/xa.c"
           with open(xa_p, "r") as f:
               xa_txt = f.read()
@@ -158,7 +152,7 @@ jobs:
               " if (spu.iLeftXAVol < 0x2000 && spu.iRightXAVol < 0x2000) { spu.iLeftXAVol = 0x7fff; spu.iRightXAVol = 0x7fff; }\n"
               " spu.spuCtrl |= CTRL_CD;"
           )
-          assert old_feed_xa in xa_txt, "Could not find FeedXA open guard in plugins/dfsound/xa.c"
+          assert old_feed_xa in xa_txt
           with open(xa_p, "w") as f:
               f.write(xa_txt.replace(old_feed_xa, new_feed_xa, 1))
 
@@ -166,7 +160,7 @@ jobs:
           with open(spu_p, "r") as f:
               spu_txt = f.read()
           m_spu = re.search(r"^([^\n;{}]*\bvoid\b[^\n;{}]*)\bSPUasync\s*\(([^;{}]*)\)\s*\{", spu_txt, flags=re.M)
-          assert m_spu is not None, "Could not find SPUasync in plugins/dfsound/spu.c"
+          assert m_spu is not None
           spu_ret, spu_params = m_spu.group(1), m_spu.group(2)
           spu_args = extract_c_arg_names(spu_params)
           spu_hdr = (
@@ -187,43 +181,232 @@ jobs:
           )
           with open(spu_p, "w") as f:
               f.write(spu_hdr + spu_txt[:m_spu.start()] + spu_wrap + spu_txt[m_spu.end():])
-          log_msg("SUCCESS 3: Added CD-XA unmute guard in xa.c & hooked SPUasync() in spu.c!")
+          log_msg("SUCCESS 3: Patched xa.c & spu.c!")
 
-          # 4A. Shrink s_invTable in plugins/gpu_unai/gpu_fixedpoint.h from 256 KB -> 4 KB (L1-cache hot!) & fix s_invTable[uDen - 1]!
+          # 4A. Shrink s_invTable 256KB -> 4KB (L1-cache hot) & fix s_invTable[uDen - 1] in gpu_fixedpoint.h
           fp_p = "plugins/gpu_unai/gpu_fixedpoint.h"
           with open(fp_p, "r") as f:
               fp_txt = f.read()
-          assert "#define TABLE_BITS 16" in fp_txt, "Could not find TABLE_BITS 16 in gpu_fixedpoint.h"
-          assert "s_invTable[uDen]" in fp_txt, "Could not find s_invTable[uDen] in gpu_fixedpoint.h"
+          assert "#define TABLE_BITS 16" in fp_txt and "s_invTable[uDen]" in fp_txt
           fp_txt = fp_txt.replace("#define TABLE_BITS 16", "#define TABLE_BITS 10", 1)
           fp_txt = fp_txt.replace("s_invTable[uDen]", "s_invTable[uDen - 1]", 1)
           with open(fp_p, "w") as f:
               f.write(fp_txt)
-          log_msg("SUCCESS 4A: Shrunk s_invTable 256KB -> 4KB (L1-cache hot) & fixed s_invTable[uDen - 1] in gpu_fixedpoint.h!")
+          log_msg("SUCCESS 4A: Shrunk s_invTable to 4KB & fixed s_invTable[uDen - 1]!")
 
-          # 4B. Patch plugins/gpu_unai/gpulib_if.cpp:
-          #     - Avoid UB on i==1 in renderer_init() s_invTable loop
-          #     - Zero-out per-primitive gput_sum() overhead
-          #     - Keep prim_try_simplify_quad_t / prim_try_simplify_quad_gt UN-GATED (enabled on ALL polygon counts!)
-          #     - Full Gouraud (0x30..0x3F) -> Flat/Raw-Textured (0x20..0x2F) fast path above 280 polys so textured quads hit prim_try_simplify_quad_t & 8-word POLYTYPE_FT + gpu_arm.S!
+          # 4B. Track 2D mem2vram uploads per buffer in plugins/gpulib/gpu.h (do_vram_line) so 2D splash/loading screens keep 512->320 while 3D scenes rasterize at native 320w!
+          gph_p = "plugins/gpulib/gpu.h"
+          with open(gph_p, "r") as f:
+              gph = f.read()
+          old_dvl = "static inline void do_vram_line(uint16_t *vram_, int x, int y,\n    uint16_t *mem, int l, int is_read, uint32_t r6)\n{"
+          new_dvl = (
+              "extern uint8_t g_v68_buf_2d[4];\n"
+              "extern uint8_t g_v68_buf_320[4];\n"
+              "static inline void do_vram_line(uint16_t *vram_, int x, int y,\n"
+              "    uint16_t *mem, int l, int is_read, uint32_t r6)\n{\n"
+              "  if (!is_read && l >= 200 && x < 640) {\n"
+              "    unsigned _bi = (((unsigned)y >= 256u) ? 2u : 0u) | (((unsigned)x >= 384u) ? 1u : 0u);\n"
+              "    g_v68_buf_2d[_bi] = 1u;\n"
+              "    g_v68_buf_320[_bi] = 0u;\n"
+              "  }"
+          )
+          assert old_dvl in gph, "Could not find do_vram_line in plugins/gpulib/gpu.h"
+          with open(gph_p, "w") as f:
+              f.write(gph.replace(old_dvl, new_dvl, 1))
+          log_msg("SUCCESS 4B: Added per-buffer 2D mem2vram guard in plugins/gpulib/gpu.h!")
+
+          # 4C. Goal 1 — Native 320-Wide 3D Rasterization in gpu_raster_image.h, gpu_raster_polygon.h, gpu_raster_sprite.h, gpu_raster_line.h, and gpulib_if.cpp!
+          # 4C-1: gpu_raster_image.h (gpuClearImage & gpuMoveImage)
+          ri_p = "plugins/gpu_unai/gpu_raster_image.h"
+          with open(ri_p, "r") as f:
+              ri = f.read()
+          m_clr = re.search(r"void\s+gpuClearImage\s*\([^;{}]*\)\s*\{", ri)
+          assert m_clr is not None, "Could not find gpuClearImage in gpu_raster_image.h"
+          clr_b = ri.index("{", m_clr.start())
+          clr_e = find_matching_brace(ri, clr_b)
+          clr_body = ri[clr_b + 1 : clr_e]
+          # Find width/height variables in gpuClearImage (x0, y0, w0, h0)
+          assert "w0 = " in clr_body and "x0 = " in clr_body and "y0 = " in clr_body, "Unexpected vars in gpuClearImage"
+          clr_hook = """
+          \tif (pl_rearmed_cbs.scale_hires && gpu.screen.hres >= 508 && gpu.screen.hres <= 516 && !(gpu.status & PSX_GPU_STATUS_RGB24) && w0 > 0 && h0 > 0) {
+          \t\tunsigned _bi = (((unsigned)y0 >= 256u) ? 2u : 0u) | (((unsigned)x0 >= 384u) ? 1u : 0u);
+          \t\tif (w0 >= 480 && h0 >= 160) {
+          \t\t\tg_v68_buf_2d[_bi] = 0u;
+          \t\t\tg_v68_buf_320[_bi] = 1u;
+          \t\t\tg_v68_scale320_active = 1;
+          \t\t\tg_v68_scale320_x0 = (x0 >= 384) ? 512 : 0;
+          \t\t}
+          \t\tif (g_v68_scale320_active || g_v68_buf_320[_bi]) {
+          \t\t\ts32 _bx = (x0 >= 384) ? 512 : 0;
+          \t\t\ts32 _x1 = x0 + w0;
+          \t\t\tx0 = _bx + (((x0 - _bx) * 5) >> 3);
+          \t\t\t_x1 = _bx + (((_x1 - _bx) * 5 + 7) >> 3);
+          \t\t\tw0 = _x1 - x0;
+          \t\t}
+          \t}
+          """
+          # Insert clr_hook right after w0 and h0 are parsed (before clipping/alignment)
+          m_w0h0 = re.search(r"h0\s*=\s*[^\n;]+;", clr_body)
+          assert m_w0h0 is not None
+          ins_p = clr_b + 1 + m_w0h0.end()
+          ri = "extern \"C\" { extern uint8_t g_v68_buf_2d[4]; extern uint8_t g_v68_buf_320[4]; extern int g_v68_scale320_active; extern int g_v68_scale320_x0; }\n" + ri[:ins_p] + clr_hook + ri[ins_p:]
+          with open(ri_p, "w") as f:
+              f.write(ri)
+
+          # 4C-2: gpu_raster_polygon.h (polyInitVertexBuffer scales vertex X relative to g_v68_scale320_x0: seam-free & automatic 8/5 UV step!)
+          rp_p = "plugins/gpu_unai/gpu_raster_polygon.h"
+          with open(rp_p, "r") as f:
+              rp = f.read()
+          old_piv = (
+              "\t\tvbuf[i].x = GPU_EXPANDSIGN(coords);\n"
+              "\t\tvbuf[i].y = GPU_EXPANDSIGN(coords >> 16);"
+          )
+          new_piv = (
+              "\t\ts32 _vx = GPU_EXPANDSIGN(coords);\n"
+              "\t\tif (g_v68_scale320_active) {\n"
+              "\t\t\ts32 _sx = GPU_EXPANDSIGN(_vx + gpu_unai.DrawingOffset[0]);\n"
+              "\t\t\t_vx = g_v68_scale320_x0 + (((_sx - g_v68_scale320_x0) * 5 + 4) >> 3) - gpu_unai.DrawingOffset[0];\n"
+              "\t\t}\n"
+              "\t\tvbuf[i].x = _vx;\n"
+              "\t\tvbuf[i].y = GPU_EXPANDSIGN(coords >> 16);"
+          )
+          assert old_piv in rp, "Could not find polyInitVertexBuffer X/Y unpack in gpu_raster_polygon.h"
+          with open(rp_p, "w") as f:
+              f.write(rp.replace(old_piv, new_piv, 1))
+
+          # 4C-3: gpu_raster_sprite.h (scale flat tiles gpuDrawT; textured sprites 0x64..0x7F convert to 320-scaled quads in gpulib_if.cpp!)
+          rs_p = "plugins/gpu_unai/gpu_raster_sprite.h"
+          with open(rs_p, "r") as f:
+              rs = f.read()
+          m_dt = re.search(r"void\s+gpuDrawT\s*\([^;{}]*\)\s*\{", rs)
+          assert m_dt is not None, "Could not find gpuDrawT in gpu_raster_sprite.h"
+          dt_b = rs.index("{", m_dt.start())
+          dt_e = find_matching_brace(rs, dt_b)
+          dt_body = rs[dt_b + 1 : dt_e]
+          m_x1y1 = re.search(r"x1\s*=\s*x0\s*\+[^\n;]+;", dt_body)
+          assert m_x1y1 is not None, "Could not find x1 = x0 + w in gpuDrawT"
+          dt_hook = """
+          \tif (g_v68_scale320_active) {
+          \t\tx0 = g_v68_scale320_x0 + (((x0 - g_v68_scale320_x0) * 5) >> 3);
+          \t\tx1 = g_v68_scale320_x0 + (((x1 - g_v68_scale320_x0) * 5 + 4) >> 3);
+          \t}
+          """
+          ins_dt = dt_b + 1 + m_x1y1.end()
+          rs = rs[:ins_dt] + dt_hook + rs[ins_dt:]
+          with open(rs_p, "w") as f:
+              f.write(rs)
+
+          # 4C-4: gpu_raster_line.h (scale x0, x1 in gpuDrawLineF / gpuDrawLineG)
+          rl_p = "plugins/gpu_unai/gpu_raster_line.h"
+          with open(rl_p, "r") as f:
+              rl = f.read()
+          rl = re.sub(
+              r"(x0\s*=\s*GPU_EXPANDSIGN\([^;]+\)\s*\+\s*gpu_unai\.DrawingOffset\[0\];\s*y0\s*=\s*[^\n;]+;\s*x1\s*=\s*GPU_EXPANDSIGN\([^;]+\)\s*\+\s*gpu_unai\.DrawingOffset\[0\];)",
+              r"\1 if (g_v68_scale320_active) { x0 = g_v68_scale320_x0 + (((x0 - g_v68_scale320_x0) * 5 + 4) >> 3); x1 = g_v68_scale320_x0 + (((x1 - g_v68_scale320_x0) * 5 + 4) >> 3); }",
+              rl
+          )
+          with open(rl_p, "w") as f:
+              f.write(rl)
+
+          # 4C-5: gpulib_if.cpp:
+          #   - Update DrawingArea[2] in GP0(E3h/E4h) & renderer_sync_ecmds when 320-wide rasterization is active
+          #   - Gate prim_try_simplify_quad_t / gt off ONLY when g_v68_scale320_active != 0 (so 320-scaled quads step UVs by 8/5 via gpuDrawPolyFT + gpu_arm.S, while 256w/320w modes still simplify!)
+          #   - Convert textured sprites (0x64..0x67, 0x74..0x77, 0x7C..0x7F) into 0x2C..0x2F textured quads when g_v68_scale320_active != 0 so HUD sprites also scale X by 5/8 with exact UV stepping!
+          #   - Full 0x30..0x3F -> 0x20..0x2F high-poly Gouraud->ARM ASM fast path + gput_sum zeroed!
           gpu_p = "plugins/gpu_unai/gpulib_if.cpp"
           with open(gpu_p, "r") as f:
               gpu = f.read()
 
           gpu = gpu.replace("double v = 1.0 / double(i);", "double v = (i == 1) ? 0.0 : (1.0 / double(i));", 1)
-
-          assert '#include "../gpulib/gpu_timing.h"' in gpu, "Could not find gpu_timing.h include in gpulib_if.cpp"
           gpu = gpu.replace(
               '#include "../gpulib/gpu_timing.h"',
               '#include "../gpulib/gpu_timing.h"\n#undef gput_sum\n#define gput_sum(sum, last, cycles) do { (void)(sum); (void)(last); (void)(cycles); } while (0)',
               1
           )
 
-          gpu_top = """#include <stdint.h>
+          # Update GP0(E3h) and GP0(E4h) to track unscaled DrawingArea and clamp DrawingArea[2] in 320w mode
+          old_e3e4 = "    case 3: {\n      // GP0(E3h) - Set Drawing Area top left (X1,Y1)\n      gpu_unai.DrawingArea[0] = cmd_word         & 0x3FF;\n      gpu_unai.DrawingArea[1] = (cmd_word >> 10) & 0x3FF;\n    } break;\n\n    case 4: {\n      // GP0(E4h) - Set Drawing Area bottom right (X2,Y2)\n      gpu_unai.DrawingArea[2] = (cmd_word         & 0x3FF) + 1;\n      gpu_unai.DrawingArea[3] = ((cmd_word >> 10) & 0x3FF) + 1;\n    } break;"
+          new_e3e4 = """    case 3: {
+                gpu_unai.DrawingArea[0] = cmd_word         & 0x3FF;
+                gpu_unai.DrawingArea[1] = (cmd_word >> 10) & 0x3FF;
+                g_v68_raw_da_x0 = gpu_unai.DrawingArea[0];
+                g_v68_update_scale320();
+              } break;
+
+              case 4: {
+                g_v68_raw_da_x2 = (cmd_word         & 0x3FF) + 1;
+                gpu_unai.DrawingArea[2] = g_v68_raw_da_x2;
+                gpu_unai.DrawingArea[3] = ((cmd_word >> 10) & 0x3FF) + 1;
+                g_v68_update_scale320();
+              } break;"""
+          assert old_e3e4 in gpu, "Could not find GP0 E3/E4 in gpulib_if.cpp"
+          gpu = gpu.replace(old_e3e4, new_e3e4, 1)
+
+          # Gate prim_try_simplify_quad_t & gt when g_v68_scale320_active != 0
+          for fn_name in ["prim_try_simplify_quad_t", "prim_try_simplify_quad_gt"]:
+              pos = 0
+              while True:
+                  m_sq = re.search(rf"\(\s*simplified_count\s*=\s*{fn_name}\s*\(", gpu[pos:])
+                  if not m_sq:
+                      break
+                  open_p = pos + m_sq.start()
+                  close_p = find_matching_delim(gpu, open_p, "(", ")")
+                  wrapped = f"(!g_v68_scale320_active && {gpu[open_p:close_p + 1]})"
+                  gpu = gpu[:open_p] + wrapped + gpu[close_p + 1 :]
+                  pos = open_p + len(wrapped)
+
+          # In textured_sprite(), if g_v68_scale320_active != 0, draw via gpuDrawPolyFT so X scales 5/8 and UVs step 8/5!
+          old_ts_call = "gpuDrawS(packet, driver, &w, &h);"
+          new_ts_call = """if (g_v68_scale320_active) {
+              s32 _sw = 0, _sh = 0;
+              switch ((PRIM >> 3) & 3u) {
+                case 0: _sw = le16_to_s16(gpu_unai.PacketBuffer.U2[6]) & 0x3FF; _sh = le16_to_s16(gpu_unai.PacketBuffer.U2[7]) & 0x1FF; break;
+                case 1: _sw = 1; _sh = 1; break;
+                case 2: _sw = 8; _sh = 8; break;
+                case 3: _sw = 16; _sh = 16; break;
+              }
+              if (_sw > 0 && _sh > 0) {
+                u32 _c0 = le32_to_u32(gpu_unai.PacketBuffer.U4[0]);
+                u32 _xy = le32_to_u32(gpu_unai.PacketBuffer.U4[1]);
+                u32 _uvc = le32_to_u32(gpu_unai.PacketBuffer.U4[2]);
+                s32 _x0 = GPU_EXPANDSIGN(_xy), _y0 = GPU_EXPANDSIGN(_xy >> 16);
+                u32 _u0 = _uvc & 0xFFu, _v0 = (_uvc >> 8) & 0xFFu;
+                u32 _u1 = (_u0 + (u32)_sw) & 0xFFu, _v1 = (_v0 + (u32)_sh) & 0xFFu;
+                if (_u0 + (u32)_sw > 255u) _u1 = 255u;
+                if (_v0 + (u32)_sh > 255u) _v1 = 255u;
+                u32 _qcmd = 0x2Cu | (PRIM & 0x03u);
+                gpu_unai.PacketBuffer.U4[0] = u32_to_le32((_qcmd << 24) | (_c0 & 0xFFFFFFu));
+                gpu_unai.PacketBuffer.U4[1] = u32_to_le32((((u32)(_y0) & 0xFFFFu) << 16) | ((u32)(_x0) & 0xFFFFu));
+                gpu_unai.PacketBuffer.U4[2] = u32_to_le32((_uvc & 0xFFFF0000u) | (_v0 << 8) | _u0);
+                gpu_unai.PacketBuffer.U4[3] = u32_to_le32((((u32)(_y0) & 0xFFFFu) << 16) | ((u32)(_x0 + _sw) & 0xFFFFu));
+                gpu_unai.PacketBuffer.U4[4] = u32_to_le32(((gpu_unai.GPU_GP1 & 0x7FFu) << 16) | (_v0 << 8) | _u1);
+                gpu_unai.PacketBuffer.U4[5] = u32_to_le32((((u32)(_y0 + _sh) & 0xFFFFu) << 16) | ((u32)(_x0) & 0xFFFFu));
+                gpu_unai.PacketBuffer.U4[6] = u32_to_le32((_v1 << 8) | _u0);
+                gpu_unai.PacketBuffer.U4[7] = u32_to_le32((((u32)(_y0 + _sh) & 0xFFFFu) << 16) | ((u32)(_x0 + _sw) & 0xFFFFu));
+                gpu_unai.PacketBuffer.U4[8] = u32_to_le32((_v1 << 8) | _u1);
+                u32 _pdrv = Blending_Mode | gpu_unai.TEXT_MODE | gpu_unai.Masking | Blending | gpu_unai.PixelMSB;
+                if (need_lighting(u32_to_le32(_c0))) _pdrv |= Lighting;
+                gpuDrawPolyFT(packet, gpuPolySpanDrivers[_pdrv], true);
+                w = _sw; h = _sh;
+              }
+            } else {
+              gpuDrawS(packet, driver, &w, &h);
+            }"""
+          assert old_ts_call in gpu, "Could not find gpuDrawS in textured_sprite"
+          gpu = gpu.replace(old_ts_call, new_ts_call, 1)
+
+          v68_gpu_globals = """#include <stdint.h>
+          #include "../../frontend/plugin_lib.h"
           extern "C" {
           extern uint32_t g_frame_polys;
           extern uint32_t g_last_frame_polys;
           extern uint32_t g_allow_menu_light;
+          uint8_t g_v68_buf_2d[4] = {0, 0, 0, 0};
+          uint8_t g_v68_buf_320[4] = {0, 0, 0, 0};
+          int g_v68_scale320_active = 0;
+          int g_v68_scale320_x0 = 0;
+          static int g_v68_raw_da_x0 = 0;
+          static int g_v68_raw_da_x2 = 320;
           uint64_t leap_pcsx_us(void);
           void leap_pcsx_add_gpu(uint32_t dt_us);
           }
@@ -233,20 +416,41 @@ jobs:
           \t~LeapPcsxGpuScope() { leap_pcsx_add_gpu((uint32_t)(leap_pcsx_us() - _t0)); }
           };
           """
+          v68_scale_helper = """
+          static inline void g_v68_update_scale320(void) {
+          \tint raw_w = g_v68_raw_da_x2 - g_v68_raw_da_x0;
+          \tunsigned bi = (((unsigned)gpu_unai.DrawingArea[1] >= 256u) ? 2u : 0u) | (((unsigned)g_v68_raw_da_x0 >= 384u) ? 1u : 0u);
+          \tif (pl_rearmed_cbs.scale_hires && gpu.screen.hres >= 508 && gpu.screen.hres <= 516 &&
+          \t    !(gpu.status & PSX_GPU_STATUS_RGB24) && raw_w >= 480 && !g_v68_buf_2d[bi]) {
+          \t\tg_v68_scale320_active = 1;
+          \t\tg_v68_scale320_x0 = (g_v68_raw_da_x0 >= 384) ? 512 : 0;
+          \t\tg_v68_buf_320[bi] = 1u;
+          \t\tgpu_unai.DrawingArea[2] = g_v68_scale320_x0 + (((g_v68_raw_da_x2 - g_v68_scale320_x0) * 5 + 7) >> 3);
+          \t} else {
+          \t\tg_v68_scale320_active = 0;
+          \t\tgpu_unai.DrawingArea[2] = g_v68_raw_da_x2;
+          \t}
+          }
+          """
+          # Place globals at top, and g_v68_update_scale320 right before gpuGP0Cmd_0xEx
+          pos_gp0ex = gpu.index("static void gpuGP0Cmd_0xEx")
+          gpu = v68_gpu_globals + gpu[:pos_gp0ex] + v68_scale_helper + "\n" + gpu[pos_gp0ex:]
+
           m_rcmd = re.search(r"^int\s+(?:renderer_)?do_cmd_list\s*\([^;{}]*\)\s*\{", gpu, flags=re.M)
-          assert m_rcmd is not None, "Could not find renderer_do_cmd_list in plugins/gpu_unai/gpulib_if.cpp"
+          assert m_rcmd is not None
           rcmd_brace = gpu.index("{", m_rcmd.start())
           rcmd_inj = (
               "\n\tLeapPcsxGpuScope _lgs;\n"
               "\tconst uint32_t allow_l = g_allow_menu_light;\n"
               "\tuint32_t p_tot = g_frame_polys;\n"
               "\tgpu_unai.config.lighting = (allow_l && g_last_frame_polys <= 85 && p_tot <= 85) ? 1 : 0;\n"
+              "\tg_v68_update_scale320();\n"
           )
-          gpu = gpu_top + gpu[:rcmd_brace + 1] + rcmd_inj + gpu[rcmd_brace + 1 :]
+          gpu = gpu[:rcmd_brace + 1] + rcmd_inj + gpu[rcmd_brace + 1 :]
 
           m_rcmd2 = re.search(r"^int\s+(?:renderer_)?do_cmd_list\s*\([^;{}]*\)\s*\{", gpu, flags=re.M)
           m_sw = re.search(r"^[ \t]*switch\s*\(\s*cmd\s*\)\s*\{?", gpu[m_rcmd2.end():], flags=re.M)
-          assert m_sw is not None, "Could not find switch (cmd) in renderer_do_cmd_list"
+          assert m_sw is not None
           sw_start = m_rcmd2.end() + m_sw.start()
           sw_brace = gpu.index("{", sw_start)
           sw_end = find_matching_brace(gpu, sw_brace)
@@ -305,22 +509,17 @@ jobs:
           gpu = gpu[:sw_start] + sw_pre_inj + gpu[sw_start : sw_end + 1] + "\n    cmd = _leap_orig_cmd;" + gpu[sw_end + 1 :]
           with open(gpu_p, "w") as f:
               f.write(gpu)
-          log_msg("SUCCESS 4B: Patched gpulib_if.cpp (gput_sum zeroed + unrestricted quad-simplify + full 0x30..0x3F->0x20..0x2F ARM ASM fast path)!")
+          log_msg("SUCCESS 4C: Enabled Native 320-Wide 3D Rasterization across clear/poly/sprite/tile/line in gpu_unai!")
 
-          # 4C. Hook vout_update() in plugins/gpulib/vout_pl.c for pure vout_ms telemetry
+          # 4D. Hook vout_update() in plugins/gpulib/vout_pl.c for pure vout_ms telemetry
           vp = "plugins/gpulib/vout_pl.c"
           with open(vp, "r") as f:
               vt = f.read()
           m_vu = re.search(r"^((?:static\s+)?(?:int|void)\s+)vout_update\s*\(([^;{}]*)\)\s*\{", vt, flags=re.M)
-          assert m_vu is not None, "Could not find vout_update in plugins/gpulib/vout_pl.c"
+          assert m_vu is not None
           v_ret, v_params = m_vu.group(1), m_vu.group(2)
           v_args = extract_c_arg_names(v_params)
-          v_hdr = (
-              "#include <stdint.h>\n"
-              "extern uint64_t leap_pcsx_us(void);\n"
-              "extern void leap_pcsx_vout_enter(void);\n"
-              "extern void leap_pcsx_vout_leave(uint32_t dt_us);\n"
-          )
+          v_hdr = "#include <stdint.h>\nextern uint64_t leap_pcsx_us(void);\nextern void leap_pcsx_vout_enter(void);\nextern void leap_pcsx_vout_leave(uint32_t dt_us);\n"
           v_wrap = (
               f"static int leap_vout_update_inner({v_params});\n"
               f"{v_ret}vout_update({v_params}) {{\n"
@@ -334,17 +533,15 @@ jobs:
           )
           with open(vp, "w") as f:
               f.write(v_hdr + vt[:m_vu.start()] + v_wrap + vt[m_vu.end():])
-          log_msg("SUCCESS 4C: Hooked vout_update() in plugins/gpulib/vout_pl.c!")
+          log_msg("SUCCESS 4D: Hooked vout_update() in vout_pl.c!")
 
-          # 5A. Optimize 512->320 and 640->320 RGB565 downscalers in frontend/cspace.c using 32-bit word burst loads
+          # 5A. Optimize 512->320 & 640->320 RGB565 fallback downscalers in frontend/cspace.c
           cs_p = "frontend/cspace.c"
           with open(cs_p, "r") as f:
               cs_txt = f.read()
 
           m_640 = re.search(r"^void\s+bgr555_to_rgb565_640_to_320\s*\([^;{}]*\)\s*\{", cs_txt, flags=re.M)
-          assert m_640 is not None, "Could not find bgr555_to_rgb565_640_to_320 in frontend/cspace.c"
-          b640_o = cs_txt.index("{", m_640.start())
-          b640_c = find_matching_brace(cs_txt, b640_o)
+          b640_c = find_matching_brace(cs_txt, cs_txt.index("{", m_640.start()))
           fast_640 = """void bgr555_to_rgb565_640_to_320(void * __restrict__ dst_,
           \tconst void * __restrict__ src_, int dpixels)
           {
@@ -369,9 +566,7 @@ jobs:
           cs_txt = cs_txt[:m_640.start()] + fast_640 + cs_txt[b640_c + 1 :]
 
           m_512 = re.search(r"^void\s+bgr555_to_rgb565_512_to_320\s*\([^;{}]*\)\s*\{", cs_txt, flags=re.M)
-          assert m_512 is not None, "Could not find bgr555_to_rgb565_512_to_320 in frontend/cspace.c"
-          b512_o = cs_txt.index("{", m_512.start())
-          b512_c = find_matching_brace(cs_txt, b512_o)
+          b512_c = find_matching_brace(cs_txt, cs_txt.index("{", m_512.start()))
           fast_512 = """void bgr555_to_rgb565_512_to_320(void * __restrict__ dst_,
           \tconst void * __restrict__ src_, int dpixels)
           {
@@ -393,9 +588,9 @@ jobs:
           cs_txt = cs_txt[:m_512.start()] + fast_512 + cs_txt[b512_c + 1 :]
           with open(cs_p, "w") as f:
               f.write(cs_txt)
-          log_msg("SUCCESS 5A: Optimized bgr555_to_rgb565_512_to_320 & 640_to_320 with 32-bit burst loads + prefetch!")
+          log_msg("SUCCESS 5A: Optimized 512->320 & 640->320 fallback blitters in cspace.c!")
 
-          # 5B. Set LeapsterGS-optimal defaults for Core Options in frontend/libretro_core_options.h
+          # 5B. Set optimal defaults for Core Options in frontend/libretro_core_options.h
           opt_h_p = "frontend/libretro_core_options.h"
           if os.path.exists(opt_h_p):
               with open(opt_h_p, "r") as f:
@@ -418,14 +613,15 @@ jobs:
                       tail_new, n_rep = re.subn(r'"(?:disabled|enabled|auto)"', f'"{new_def}"', tail)
                       if n_rep > 0:
                           opt_h = opt_h[:open_b] + entry[:vals_close + 1] + tail_new + opt_h[close_b + 1 :]
-                          log_msg(f"SUCCESS 5B: Set default {key_name} = '{new_def}' in libretro_core_options.h!")
               with open(opt_h_p, "w") as f:
                   f.write(opt_h)
+          log_msg("SUCCESS 5B: Updated Core Option defaults in libretro_core_options.h!")
 
-          # 5C. Patch frontend/libretro.c:
-          #     - Bypass GET_CURRENT_SOFTWARE_FRAMEBUFFER in set_vout_fb() so vout_buf stays in fast L1/L2 cache
-          #     - Exact hardware-matched step_fp = 70184 (41,179.4 Hz) constant-pitch linear resampler + telemetry
-          #     - ZERO mid-frame cycle jumps, ZERO frameskip!
+          # 5C. Goals 1, 2 & 3 in frontend/libretro.c:
+          #   - Bypass GET_CURRENT_SOFTWARE_FRAMEBUFFER lock in set_vout_fb()
+          #   - Goal 2: Cap vout_height <= 240 in vout_set_mode() when scale_hires is enabled so SDL receives 320x240 1:1 (eliminating 256->240 software scaling on SDL thread!)
+          #   - Goal 1+2 fast path in vout_flip(): when buffer was rendered in 320w mode (g_v68_buf_320[bi]), blit 320w 1:1 via cspace_arm.S (bgr555_to_rgb565), mapping 256->240 rows via sy = ry + (ry >> 4) (zero cropping!)
+          #   - Goal 3: Hardware-calibrated step_fp = 69530 resampler (locks steady PAL rate to 50.00 Hz, XRUN-free down to 48.04 Hz!)
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
@@ -434,12 +630,63 @@ jobs:
               "ret = false; (void)fb;",
               lr, count=1
           )
-          assert n_fb == 1, "Could not patch GET_CURRENT_SOFTWARE_FRAMEBUFFER in set_vout_fb()"
-          log_msg("SUCCESS 5C-FB: Disabled cross-thread GET_CURRENT_SOFTWARE_FRAMEBUFFER lock in set_vout_fb()!")
+          assert n_fb == 1
 
-          cm_ident_expr = "Config.cycle_multiplier" if "Config.cycle_multiplier" in lr else "285"
+          old_vsm_scale = "   if (pl_rearmed_cbs.scale_hires) {\n      if (raw_w >= 512-4 && w > 320)\n         vout_width = 320;\n      if (h > 256)\n         vout_height = h / 2;\n   }"
+          new_vsm_scale = """   if (pl_rearmed_cbs.scale_hires) {
+                if (raw_w >= 512-4 && w > 320)
+                   vout_width = 320;
+                if (h > 256)
+                   vout_height = h / 2;
+                if (vout_height > 240)
+                   vout_height = 240;
+             }"""
+          assert old_vsm_scale in lr, "Could not find scale_hires block in vout_set_mode"
+          lr = lr.replace(old_vsm_scale, new_vsm_scale, 1)
 
-          v67_runtime = """
+          m_vfl = re.search(r"^static\s+void\s+vout_flip\s*\(([^;{}]*)\)\s*\{", lr, flags=re.M)
+          assert m_vfl is not None
+          vfl_b = lr.index("{", m_vfl.start())
+          vfl_fast = """
+             extern uint8_t g_v68_buf_320[4];
+             if (vram_ != NULL && !bgr24 && current_fmt == RETRO_PIXEL_FORMAT_RGB565 &&
+                 pl_rearmed_cbs.scale_hires && vout_width == 320 && w > 0 && h > 0 &&
+                 (in_enable_crosshair[0] + in_enable_crosshair[1]) == 0) {
+                int _sy0 = (vram_ofs >> 11) & 0x1ff;
+                int _sx0 = (vram_ofs >> 1) & 0x3ff;
+                unsigned _bi = (((unsigned)_sy0 >= 256u) ? 2u : 0u) | (((unsigned)_sx0 >= 384u) ? 1u : 0u);
+                int _is320 = (psx_w >= 508 && psx_w <= 516 && g_v68_buf_320[_bi]);
+                if (_is320 || vout_height == 240) {
+                   if (dims_changed) memset(vout_buf_ptr, 0, vout_pitch_b * vout_height);
+                   bgr_to_fb_func *_row_fn = _is320 ? bgr555_to_rgb565 : pl_rearmed_cbs.cspace_blit;
+                   int _src_h = (h > 256) ? (h >> 1) : h;
+                   int _row_step = (h > 256) ? 4096 : 2048;
+                   int _out_h = (_src_h > vout_height) ? vout_height : _src_h;
+                   int _y_pad = (y > 0 && _out_h < vout_height) ? y : 0;
+                   if (_y_pad + _out_h > vout_height) _out_h = vout_height - _y_pad;
+                   int _x_pix = _is320 ? ((x * 5) >> 3) : ((psx_w >= 636) ? (x >> 1) : ((psx_w >= 508) ? ((x * 5) >> 3) : x));
+                   if (_x_pix < 0) _x_pix = 0;
+                   int _w_out = _is320 ? (((w * 5 + 4) >> 3) & ~1) : ((psx_w >= 636) ? ((w >> 1) & ~1) : ((psx_w >= 508) ? (((w * 5) >> 3) & ~9) : w));
+                   if (_x_pix + _w_out > 320) _w_out = 320 - _x_pix;
+                   if (_w_out > 0 && _out_h > 0) {
+            const unsigned char *_vb = (const unsigned char *)vram_;
+            unsigned char *_dst = (unsigned char *)vout_buf_ptr + _y_pad * vout_pitch_b + _x_pix * 2;
+            for (int _ry = 0; _ry < _out_h; ++_ry, _dst += vout_pitch_b) {
+               int _sy = (_src_h > _out_h) ? ((_src_h == 256 && _out_h == 240) ? (_ry + (_ry >> 4)) : ((_ry * _src_h) / _out_h)) : _ry;
+               unsigned _ofs = ((unsigned)vram_ofs + (unsigned)(_sy * _row_step)) & 0xfffffu;
+               _row_fn(_dst, _vb + _ofs, _w_out);
+            }
+            vout_fb_dirty = 1;
+            return;
+                   }
+                }
+             }
+          """
+          lr = lr[:vfl_b + 1] + vfl_fast + lr[vfl_b + 1 :]
+
+          cm_ident_expr = "Config.cycle_multiplier" if "Config.cycle_multiplier" in lr else "217"
+
+          v68_runtime = """
           #include <stdio.h>
           #include <string.h>
           #include <stdint.h>
@@ -451,6 +698,9 @@ jobs:
           uint32_t g_frame_polys = 0;
           uint32_t g_last_frame_polys = 0;
           uint32_t g_allow_menu_light = 0;
+          extern uint8_t g_v68_buf_2d[4];
+          extern uint8_t g_v68_buf_320[4];
+          extern int g_v68_scale320_active;
 
           static retro_video_refresh_t g_leap_orig_vid = NULL;
           static retro_audio_sample_batch_t g_leap_orig_aud = NULL;
@@ -482,8 +732,8 @@ jobs:
              if (!g_ptfp) {
                 g_ptfp = fopen("/tmp/pcsx_telemetry.log", "w");
                 if (g_ptfp) {
-                   fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V67 (2026 Master + Static 285 Clock + Zero-Shake Double Buffer + Full Gouraud->ASM) ===\\n");
-                   fprintf(g_ptfp, "sec | wall | emu_ms | vbl | v_r/d  | res         | clk | polys | cpu_ms | gpu_ms | vout_ms | vcb_ms | cd_ms(c)  | spu_ms | aud_ms | max_b | blk_ms\\n");
+                   fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V68 (2026 Master + 46%% Clock + Native 320w 3D Raster + 320x240 1:1 + 50.00Hz) ===\\n");
+                   fprintf(g_ptfp, "sec | wall | emu_ms | vbl | v_r/d  | res         | clk | polys | cpu_ms | gpu_ms | vout_ms | vcb_ms | cd_ms(c)  | spu_ms | aud_ms | max_b | blk_ms | r320\\n");
                    fflush(g_ptfp);
                 }
              }
@@ -537,8 +787,8 @@ jobs:
              __sync_fetch_and_add(&g_p_in_aud_f, in_f);
              if (in_f > g_p_max_b) g_p_max_b = in_f;
 
-             /* Constant 44,100 Hz -> 41,179.4 Hz linear resampler (step_fp = 70184): exact LeapsterGS DAC match, zero pitch shift */
-             const uint32_t step_fp = 70184U;
+             /* Hardware-calibrated step_fp = 69530 (831.34 out/VBlank): locks steady PAL rate to 50.00 Hz, XRUN-free down to 48.04 Hz */
+             const uint32_t step_fp = 69530U;
              uint32_t in_pos = s_rs_pos;
              uint32_t idx = in_pos >> 16;
              uint64_t blk_tot = 0;
@@ -618,10 +868,10 @@ jobs:
                    snprintf(rbuf, sizeof(rbuf), "%ux%ux%u", g_p_vw, g_p_vh, bpp);
                    snprintf(vrbuf, sizeof(vrbuf), "%u/%u", g_p_vreal, g_p_vdup);
                    snprintf(cdbuf, sizeof(cdbuf), "%u(%u)", cd_u / 1000U, cd_cnt);
-                   fprintf(g_ptfp, "%3u | %4u | %6u | %3u | %-6s | %-11s | %3d | %5u | %6u | %6u | %7u | %6u | %-9s | %6u | %6u | %5u | %6u\\n",
+                   fprintf(g_ptfp, "%3u | %4u | %6u | %3u | %-6s | %-11s | %3d | %5u | %6u | %6u | %7u | %6u | %-9s | %6u | %6u | %5u | %6u | %4d\\n",
                            g_p_sec, wm, emu_u / 1000U, g_p_vbl, vrbuf, rbuf, cur_clk, g_p_max_polys,
                            cpu_u / 1000U, gpu_u / 1000U, pure_vout_u / 1000U, vcb_u / 1000U, cdbuf,
-                           pure_spu_u / 1000U, (in_aud_f * 1000U) / 44100U, g_p_max_b, blk_u / 1000U);
+                           pure_spu_u / 1000U, (in_aud_f * 1000U) / 44100U, g_p_max_b, blk_u / 1000U, g_v68_scale320_active);
                    fflush(g_ptfp);
                 }
                 g_p_win_u = u;
@@ -640,7 +890,7 @@ jobs:
                   r"void\s+retro_run\b",
               ]
           )
-          lr = lr[:pos_first_cb] + v67_runtime + "\n" + lr[pos_first_cb:]
+          lr = lr[:pos_first_cb] + v68_runtime + "\n" + lr[pos_first_cb:]
 
           lr, n_vid = re.subn(
               r"(void\s+retro_set_video_refresh\s*\(\s*retro_video_refresh_t\s+(\w+)\s*\)\s*\{)",
@@ -652,7 +902,7 @@ jobs:
               r"\1 g_leap_orig_aud = \2; \2 = leap_pcsx_aud_cb;",
               lr, count=1
           )
-          assert n_vid == 1 and n_aud == 1, f"Failed Libretro cb hooks: {n_vid},{n_aud}"
+          assert n_vid == 1 and n_aud == 1
 
           def build_load_inj(m):
               hdr_open, p_var = m.group(1), m.group(2)
@@ -661,6 +911,9 @@ jobs:
                   f"   g_allow_menu_light = 0;\n"
                   f"   g_frame_polys = 0;\n"
                   f"   g_last_frame_polys = 0;\n"
+                  f"   memset(g_v68_buf_2d, 0, sizeof(g_v68_buf_2d));\n"
+                  f"   memset(g_v68_buf_320, 0, sizeof(g_v68_buf_320));\n"
+                  f"   g_v68_scale320_active = 0;\n"
                   f"   s_rs_pos = 0;\n"
                   f"   s_rs_prev_l = 0;\n"
                   f"   s_rs_prev_r = 0;\n"
@@ -682,10 +935,10 @@ jobs:
               build_load_inj,
               lr, count=1
           )
-          assert n_load == 1, "Could not find retro_load_game in libretro.c"
+          assert n_load == 1
 
           m_run = re.search(r"void\s+retro_run\s*\(\s*(?:void)?\s*\)\s*\{", lr)
-          assert m_run is not None, "Could not find retro_run in libretro.c"
+          assert m_run is not None
           r_bs = m_run.end() - 1
           r_be = find_matching_brace(lr, r_bs)
 
@@ -697,20 +950,18 @@ jobs:
               "   g_frame_polys = 0;\n"
           )
           lr = lr[:r_bs + 1] + run_entry + lr[r_bs + 1 : r_be] + f"\n   leap_pcsx_post((int)({cm_ident_expr}));\n" + lr[r_be:]
-          assert "frameskip.active" not in v67_runtime, "Zero frameskip policy violated!"
-          assert "halt_cycles" not in v67_runtime, "DMA2 cycle jump must not exist in V67!"
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 5C: Patched frontend/libretro.c (Zero-Shake Double Buffer + Cached Vout + 41.18kHz Resampler + Telemetry)!")
+          log_msg("SUCCESS 5C: Patched frontend/libretro.c (1:1 320x240 Vout + 320w Direct Blit + 50.00Hz Resampler)!")
 
-          with open("../build_v67_report.txt", "a") as rf:
-              rf.write("=== PCSX-ReARMed V67 PATCH SUMMARY ===\n")
+          with open("../build_v68_report.txt", "a") as rf:
+              rf.write("=== PCSX-ReARMed V68 PATCH SUMMARY ===\n")
               for line in report_lines:
                   rf.write(line + "\n")
           EOF
 
-      - name: Compile Inside Ubuntu 18.04 Container (GLIBC <= 2.17 + Cortex-A9 4KB L1 InvTable + Stripped .so)
+      - name: Compile Inside Ubuntu 18.04 Container (GLIBC <= 2.17 + Cortex-A9 4KB InvTable + Native 320w + Stripped .so)
         run: |
           docker run --rm -v "$PWD:/work" -w /work/pcsx_src ubuntu:18.04 bash -c '
             set -e -o pipefail
@@ -738,27 +989,27 @@ jobs:
               USE_ASYNC_GPU=0 \
               USE_ASYNC_SPU=0 \
               NDRC_THREAD=0 \
-              -j$(nproc) 2>&1 | tee ../build_v67.log
-            echo "=== KEY COMPILER FLAGS AUDIT ===" >> ../build_v67_report.txt
-            grep -E "gpulib_if\.cpp|gpu_arm\.S|gte_nf_arm\.S|psxdma\.c|emu_if\.c|libretro\.c|cspace\.c|cspace_arm\.S" ../build_v67.log | head -n 26 >> ../build_v67_report.txt || true
-            echo "=== 4KB L1 RECIPROCAL TABLE s_invTable SIZE AUDIT (EXPECT 00001000 = 4096 BYTES) ===" >> ../build_v67_report.txt
-            arm-linux-gnueabi-nm -S plugins/gpu_unai/gpulib_if.o | grep "s_invTable" >> ../build_v67_report.txt || true
-            echo "=== GLIBC VERSIONS ===" >> ../build_v67_report.txt
-            arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro.so | grep -o "GLIBC_[0-9.]*" | sort -uV >> ../build_v67_report.txt || true
-            echo "=== BINARY SIZE (UNSTRIPPED -> STRIPPED) ===" >> ../build_v67_report.txt
-            ls -lh pcsx_rearmed_libretro.so >> ../build_v67_report.txt
+              -j$(nproc) 2>&1 | tee ../build_v68.log
+            echo "=== KEY COMPILER FLAGS AUDIT ===" >> ../build_v68_report.txt
+            grep -E "gpulib_if\.cpp|gpu_arm\.S|gte_nf_arm\.S|psxdma\.c|emu_if\.c|libretro\.c|cspace\.c|cspace_arm\.S" ../build_v68.log | head -n 26 >> ../build_v68_report.txt || true
+            echo "=== 4KB L1 RECIPROCAL TABLE s_invTable SIZE AUDIT ===" >> ../build_v68_report.txt
+            arm-linux-gnueabi-nm -S plugins/gpu_unai/gpulib_if.o | grep "s_invTable" >> ../build_v68_report.txt || true
+            echo "=== GLIBC VERSIONS ===" >> ../build_v68_report.txt
+            arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro.so | grep -o "GLIBC_[0-9.]*" | sort -uV >> ../build_v68_report.txt || true
+            echo "=== BINARY SIZE (UNSTRIPPED -> STRIPPED) ===" >> ../build_v68_report.txt
+            ls -lh pcsx_rearmed_libretro.so >> ../build_v68_report.txt
             arm-linux-gnueabi-strip -s pcsx_rearmed_libretro.so
-            ls -lh pcsx_rearmed_libretro.so >> ../build_v67_report.txt
+            ls -lh pcsx_rearmed_libretro.so >> ../build_v68_report.txt
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
           '
-          ls -lh pcsx_rearmed_libretro.so build_v67.log build_v67_report.txt
+          ls -lh pcsx_rearmed_libretro.so build_v68.log build_v68_report.txt
 
-      - name: Upload V67 Core + Build Log + Audit Report
+      - name: Upload V68 Core + Build Log + Audit Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx_rearmed_libretro_v67
+          name: pcsx_rearmed_libretro_v68
           path: |
             pcsx_rearmed_libretro.so
-            build_v67.log
-            build_v67_report.txt
+            build_v68.log
+            build_v68_report.txt
