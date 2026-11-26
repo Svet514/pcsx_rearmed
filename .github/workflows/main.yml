@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V68 (2026 Master + 46% Fluent Clock + Native 320w 3D Raster + 320x240 1:1 SDL + 50.00Hz Audio)
+name: Build PCSX-ReARMed V69 (2026 Master + 46% Fluent Clock + Clean 320w Cull/Sky/Menu Fixes + 320x240 1:1 + 50.00Hz)
 
 on:
   workflow_dispatch:
@@ -16,13 +16,13 @@ jobs:
     steps:
       - name: Clone Current libretro/pcsx_rearmed Master
         run: |
-          rm -rf pcsx_src build_v68_report.txt build_v68.log
+          rm -rf pcsx_src build_v69_report.txt build_v69.log
           git clone --depth 1 https://github.com/libretro/pcsx_rearmed.git pcsx_src
           cd pcsx_src
-          echo "=== UPSTREAM MASTER BASE COMMIT ===" > ../build_v68_report.txt
-          git log -1 --format="%H (%ci) %s" >> ../build_v68_report.txt
+          echo "=== UPSTREAM MASTER BASE COMMIT ===" > ../build_v69_report.txt
+          git log -1 --format="%H (%ci) %s" >> ../build_v69_report.txt
 
-      - name: Apply V68 Master Patches (46% Clock + Native 320w 3D Raster + 320x240 1:1 SDL Vout + 50.00Hz DAC Resampler)
+      - name: Apply V69 Master Patches (46% Clock + Elmo 1024px Cull Fix + Smooth Gouraud Sky + Zero-Toggle 320w Menu + 50.00Hz Audio)
         run: |
           cd pcsx_src
           python3 - << 'EOF'
@@ -67,7 +67,7 @@ jobs:
 
           extra_mk = [
               "",
-              "# V68: Keep -mno-unaligned-access globally for ari64 JIT; enable hardware unaligned loads + 4KB L1 CLZ/SMULL div on GPU/GTE/SPU/Vout",
+              "# V69: Keep -mno-unaligned-access globally for ari64 JIT; enable hardware unaligned loads + 4KB L1 CLZ/SMULL div on GPU/GTE/SPU/Vout",
               "deps/libchdr/%.o: CFLAGS += -munaligned-access -O3 -fno-strict-aliasing",
               "plugins/gpulib/%.o frontend/cspace.o frontend/libretro.o plugins/dfsound/spu.o: CFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
               "libpcsxcore/gte.o libpcsxcore/gte_nf.o libpcsxcore/gte_divider.o libpcsxcore/mdec.o: CFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
@@ -194,7 +194,8 @@ jobs:
               f.write(fp_txt)
           log_msg("SUCCESS 4A: Shrunk s_invTable to 4KB & fixed s_invTable[uDen - 1]!")
 
-          # 4B. Track 2D mem2vram uploads per buffer in plugins/gpulib/gpu.h (do_vram_line) using x >= 512 quadrant split
+          # 4B. Fix 3 (Zero Polygon Gate!) — Only flag buffer as 2D bitmap in do_vram_line on true full-width 512px frame uploads (l >= 480 at x == 0 or x == 512)
+          #     so 256-wide texture/CLUT uploads NEVER toggle r320 off on low-poly 3D menus or low-poly 3D games!
           gph_p = "plugins/gpulib/gpu.h"
           with open(gph_p, "r") as f:
               gph = f.read()
@@ -204,7 +205,7 @@ jobs:
               "extern uint8_t g_v68_buf_320[4];\n"
               "static inline void do_vram_line(uint16_t *vram_, int x, int y,\n"
               "    uint16_t *mem, int l, int is_read, uint32_t r6)\n{\n"
-              "  if (!is_read && l >= 200 && x < 640) {\n"
+              "  if (!is_read && l >= 480 && (x == 0 || x == 512)) {\n"
               "    unsigned _bi = (((unsigned)y >= 256u) ? 2u : 0u) | (((unsigned)x >= 512u) ? 1u : 0u);\n"
               "    g_v68_buf_2d[_bi] = 1u;\n"
               "    g_v68_buf_320[_bi] = 0u;\n"
@@ -213,9 +214,9 @@ jobs:
           assert old_dvl in gph, "Could not find do_vram_line in plugins/gpulib/gpu.h"
           with open(gph_p, "w") as f:
               f.write(gph.replace(old_dvl, new_dvl, 1))
-          log_msg("SUCCESS 4B: Added per-buffer 2D mem2vram guard in plugins/gpulib/gpu.h!")
+          log_msg("SUCCESS 4B: Restricted 2D mem2vram detection in gpu.h to full-width (l>=480, x==0|512) frame uploads (zero texture-upload toggling)!")
 
-          # 4C. Goal 1 — Native 320-Wide 3D Rasterization in gpu_unai (with all 4 audit fixes!)
+          # 4C. Native 320-Wide 3D Rasterization + All 3 V69 Visual Fixes in gpu_unai!
           # 4C-1: gpu_raster_image.h (8-pixel aligned gpuClearImage for gpu_fill_asm + x >= 512 buffer origin)
           ri_p = "plugins/gpu_unai/gpu_raster_image.h"
           with open(ri_p, "r") as f:
@@ -251,10 +252,49 @@ jobs:
           with open(ri_p, "w") as f:
               f.write(ri)
 
-          # 4C-2: gpu_raster_polygon.h (seam-free vertex X scaling relative to g_v68_scale320_x0)
+          # 4C-2: Fix 1 (Elmo Green Hedge Glitch) across gpu_unai.h AND gpu_raster_polygon.h:
+          #   (a) Patch #define CHKMAX_X 1024 in gpu_unai.h (and/or gpu_raster_polygon.h) to (g_v68_scale320_active ? 640 : 1024)
+          #       so GTE-saturated behind-camera spans (>=1024 unscaled => >=640 scaled) cull identically to real PS1 hardware!
+          #   (b) Plain 32-bit signed _vx + DrawingOffset[0] (NO second 11-bit GPU_EXPANDSIGN overflow wrapping X>=1024 to -1024!)
+          cull_patched = 0
+          ext_decl = (
+              "#ifdef __cplusplus\n"
+              'extern "C" { extern int g_v68_scale320_active; }\n'
+              "#else\n"
+              "extern int g_v68_scale320_active;\n"
+              "#endif\n"
+          )
+          for hdr_p in ["plugins/gpu_unai/gpu_unai.h", "plugins/gpu_unai/gpu_raster_polygon.h"]:
+              with open(hdr_p, "r") as f:
+                  htxt = f.read()
+              htxt_new, n_chk = re.subn(
+                  r"(#define\s+CHKMAX_X\s+)\(?1024\)?",
+                  r"\g<1>(g_v68_scale320_active ? 640 : 1024)",
+                  htxt
+              )
+              if n_chk > 0:
+                  cull_patched += n_chk
+                  with open(hdr_p, "w") as f:
+                      f.write(ext_decl + htxt_new)
+
           rp_p = "plugins/gpu_unai/gpu_raster_polygon.h"
           with open(rp_p, "r") as f:
               rp = f.read()
+
+          if cull_patched == 0:
+              m_put = re.search(r"bool\s+polyUseTriangle\s*\([^;{}]*\)\s*\{", rp)
+              assert m_put is not None, "Could not find CHKMAX_X or polyUseTriangle"
+              put_b = rp.index("{", m_put.start())
+              put_e = find_matching_brace(rp, put_b)
+              put_seg = rp[put_b:put_e + 1]
+              if "CHKMAX_X" in put_seg:
+                  put_seg, n_1024 = put_seg.replace("CHKMAX_X", "(g_v68_scale320_active ? 640 : CHKMAX_X)"), 1
+              else:
+                  put_seg, n_1024 = re.subn(r"\b1024\b", "(g_v68_scale320_active ? 640 : 1024)", put_seg)
+              assert n_1024 > 0, "Could not patch X-span cull check in polyUseTriangle"
+              rp = rp[:put_b] + put_seg + rp[put_e + 1 :]
+              cull_patched += n_1024
+
           old_piv = (
               "\t\tvbuf[i].x = GPU_EXPANDSIGN(coords);\n"
               "\t\tvbuf[i].y = GPU_EXPANDSIGN(coords >> 16);"
@@ -262,7 +302,7 @@ jobs:
           new_piv = (
               "\t\ts32 _vx = GPU_EXPANDSIGN(coords);\n"
               "\t\tif (g_v68_scale320_active) {\n"
-              "\t\t\ts32 _sx = GPU_EXPANDSIGN(_vx + gpu_unai.DrawingOffset[0]);\n"
+              "\t\t\ts32 _sx = _vx + gpu_unai.DrawingOffset[0];\n"
               "\t\t\t_vx = g_v68_scale320_x0 + (((_sx - g_v68_scale320_x0) * 5 + 4) >> 3) - gpu_unai.DrawingOffset[0];\n"
               "\t\t}\n"
               "\t\tvbuf[i].x = _vx;\n"
@@ -271,6 +311,7 @@ jobs:
           assert old_piv in rp, "Could not find polyInitVertexBuffer X/Y unpack in gpu_raster_polygon.h"
           with open(rp_p, "w") as f:
               f.write(rp.replace(old_piv, new_piv, 1))
+          log_msg(f"SUCCESS 4C-POLY: Fixed 32-bit DrawingOffset math & CHKMAX_X 1024->640 cull ({cull_patched} site) in gpu_unai!")
 
           # 4C-3: gpu_raster_sprite.h (scale flat tiles gpuDrawT)
           rs_p = "plugins/gpu_unai/gpu_raster_sprite.h"
@@ -307,8 +348,8 @@ jobs:
               f.write(rl)
 
           # 4C-5: gpulib_if.cpp:
-          #   - Fix 1: Type-safe ((_c0 & 0xF8F8F8u) != 0x808080u) lighting check (no le32_t -> u32 type error!)
-          #   - Fix 2: Scale BOTH DrawingArea[0] and DrawingArea[2] & keep g_v68_scale320_active sticky on mid-frame HUD/dialogue sub-window clip boxes!
+          #   - Fix 2 (Smooth Skybox): Keep untextured Gouraud (0x30..0x33, 0x38..0x3B) on native ARMv6 Gouraud ASM (poly_utx_g1d0m0std_asm); ONLY flatten textured Gouraud (0x34..0x37, 0x3C..0x3F) >280 polys!
+          #   - Fix 3 (Menu & Hybrid 2D/3D Safety): Refresh g_v68_update_scale320() in renderer_notify_screen_change(); never clear g_v68_buf_2d on overlay polygons so hybrid 2D-wallpaper + 3D-overlay screens never crop!
           gpu_p = "plugins/gpu_unai/gpulib_if.cpp"
           with open(gpu_p, "r") as f:
               gpu = f.read()
@@ -401,7 +442,7 @@ jobs:
           assert old_ts_call in gpu, "Could not find gpuDrawS in textured_sprite"
           gpu = gpu.replace(old_ts_call, new_ts_call, 1)
 
-          v68_gpu_globals = (
+          v69_gpu_globals = (
               "#include <stdint.h>\n"
               '#include "../../frontend/plugin_lib.h"\n'
               'extern "C" {\n'
@@ -423,7 +464,7 @@ jobs:
               "\t~LeapPcsxGpuScope() { leap_pcsx_add_gpu((uint32_t)(leap_pcsx_us() - _t0)); }\n"
               "};\n"
           )
-          v68_scale_helper = (
+          v69_scale_helper = (
               "static inline void g_v68_update_scale320(void) {\n"
               "\tint raw_w = g_v68_raw_da_x2 - g_v68_raw_da_x0;\n"
               "\tint bx = (g_v68_raw_da_x0 >= 512) ? 512 : 0;\n"
@@ -442,8 +483,13 @@ jobs:
               "\t}\n"
               "}\n"
           )
-          pos_gp0ex = gpu.index("static void gpuGP0Cmd_0xEx")
-          gpu = v68_gpu_globals + gpu[:pos_gp0ex] + v68_scale_helper + "\n" + gpu[pos_gp0ex:]
+          m_rnsc = re.search(r"void\s+renderer_notify_screen_change\s*\([^;{}]*\)\s*\{", gpu)
+          assert m_rnsc is not None, "Could not find renderer_notify_screen_change in gpulib_if.cpp"
+          gpu = v69_gpu_globals + gpu[:m_rnsc.start()] + v69_scale_helper + "\n" + gpu[m_rnsc.start():]
+
+          m_rnsc2 = re.search(r"void\s+renderer_notify_screen_change\s*\([^;{}]*\)\s*\{", gpu)
+          rnsc_e = find_matching_brace(gpu, gpu.index("{", m_rnsc2.start()))
+          gpu = gpu[:rnsc_e] + "\n  g_v68_update_scale320();\n" + gpu[rnsc_e:]
 
           m_rcmd = re.search(r"^int\s+(?:renderer_)?do_cmd_list\s*\([^;{}]*\)\s*\{", gpu, flags=re.M)
           assert m_rcmd is not None
@@ -470,48 +516,23 @@ jobs:
               "      p_tot++;\n"
               "      g_frame_polys = p_tot;\n"
               "      if (allow_l && p_tot > 85u) gpu_unai.config.lighting = 0;\n"
-              "      if ((p_tot > 280u || g_last_frame_polys > 280u) && (cmd >= 0x30u)) {\n"
-              "        if ((cmd & 0x04u) == 0u) {\n"
-              "          const u32 c0 = le32_to_u32(gpu_unai.PacketBuffer.U4[0]);\n"
-              "          const u32 c1 = le32_to_u32(gpu_unai.PacketBuffer.U4[2]);\n"
-              "          const u32 c2 = le32_to_u32(gpu_unai.PacketBuffer.U4[4]);\n"
-              "          if ((cmd & 0x08u) == 0u) {\n"
-              "            const u32 r = (((c0 & 0xFFu) + (c1 & 0xFFu) + (c2 & 0xFFu) + 1u) * 85u) >> 8;\n"
-              "            const u32 g = ((((c0 >> 8) & 0xFFu) + ((c1 >> 8) & 0xFFu) + ((c2 >> 8) & 0xFFu) + 1u) * 85u) >> 8;\n"
-              "            const u32 b = ((((c0 >> 16) & 0xFFu) + ((c1 >> 16) & 0xFFu) + ((c2 >> 16) & 0xFFu) + 1u) * 85u) >> 8;\n"
-              "            cmd -= 0x10u;\n"
-              "            gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | (b << 16) | (g << 8) | r);\n"
-              "            gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];\n"
-              "            gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];\n"
-              "          } else {\n"
-              "            const u32 c3 = le32_to_u32(gpu_unai.PacketBuffer.U4[6]);\n"
-              "            const u32 a01 = ((c0 & c1) + (((c0 ^ c1) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;\n"
-              "            const u32 a23 = ((c2 & c3) + (((c2 ^ c3) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;\n"
-              "            const u32 c_avg = ((a01 & a23) + (((a01 ^ a23) & 0xFEFEFEu) >> 1)) & 0xFFFFFFu;\n"
-              "            cmd -= 0x10u;\n"
-              "            gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | c_avg);\n"
-              "            gpu_unai.PacketBuffer.U4[2] = gpu_unai.PacketBuffer.U4[3];\n"
-              "            gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[5];\n"
-              "            gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[7];\n"
-              "          }\n"
-              "        } else if (gpu_unai.config.lighting == 0) {\n"
-              "          if ((cmd & 0x08u) == 0u) {\n"
-              "            cmd = (cmd - 0x10u) | 0x01u;\n"
-              "            gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);\n"
-              "            gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];\n"
-              "            gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];\n"
-              "            gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];\n"
-              "            gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];\n"
-              "          } else {\n"
-              "            cmd = (cmd - 0x10u) | 0x01u;\n"
-              "            gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);\n"
-              "            gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];\n"
-              "            gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];\n"
-              "            gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];\n"
-              "            gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];\n"
-              "            gpu_unai.PacketBuffer.U4[7] = gpu_unai.PacketBuffer.U4[10];\n"
-              "            gpu_unai.PacketBuffer.U4[8] = gpu_unai.PacketBuffer.U4[11];\n"
-              "          }\n"
+              "      if ((p_tot > 280u || g_last_frame_polys > 280u) && (cmd >= 0x30u) && ((cmd & 0x04u) != 0u) && (gpu_unai.config.lighting == 0)) {\n"
+              "        if ((cmd & 0x08u) == 0u) {\n"
+              "          cmd = (cmd - 0x10u) | 0x01u;\n"
+              "          gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);\n"
+              "          gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];\n"
+              "          gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];\n"
+              "          gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];\n"
+              "          gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];\n"
+              "        } else {\n"
+              "          cmd = (cmd - 0x10u) | 0x01u;\n"
+              "          gpu_unai.PacketBuffer.U4[0] = u32_to_le32((cmd << 24) | 0x808080u);\n"
+              "          gpu_unai.PacketBuffer.U4[3] = gpu_unai.PacketBuffer.U4[4];\n"
+              "          gpu_unai.PacketBuffer.U4[4] = gpu_unai.PacketBuffer.U4[5];\n"
+              "          gpu_unai.PacketBuffer.U4[5] = gpu_unai.PacketBuffer.U4[7];\n"
+              "          gpu_unai.PacketBuffer.U4[6] = gpu_unai.PacketBuffer.U4[8];\n"
+              "          gpu_unai.PacketBuffer.U4[7] = gpu_unai.PacketBuffer.U4[10];\n"
+              "          gpu_unai.PacketBuffer.U4[8] = gpu_unai.PacketBuffer.U4[11];\n"
               "        }\n"
               "      }\n"
               "    }\n"
@@ -519,7 +540,7 @@ jobs:
           gpu = gpu[:sw_start] + sw_pre_inj + gpu[sw_start : sw_end + 1] + "\n    cmd = _leap_orig_cmd;" + gpu[sw_end + 1 :]
           with open(gpu_p, "w") as f:
               f.write(gpu)
-          log_msg("SUCCESS 4C: Enabled Native 320-Wide 3D Rasterization across clear/poly/sprite/tile/line in gpu_unai!")
+          log_msg("SUCCESS 4C: Patched gpulib_if.cpp (Smooth ARM ASM Gouraud Sky + Hybrid-Safe Zero-Toggle 320w + Textured Gouraud Fast Path)!")
 
           # 4D. Hook vout_update() in plugins/gpulib/vout_pl.c for pure vout_ms telemetry
           vp = "plugins/gpulib/vout_pl.c"
@@ -631,7 +652,7 @@ jobs:
                   f.write(opt_h)
           log_msg("SUCCESS 5B: Updated Core Option defaults in libretro_core_options.h!")
 
-          # 5C. Goals 1, 2 & 3 in frontend/libretro.c (including 8-pixel alignment & 24-bit bgr24 PAL FMV 256->240 mapping!)
+          # 5C. 1:1 320x240 Vout + 8px-aligned 320w Direct Blit + 50.00Hz Resampler in frontend/libretro.c
           with open("frontend/libretro.c", "r") as f:
               lr = f.read()
 
@@ -722,7 +743,7 @@ jobs:
 
           cm_ident_expr = "Config.cycle_multiplier" if "Config.cycle_multiplier" in lr else "217"
 
-          v68_runtime = (
+          v69_runtime = (
               "#include <stdio.h>\n"
               "#include <string.h>\n"
               "#include <stdint.h>\n"
@@ -762,7 +783,7 @@ jobs:
               "   if (!g_ptfp) {\n"
               '      g_ptfp = fopen("/tmp/pcsx_telemetry.log", "w");\n'
               "      if (g_ptfp) {\n"
-              '         fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V68 (2026 Master + 46%% Clock + Native 320w 3D Raster + 320x240 1:1 + 50.00Hz) ===\\n");\n'
+              '         fprintf(g_ptfp, "=== PCSX-ReARMed LeapsterGS V69 (2026 Master + 46%% Clock + Clean 320w Cull/Sky/Menu + 320x240 1:1 + 50.00Hz) ===\\n");\n'
               '         fprintf(g_ptfp, "sec | wall | emu_ms | vbl | v_r/d  | res         | clk | polys | cpu_ms | gpu_ms | vout_ms | vcb_ms | cd_ms(c)  | spu_ms | aud_ms | max_b | blk_ms | r320\\n");\n'
               "         fflush(g_ptfp);\n"
               "      }\n"
@@ -908,7 +929,7 @@ jobs:
                   r"void\s+retro_run\b",
               ]
           )
-          lr = lr[:pos_first_cb] + v68_runtime + "\n" + lr[pos_first_cb:]
+          lr = lr[:pos_first_cb] + v69_runtime + "\n" + lr[pos_first_cb:]
 
           lr, n_vid = re.subn(
               r"(void\s+retro_set_video_refresh\s*\(\s*retro_video_refresh_t\s+(\w+)\s*\)\s*\{)",
@@ -971,15 +992,15 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 5C: Patched frontend/libretro.c (1:1 320x240 Vout incl. 24-bit FMV + 8px-aligned 320w Blit + 50.00Hz Resampler)!")
+          log_msg("SUCCESS 5C: Patched frontend/libretro.c (1:1 320x240 Vout + 8px-aligned 320w Blit + 50.00Hz Resampler)!")
 
-          with open("../build_v68_report.txt", "a") as rf:
-              rf.write("=== PCSX-ReARMed V68 PATCH SUMMARY ===\n")
+          with open("../build_v69_report.txt", "a") as rf:
+              rf.write("=== PCSX-ReARMed V69 PATCH SUMMARY ===\n")
               for line in report_lines:
                   rf.write(line + "\n")
           EOF
 
-      - name: Compile Inside Ubuntu 18.04 Container (GLIBC <= 2.17 + Cortex-A9 4KB InvTable + Native 320w + Stripped .so)
+      - name: Compile Inside Ubuntu 18.04 Container (GLIBC <= 2.17 + Cortex-A9 4KB InvTable + Clean 320w + Stripped .so)
         run: |
           docker run --rm -v "$PWD:/work" -w /work/pcsx_src ubuntu:18.04 bash -c '
             set -e -o pipefail
@@ -1007,27 +1028,27 @@ jobs:
               USE_ASYNC_GPU=0 \
               USE_ASYNC_SPU=0 \
               NDRC_THREAD=0 \
-              -j$(nproc) 2>&1 | tee ../build_v68.log
-            echo "=== KEY COMPILER FLAGS AUDIT ===" >> ../build_v68_report.txt
-            grep -E "gpulib_if\.cpp|gpu_arm\.S|gte_nf_arm\.S|psxdma\.c|emu_if\.c|libretro\.c|cspace\.c|cspace_arm\.S" ../build_v68.log | head -n 26 >> ../build_v68_report.txt || true
-            echo "=== 4KB L1 RECIPROCAL TABLE s_invTable SIZE AUDIT ===" >> ../build_v68_report.txt
-            arm-linux-gnueabi-nm -S plugins/gpu_unai/gpulib_if.o | grep "s_invTable" >> ../build_v68_report.txt || true
-            echo "=== GLIBC VERSIONS ===" >> ../build_v68_report.txt
-            arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro.so | grep -o "GLIBC_[0-9.]*" | sort -uV >> ../build_v68_report.txt || true
-            echo "=== BINARY SIZE (UNSTRIPPED -> STRIPPED) ===" >> ../build_v68_report.txt
-            ls -lh pcsx_rearmed_libretro.so >> ../build_v68_report.txt
+              -j$(nproc) 2>&1 | tee ../build_v69.log
+            echo "=== KEY COMPILER FLAGS AUDIT ===" >> ../build_v69_report.txt
+            grep -E "gpulib_if\.cpp|gpu_arm\.S|gte_nf_arm\.S|psxdma\.c|emu_if\.c|libretro\.c|cspace\.c|cspace_arm\.S" ../build_v69.log | head -n 26 >> ../build_v69_report.txt || true
+            echo "=== 4KB L1 RECIPROCAL TABLE s_invTable SIZE AUDIT ===" >> ../build_v69_report.txt
+            arm-linux-gnueabi-nm -S plugins/gpu_unai/gpulib_if.o | grep "s_invTable" >> ../build_v69_report.txt || true
+            echo "=== GLIBC VERSIONS ===" >> ../build_v69_report.txt
+            arm-linux-gnueabi-objdump -T pcsx_rearmed_libretro.so | grep -o "GLIBC_[0-9.]*" | sort -uV >> ../build_v69_report.txt || true
+            echo "=== BINARY SIZE (UNSTRIPPED -> STRIPPED) ===" >> ../build_v69_report.txt
+            ls -lh pcsx_rearmed_libretro.so >> ../build_v69_report.txt
             arm-linux-gnueabi-strip -s pcsx_rearmed_libretro.so
-            ls -lh pcsx_rearmed_libretro.so >> ../build_v68_report.txt
+            ls -lh pcsx_rearmed_libretro.so >> ../build_v69_report.txt
             cp pcsx_rearmed_libretro.so ../pcsx_rearmed_libretro.so
           '
-          ls -lh pcsx_rearmed_libretro.so build_v68.log build_v68_report.txt
+          ls -lh pcsx_rearmed_libretro.so build_v69.log build_v69_report.txt
 
-      - name: Upload V68 Core + Build Log + Audit Report
+      - name: Upload V69 Core + Build Log + Audit Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pcsx_rearmed_libretro_v68
+          name: pcsx_rearmed_libretro_v69
           path: |
             pcsx_rearmed_libretro.so
-            build_v68.log
-            build_v68_report.txt
+            build_v69.log
+            build_v69_report.txt
