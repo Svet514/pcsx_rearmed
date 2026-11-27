@@ -1,4 +1,4 @@
-name: Build PCSX-ReARMed V74 (2026 Master + 46% Clock + Cached CLUT Pre-Lighting l0 ASM + Version-Script Vis + 1-Pass Rects)
+name: Build PCSX-ReARMed V74 (2026 Master + 46% Clock + Cached CLUT Pre-Lighting l0 ASM + Strict Vis + 1-Pass Rects)
 
 on:
   workflow_dispatch:
@@ -62,26 +62,23 @@ jobs:
               return find_matching_delim(text, open_idx, "{", "}")
 
           # 1A. Export ONLY libretro API entry points under -fvisibility=hidden
-          lr_hdr_patched = 0
-          for lr_hdr in ["deps/libretro-common/include/libretro.h", "frontend/libretro.h", "include/libretro.h"]:
-              if os.path.exists(lr_hdr):
-                  with open(lr_hdr, "r") as f:
-                      lht = f.read()
-                  lht = (
-                      '#if defined(__GNUC__) && __GNUC__ >= 4\n'
-                      '#pragma GCC visibility push(default)\n'
-                      '#endif\n'
-                      + lht +
-                      '\n#if defined(__GNUC__) && __GNUC__ >= 4\n'
-                      '#pragma GCC visibility pop\n'
-                      '#endif\n'
-                  )
-                  with open(lr_hdr, "w") as f:
-                      f.write(lht)
-                  lr_hdr_patched += 1
-          assert lr_hdr_patched > 0, "Could not find libretro.h to mark default visibility"
+          lr_hdr = "deps/libretro-common/include/libretro.h"
+          assert os.path.exists(lr_hdr), f"Could not find {lr_hdr}"
+          with open(lr_hdr, "r") as f:
+              lht = f.read()
+          lht = (
+              "#if defined(__GNUC__) && __GNUC__ >= 4\n"
+              "#pragma GCC visibility push(default)\n"
+              "#endif\n"
+              + lht +
+              "\n#if defined(__GNUC__) && __GNUC__ >= 4\n"
+              "#pragma GCC visibility pop\n"
+              "#endif\n"
+          )
+          with open(lr_hdr, "w") as f:
+              f.write(lht)
 
-          # 1B. Scoped Cortex-A9 flags + -DGPU_UNAI_USE_INT_DIV_MULTINV (both CFLAGS and CXXFLAGS)
+          # 1B. Scoped Cortex-A9 flags + -DGPU_UNAI_USE_INT_DIV_MULTINV (Makefile expands CXXFLAGS += $(CFLAGS) automatically)
           with open("Makefile.libretro", "r") as f:
               mklr = f.read()
 
@@ -92,12 +89,11 @@ jobs:
               "plugins/gpulib/%.o frontend/cspace.o frontend/libretro.o plugins/dfsound/spu.o: CFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
               "libpcsxcore/gte.o libpcsxcore/gte_nf.o libpcsxcore/gte_divider.o libpcsxcore/mdec.o: CFLAGS += -munaligned-access -Ofast -fno-strict-aliasing",
               "plugins/gpu_unai/gpulib_if.o: CFLAGS += -DGPU_UNAI_USE_INT_DIV_MULTINV -munaligned-access -Ofast -fno-strict-aliasing",
-              "plugins/gpu_unai/gpulib_if.o: CXXFLAGS += -DGPU_UNAI_USE_INT_DIV_MULTINV -munaligned-access -Ofast -fno-strict-aliasing",
           ]
           mklr += "\n".join(extra_mk) + "\n"
           with open("Makefile.libretro", "w") as f:
               f.write(mklr)
-          log_msg(f"SUCCESS 1: Enabled -fvisibility=hidden (patched {lr_hdr_patched} libretro.h) + scoped C/C++ -munaligned-access -Ofast + -DGPU_UNAI_USE_INT_DIV_MULTINV!")
+          log_msg("SUCCESS 1: Enabled -fvisibility=hidden + scoped C/C++ -munaligned-access -Ofast + -DGPU_UNAI_USE_INT_DIV_MULTINV!")
 
           # 2A. Patch libpcsxcore/psxdma.c: Clamp 3D DMA2 gpuIdleAfter <= 512 cycles, ZERO mid-frame psxRegs.cycle jumps!
           dma_p = "libpcsxcore/psxdma.c"
@@ -203,7 +199,7 @@ jobs:
               f.write(spu_hdr + spu_txt[:m_spu.start()] + spu_wrap + spu_txt[m_spu.end():])
           log_msg("SUCCESS 3: Patched xa.c & spu.c!")
 
-          # 4A. Clean V73 4KB L1 s_invTable in gpu_fixedpoint.h
+          # 4A. Clean 4KB L1 s_invTable in gpu_fixedpoint.h
           fp_p = "plugins/gpu_unai/gpu_fixedpoint.h"
           with open(fp_p, "r") as f:
               fp_txt = f.read()
@@ -278,7 +274,7 @@ jobs:
           with open(ri_p, "w") as f:
               f.write(ri)
 
-          # 4C-2: Clean V73 Floor X Rounding + CHKMAX_X 640 Cull + Single-Pass Axis-Aligned 320w Rectangles in gpu_raster_polygon.h
+          # 4C-2: Clean Floor X Rounding + CHKMAX_X 640 Cull + Single-Pass Axis-Aligned 320w Rectangles in gpu_raster_polygon.h
           cull_patched = 0
           ext_decl = (
               "#ifdef __cplusplus\n"
@@ -362,7 +358,7 @@ jobs:
 
           with open(rp_p, "w") as f:
               f.write(rp)
-          log_msg(f"SUCCESS 4C-POLY: Clean V73 floor X rounding + 1-pass 320w AA rectangles + CHKMAX_X 640 cull ({cull_patched} site)!")
+          log_msg(f"SUCCESS 4C-POLY: Clean floor X rounding + 1-pass 320w AA rectangles + CHKMAX_X 640 cull ({cull_patched} site)!")
 
           # 4C-3: gpu_raster_sprite.h (consistent floor rounding on flat tiles gpuDrawT)
           rs_p = "plugins/gpu_unai/gpu_raster_sprite.h"
@@ -399,10 +395,9 @@ jobs:
           with open(rl_p, "w") as f:
               f.write(rl)
 
-          # 4C-5: gpulib_if.cpp — 2-Way Set-Associative Cached CLUT Pre-Lighting on Unlit l0 ARMv6 ASM!
-          #   - Pre-modulates 16-color (4bpp) and 256-color (8bpp) palettes once per unique (CLUT, BGR555 light) pair
-          #     and dispatches poly_4bp_l0* / poly_8bp_l0* ASM (ZERO extra instructions per pixel!)
-          #   - Unifies 3D models, world walls, Main Menus, Pause Menus, and native 320x240 games under one glitch-free shading pipeline!
+          # 4C-5: gpulib_if.cpp — 2-Way Set-Associative Cached CLUT Pre-Lighting on Unlit l0 ARMv6 ASM
+          #   - Placed AFTER gpu.h & gpu_unai.h includes (right above renderer_notify_screen_change) so u32, le16_t, gpu_unai, likely/unlikely are all in scope!
+          #   - Hashes all 8 u32 words of 4bpp CLUTs (1 L1 cache line) + 8 stride words of 8bpp CLUTs + hooks renderer_update_caches (zero periodic VBlank cache wipes!)
           gpu_p = "plugins/gpu_unai/gpulib_if.cpp"
           with open(gpu_p, "r") as f:
               gpu = f.read()
@@ -531,6 +526,7 @@ jobs:
           assert old_ts_call in gpu, "Could not find gpuDrawS in textured_sprite"
           gpu = gpu.replace(old_ts_call, new_ts_call, 1)
 
+          # Top-of-file declarations ONLY use <stdint.h> types (safe before gpu.h / gpu_unai.h!)
           v74_gpu_globals = (
               "#include <stdint.h>\n"
               '#include "../../frontend/plugin_lib.h"\n'
@@ -554,6 +550,10 @@ jobs:
               "\tLeapPcsxGpuScope() : _t0(leap_pcsx_us()) {}\n"
               "\t~LeapPcsxGpuScope() { leap_pcsx_add_gpu((uint32_t)(leap_pcsx_us() - _t0)); }\n"
               "};\n"
+          )
+
+          # Placed right before renderer_notify_screen_change (AFTER gpu.h, gpu_unai.h, gpu_inner.h, gpu_command.h are all included!)
+          v74_clut_and_scale_helpers = (
               "struct V74ClutSlot4 {\n"
               "\tu32 key, gen, sig;\n"
               "\tle16_t pal[16] __attribute__((aligned(16)));\n"
@@ -562,10 +562,10 @@ jobs:
               "\tu32 key, gen, sig;\n"
               "\tle16_t pal[256] __attribute__((aligned(16)));\n"
               "};\n"
-              "static V74ClutSlot4 g_v74_c4[256][2];\n"
-              "static uint8_t g_v74_c4_way[256];\n"
-              "static V74ClutSlot8 g_v74_c8[64][2];\n"
-              "static uint8_t g_v74_c8_way[64];\n"
+              "static V74ClutSlot4 g_v74_c4[512][2];\n"
+              "static uint8_t g_v74_c4_way[512];\n"
+              "static V74ClutSlot8 g_v74_c8[256][2];\n"
+              "static uint8_t g_v74_c8_way[256];\n"
               "static inline le16_t *g_v74_get_lit_clut(u32 clut_word, u32 rgb_word, u32 text_mode) {\n"
               "\tu32 c15 = clut_word & 0x7FFFu;\n"
               "\tu32 base = c15 << 4;\n"
@@ -579,8 +579,8 @@ jobs:
               "\tif (text_mode == 0x20u) {\n"
               "\t\tconst le16_t *src = &vram[base];\n"
               "\t\tconst u32 *s32 = (const u32 *)src;\n"
-              "\t\tu32 sig = s32[0] ^ (s32[3] << 1) ^ (s32[5] << 2) ^ (s32[7] << 3);\n"
-              "\t\tu32 set = (((c15 * 2654435761u) >> 24) ^ ((lr << 3) ^ (lg << 1) ^ lb)) & 255u;\n"
+              "\t\tu32 sig = (s32[0] ^ s32[4]) + ((s32[1] ^ s32[5]) << 3) + ((s32[2] ^ s32[6]) << 6) + ((s32[3] ^ s32[7]) << 9);\n"
+              "\t\tu32 set = (((c15 * 2654435761u) >> 23) ^ ((lr << 4) ^ (lg << 2) ^ lb)) & 511u;\n"
               "\t\tV74ClutSlot4 *s0 = &g_v74_c4[set][0];\n"
               "\t\tif (s0->key == key && s0->gen == gen && s0->sig == sig) return s0->pal;\n"
               "\t\tV74ClutSlot4 *s1 = &g_v74_c4[set][1];\n"
@@ -589,24 +589,34 @@ jobs:
               "\t\tg_v74_c4_way[set] = (uint8_t)w;\n"
               "\t\tV74ClutSlot4 *dst = &g_v74_c4[set][w];\n"
               "\t\tdst->key = key; dst->gen = gen; dst->sig = sig;\n"
-              "\t\tfor (u32 i = 0; i < 16u; ++i) {\n"
-              "\t\t\tu32 px = le16_to_u16(src[i]);\n"
-              "\t\t\tif (px == 0u) { dst->pal[i] = u16_to_le16(0u); continue; }\n"
-              "\t\t\tu32 r = ((px & 0x1Fu) * lr) >> 4; if (r > 31u) r = 31u;\n"
-              "\t\t\tu32 g = (((px >> 5) & 0x1Fu) * lg) >> 4; if (g > 31u) g = 31u;\n"
-              "\t\t\tu32 b = (((px >> 10) & 0x1Fu) * lb) >> 4; if (b > 31u) b = 31u;\n"
-              "\t\t\tu32 out = (px & 0x8000u) | (b << 10) | (g << 5) | r;\n"
-              "\t\t\tif (unlikely(out == 0u)) out = 0x0400u;\n"
-              "\t\t\tdst->pal[i] = u16_to_le16((u16)out);\n"
+              "\t\tif (lr <= 16u && lg <= 16u && lb <= 16u) {\n"
+              "\t\t\tfor (u32 i = 0; i < 16u; ++i) {\n"
+              "\t\t\t\tu32 px = le16_to_u16(src[i]);\n"
+              "\t\t\t\tif (px == 0u) { dst->pal[i] = u16_to_le16(0u); continue; }\n"
+              "\t\t\t\tu32 out = (px & 0x8000u) | ((((px >> 10) & 0x1Fu) * lb >> 4) << 10) | ((((px >> 5) & 0x1Fu) * lg >> 4) << 5) | (((px & 0x1Fu) * lr) >> 4);\n"
+              "\t\t\t\tif (unlikely(out == 0u)) out = 0x0400u;\n"
+              "\t\t\t\tdst->pal[i] = u16_to_le16((u16)out);\n"
+              "\t\t\t}\n"
+              "\t\t} else {\n"
+              "\t\t\tfor (u32 i = 0; i < 16u; ++i) {\n"
+              "\t\t\t\tu32 px = le16_to_u16(src[i]);\n"
+              "\t\t\t\tif (px == 0u) { dst->pal[i] = u16_to_le16(0u); continue; }\n"
+              "\t\t\t\tu32 r = ((px & 0x1Fu) * lr) >> 4; if (r > 31u) r = 31u;\n"
+              "\t\t\t\tu32 g = (((px >> 5) & 0x1Fu) * lg) >> 4; if (g > 31u) g = 31u;\n"
+              "\t\t\t\tu32 b = (((px >> 10) & 0x1Fu) * lb) >> 4; if (b > 31u) b = 31u;\n"
+              "\t\t\t\tu32 out = (px & 0x8000u) | (b << 10) | (g << 5) | r;\n"
+              "\t\t\t\tif (unlikely(out == 0u)) out = 0x0400u;\n"
+              "\t\t\t\tdst->pal[i] = u16_to_le16((u16)out);\n"
+              "\t\t\t}\n"
               "\t\t}\n"
               "\t\treturn dst->pal;\n"
               "\t} else {\n"
               "\t\tu32 sig = 0u;\n"
               "\t\tif (likely(base <= 0x7FF00u)) {\n"
               "\t\t\tconst u32 *s32 = (const u32 *)&vram[base];\n"
-              "\t\t\tsig = s32[0] ^ (s32[21] << 1) ^ (s32[42] << 2) ^ (s32[63] << 3);\n"
+              "\t\t\tsig = (s32[0] ^ s32[32]) + ((s32[8] ^ s32[40]) << 3) + ((s32[16] ^ s32[48]) << 6) + ((s32[24] ^ s32[63]) << 9);\n"
               "\t\t}\n"
-              "\t\tu32 set = (((c15 * 2654435761u) >> 26) ^ ((lr << 2) ^ (lg << 1) ^ lb)) & 63u;\n"
+              "\t\tu32 set = (((c15 * 2654435761u) >> 24) ^ ((lr << 3) ^ (lg << 1) ^ lb)) & 255u;\n"
               "\t\tV74ClutSlot8 *s0 = &g_v74_c8[set][0];\n"
               "\t\tif (s0->key == key && s0->gen == gen && s0->sig == sig && likely(base <= 0x7FF00u)) return s0->pal;\n"
               "\t\tV74ClutSlot8 *s1 = &g_v74_c8[set][1];\n"
@@ -615,21 +625,29 @@ jobs:
               "\t\tg_v74_c8_way[set] = (uint8_t)w;\n"
               "\t\tV74ClutSlot8 *dst = &g_v74_c8[set][w];\n"
               "\t\tdst->key = key; dst->gen = gen; dst->sig = sig;\n"
-              "\t\tfor (u32 i = 0; i < 256u; ++i) {\n"
-              "\t\t\tu32 px = le16_to_u16(vram[(base + i) & 0x7FFFFu]);\n"
-              "\t\t\tif (px == 0u) { dst->pal[i] = u16_to_le16(0u); continue; }\n"
-              "\t\t\tu32 r = ((px & 0x1Fu) * lr) >> 4; if (r > 31u) r = 31u;\n"
-              "\t\t\tu32 g = (((px >> 5) & 0x1Fu) * lg) >> 4; if (g > 31u) g = 31u;\n"
-              "\t\t\tu32 b = (((px >> 10) & 0x1Fu) * lb) >> 4; if (b > 31u) b = 31u;\n"
-              "\t\t\tu32 out = (px & 0x8000u) | (b << 10) | (g << 5) | r;\n"
-              "\t\t\tif (unlikely(out == 0u)) out = 0x0400u;\n"
-              "\t\t\tdst->pal[i] = u16_to_le16((u16)out);\n"
+              "\t\tif (lr <= 16u && lg <= 16u && lb <= 16u) {\n"
+              "\t\t\tfor (u32 i = 0; i < 256u; ++i) {\n"
+              "\t\t\t\tu32 px = le16_to_u16(vram[(base + i) & 0x7FFFFu]);\n"
+              "\t\t\t\tif (px == 0u) { dst->pal[i] = u16_to_le16(0u); continue; }\n"
+              "\t\t\t\tu32 out = (px & 0x8000u) | ((((px >> 10) & 0x1Fu) * lb >> 4) << 10) | ((((px >> 5) & 0x1Fu) * lg >> 4) << 5) | (((px & 0x1Fu) * lr) >> 4);\n"
+              "\t\t\t\tif (unlikely(out == 0u)) out = 0x0400u;\n"
+              "\t\t\t\tdst->pal[i] = u16_to_le16((u16)out);\n"
+              "\t\t\t}\n"
+              "\t\t} else {\n"
+              "\t\t\tfor (u32 i = 0; i < 256u; ++i) {\n"
+              "\t\t\t\tu32 px = le16_to_u16(vram[(base + i) & 0x7FFFFu]);\n"
+              "\t\t\t\tif (px == 0u) { dst->pal[i] = u16_to_le16(0u); continue; }\n"
+              "\t\t\t\tu32 r = ((px & 0x1Fu) * lr) >> 4; if (r > 31u) r = 31u;\n"
+              "\t\t\t\tu32 g = (((px >> 5) & 0x1Fu) * lg) >> 4; if (g > 31u) g = 31u;\n"
+              "\t\t\t\tu32 b = (((px >> 10) & 0x1Fu) * lb) >> 4; if (b > 31u) b = 31u;\n"
+              "\t\t\t\tu32 out = (px & 0x8000u) | (b << 10) | (g << 5) | r;\n"
+              "\t\t\t\tif (unlikely(out == 0u)) out = 0x0400u;\n"
+              "\t\t\t\tdst->pal[i] = u16_to_le16((u16)out);\n"
+              "\t\t\t}\n"
               "\t\t}\n"
               "\t\treturn dst->pal;\n"
               "\t}\n"
               "}\n"
-          )
-          v74_scale_helper = (
               "static inline void g_v74_update_scale320(void) {\n"
               "\tint raw_w = g_v74_raw_da_x2 - g_v74_raw_da_x0;\n"
               "\tint raw_h = g_v74_raw_da_y2 - g_v74_raw_da_y0;\n"
@@ -659,7 +677,7 @@ jobs:
           )
           m_rnsc = re.search(r"void\s+renderer_notify_screen_change\s*\([^;{}]*\)\s*\{", gpu)
           assert m_rnsc is not None, "Could not find renderer_notify_screen_change in gpulib_if.cpp"
-          gpu = v74_gpu_globals + gpu[:m_rnsc.start()] + v74_scale_helper + "\n" + gpu[m_rnsc.start():]
+          gpu = v74_gpu_globals + gpu[:m_rnsc.start()] + v74_clut_and_scale_helpers + "\n" + gpu[m_rnsc.start():]
 
           m_rnsc2 = re.search(r"void\s+renderer_notify_screen_change\s*\([^;{}]*\)\s*\{", gpu)
           rnsc_e = find_matching_brace(gpu, gpu.index("{", m_rnsc2.start()))
@@ -673,6 +691,14 @@ jobs:
               "  }\n"
           )
           gpu = gpu[:rnsc_e] + rnsc_inj + gpu[rnsc_e:]
+
+          # Also bump g_v74_clut_gen in renderer_update_caches (covers MoveImage GP0(80h) VRAM-to-VRAM copies!)
+          gpu, _ = re.subn(
+              r"(void\s+renderer_update_caches\s*\([^;{}]*\)\s*\{)",
+              r"\1\n  if (++g_v74_clut_gen == 0u) g_v74_clut_gen = 1u;",
+              gpu,
+              count=1
+          )
 
           m_rcmd = re.search(r"^int\s+(?:renderer_)?do_cmd_list\s*\([^;{}]*\)\s*\{", gpu, flags=re.M)
           assert m_rcmd is not None
@@ -774,7 +800,7 @@ jobs:
           gpu = gpu[:sw_start] + sw_pre_inj + gpu[sw_start : sw_end + 1] + "\n    cmd = _leap_orig_cmd;" + gpu[sw_end + 1 :]
           with open(gpu_p, "w") as f:
               f.write(gpu)
-          log_msg("SUCCESS 4C: Patched gpulib_if.cpp (2-Way Cached CLUT Pre-Lighting on l0 ASM + Unified 3D/Menu/Pause Shading + Opaque Load Fade Guard)!")
+          log_msg("SUCCESS 4C: Patched gpulib_if.cpp (Header-Safe 2-Way Cached CLUT Pre-Lighting on l0 ASM + Unified 3D/Menu/Pause Shading)!")
 
           # 4D. Hook vout_update() in plugins/gpulib/vout_pl.c for pure vout_ms telemetry
           vp = "plugins/gpulib/vout_pl.c"
@@ -1217,9 +1243,6 @@ jobs:
 
           run_entry = (
               "\n   leap_pcsx_pre();\n"
-              "   if ((g_p_vbl & 3u) == 0u) {\n"
-              "      if (++g_v74_clut_gen == 0u) g_v74_clut_gen = 1u;\n"
-              "   }\n"
               "   if (g_frame_polys > 0) {\n"
               "      g_last_frame_polys = g_frame_polys;\n"
               "   }\n"
@@ -1229,7 +1252,7 @@ jobs:
 
           with open("frontend/libretro.c", "w") as f:
               f.write(lr)
-          log_msg("SUCCESS 5C: Patched frontend/libretro.c (1:1 320x240 Vout + y>=192 Split + 50.00Hz Resampler + Periodic CLUT Refresh)!")
+          log_msg("SUCCESS 5C: Patched frontend/libretro.c (1:1 320x240 Vout + y>=192 Split + 50.00Hz Resampler)!")
 
           with open("../build_v74_report.txt", "a") as rf:
               rf.write("=== PCSX-ReARMed V74 PATCH SUMMARY ===\n")
@@ -1237,24 +1260,24 @@ jobs:
                   rf.write(line + "\n")
           EOF
 
-      - name: Compile Inside Ubuntu 18.04 Container (GLIBC <= 2.17 + Cached CLUT l0 ASM + Linker Version-Script + Stripped .so)
+      - name: Compile Inside Ubuntu 18.04 Container (GLIBC <= 2.17 + Cached CLUT l0 ASM + Built-In Version-Script + Stripped .so)
         run: |
           docker run --rm -v "$PWD:/work" -w /work/pcsx_src ubuntu:18.04 bash -c '
             set -e -o pipefail
             apt-get update
             apt-get install -y git gcc-arm-linux-gnueabi g++-arm-linux-gnueabi binutils-arm-linux-gnueabi make
             git config --global --add safe.directory /work/pcsx_src
-            printf "{\n  global:\n    retro_*;\n  local:\n    *;\n};\n" > /tmp/libretro.ver
             OPT_FLAGS="-march=armv7-a -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=softfp -marm -mno-unaligned-access -fvisibility=hidden -O3 -fomit-frame-pointer -ffast-math -funsafe-math-optimizations -fno-strict-aliasing -fno-plt -fno-semantic-interposition -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -DNDEBUG"
             export CFLAGS="$OPT_FLAGS"
-            export CXXFLAGS="$OPT_FLAGS"
-            export LDFLAGS="-Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--version-script=/tmp/libretro.ver -static-libstdc++ -static-libgcc"
+            export CXXFLAGS="-fvisibility-inlines-hidden"
+            export LDFLAGS="-Wl,-Bsymbolic -Wl,-Bsymbolic-functions -static-libstdc++ -static-libgcc"
             make -f Makefile.libretro \
               V=1 \
               platform=unix \
               ARCH=arm \
               CC="arm-linux-gnueabi-gcc" \
               CXX="arm-linux-gnueabi-g++ -static-libstdc++ -static-libgcc" \
+              LD="arm-linux-gnueabi-ld" \
               DYNAREC=ari64 \
               BUILTIN_GPU=unai \
               GPU_UNAI_NO_OLD=1 \
@@ -1270,7 +1293,7 @@ jobs:
               -j$(nproc) 2>&1 | tee ../build_v74.log
             echo "=== KEY COMPILER FLAGS AUDIT ===" >> ../build_v74_report.txt
             grep -E "gpulib_if\.cpp|gpu_arm\.S|gte_nf_arm\.S|psxdma\.c|emu_if\.c|libretro\.c|cspace\.c|cspace_arm\.S" ../build_v74.log | head -n 26 >> ../build_v74_report.txt || true
-            echo "=== DYNAMIC EXPORTED SYMBOLS AUDIT (version-script: retro_* ONLY) ===" >> ../build_v74_report.txt
+            echo "=== DYNAMIC EXPORTED SYMBOLS AUDIT (frontend/libretro-version-script) ===" >> ../build_v74_report.txt
             arm-linux-gnueabi-nm -D pcsx_rearmed_libretro.so | grep " T " >> ../build_v74_report.txt
             arm-linux-gnueabi-nm -D pcsx_rearmed_libretro.so | grep -q " T retro_run"
             arm-linux-gnueabi-nm -D pcsx_rearmed_libretro.so | grep -q " T retro_load_game"
